@@ -348,7 +348,7 @@ info "Running NVIDIA installer in silent cross-compile mode …"
     --silent \
     --kernel-source-path="${KERNEL_HEADERS_PATH}" \
     --kernel-name="${KERNEL_VERSION}" \
-    --kernel-module-type=open \
+    --kernel-module-type=${NVIDIA_KERNEL_MODULE_TYPE} \
     --allow-installation-with-running-driver \
     --no-rebuild-initramfs \
     --skip-module-load \

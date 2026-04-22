@@ -4,6 +4,9 @@ services:
     container_name: truenas-nvidia-builder
     environment:
       - NVIDIA_VERSION=595.58.03
+      # Open Kernel Modules (open): Preferred for newer GPUs (Turing/Ampere/Ada Lovelace/Hopper) as of R560+ drivers.
+      # Proprietary Module (native): The legacy closed-source binary, often required for older cards.
+      - NVIDIA_KERNEL_MODULE_TYPE=open
       - TRUENAS_VERSION=25.10.3
       - TRUENAS_CODENAME=Goldeye
     volumes:
