@@ -440,14 +440,34 @@ while IFS= read -r src_file; do
         relative="${src_file#/etc/}"
         dest_path="${STAGING_DIR}/usr/share/${relative}"
 
-    elif [[ "${src_file}" == /etc/nvidia-container-runtime/* ]]; then
-        # nvidia-container-toolkit config — remap to /usr/share/
+    elif [[ "${src_file}" == /etc/vulkansc/* ]]; then
+        # /etc/vulkansc/... → staging/usr/share/vulkansc/...
         relative="${src_file#/etc/}"
         dest_path="${STAGING_DIR}/usr/share/${relative}"
 
+    elif [[ "${src_file}" == /etc/nvidia-container-runtime/* ]]; then
+        # nvidia-container-runtime config → /usr/share/nvidia-container-runtime/
+        relative="${src_file#/etc/}"
+        dest_path="${STAGING_DIR}/usr/share/${relative}"
+
+    elif [[ "${src_file}" == /etc/nvidia-container-toolkit/* ]]; then
+        # nvidia-container-toolkit config → /usr/share/nvidia-container-toolkit/
+        relative="${src_file#/etc/}"
+        dest_path="${STAGING_DIR}/usr/share/${relative}"
+
+    elif [[ "${src_file}" == /etc/systemd/system/* ]]; then
+        # systemd units → /usr/lib/systemd/system/ (the correct sysext-mergeable path)
+        relative="${src_file#/etc/systemd/system/}"
+        dest_path="${STAGING_DIR}/usr/lib/systemd/system/${relative}"
+
+    elif [[ "${src_file}" == /etc/apt/* ]]; then
+        # apt repo config — build artifact, not needed on target; skip silently
+        (( SKIPPED_COUNT++ )) || true
+        continue
+
     elif [[ "${src_file}" == /etc/* ]]; then
-        # Other /etc files — log and skip (sysext limitation)
-        warn "Cannot stage /etc file (sysext limitation): ${src_file}"
+        # Unknown /etc files — log and skip (sysext can only merge /usr)
+        info "Skipping /etc file (not needed in sysext): ${src_file}"
         (( SKIPPED_COUNT++ )) || true
         continue
 
