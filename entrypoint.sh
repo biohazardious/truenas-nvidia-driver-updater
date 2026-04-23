@@ -1,21 +1,39 @@
 #!/bin/bash
 # =============================================================================
-# entrypoint.sh — Build a systemd-sysext nvidia.raw for TrueNAS SCALE
+# entrypoint.sh — Build a systemd-sysext nvidia.raw for TrueNAS
 #
 # Runs inside a privileged Debian 12 (Bookworm) container.
 #
 # Required environment variables:
 #   NVIDIA_VERSION     — NVIDIA driver version (e.g. 595.58.03)
-#   TRUENAS_VERSION    — TrueNAS SCALE version (e.g. 25.10.0)
-#   TRUENAS_CODENAME   — TrueNAS SCALE codename (e.g. Goldeye)
+#   TRUENAS_VERSION    — TrueNAS version (e.g. 25.10.3 or 26.0.0-BETA.1)
 #
 # Optional:
+#   NVIDIA_KERNEL_MODULE_TYPE
+#                       — Passed directly to NVIDIA installer as
+#                         --kernel-module-type=<value>
+#                         Supported values commonly used here:
+#                           open        -> Open GPU kernel modules
+#                           proprietary -> Legacy closed-source modules
+#   NVIDIA_BUILD_CC     — Optional compiler override for NVIDIA kernel module
+#                         builds (for example: gcc, gcc-14)
+#                         By default the script auto-detects a suitable GCC.
+#   TRUENAS_CODENAME   — Required for 25.x and earlier download URLs
+#                         (e.g. Goldeye). Not used for TrueNAS 26+.
 #   /workspace/truenas.update — Pre-downloaded update file (skips download)
 #   /output                   — Bind-mounted output directory
+#   EMBED_NVIDIA_RAW_IN_UPDATE=true
+#                            — Repack truenas.update by replacing the bundled
+#                              /usr/share/truenas/sysext-extensions/nvidia.raw
+#                              with the newly built image, then write a new
+#                              .update artifact to /output
 #
-# Download URL pattern:
-#   https://download.truenas.com/TrueNAS-SCALE-{CODENAME}/{VERSION}/
-#   TrueNAS-SCALE-{VERSION}.update?download=1
+# Download URL patterns:
+#   TrueNAS 25.x and earlier:
+#     https://download.truenas.com/TrueNAS-SCALE-{CODENAME}/{VERSION}/
+#     TrueNAS-SCALE-{VERSION}.update?download=1
+#   TrueNAS 26+:
+#     https://update-public.sys.truenas.net/TrueNAS-26-BETA/TrueNAS-{VERSION}.update
 # =============================================================================
 set -euo pipefail
 IFS=$'\n\t'
@@ -32,12 +50,190 @@ banner(){ echo -e "\n${BOLD}═════════════════�
           echo -e "${BOLD}  $*${NC}";
           echo -e "${BOLD}════════════════════════════════════════════════════════════${NC}\n"; }
 
+env_is_true() {
+    local value="${1:-}"
+    case "${value,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_embedded_nvidia_raw_path() {
+    local extracted_rootfs_dir="$1"
+    local default_path="${extracted_rootfs_dir}/usr/share/truenas/sysext-extensions/nvidia.raw"
+
+    if [[ -f "${default_path}" ]]; then
+        printf '%s\n' "${default_path}"
+        return 0
+    fi
+
+    mapfile -t matches < <(find "${extracted_rootfs_dir}" -type f -name 'nvidia.raw' 2>/dev/null)
+
+    if [[ ${#matches[@]} -eq 1 ]]; then
+        printf '%s\n' "${matches[0]}"
+        return 0
+    fi
+
+    if [[ ${#matches[@]} -gt 1 ]]; then
+        warn "Found multiple candidate nvidia.raw files inside extracted update:"
+        printf '  %s\n' "${matches[@]}"
+    fi
+
+    return 1
+}
+
+write_truenas_extension_release() {
+    local output_path="$1"
+    # TrueNAS's official sysext build writes ID=_any for extensions,
+    # including the bundled NVIDIA extension. Matching that behavior avoids
+    # host-version-specific compatibility rejections from systemd-sysext.
+    printf 'ID=_any\n' > "${output_path}"
+}
+
+build_squashfs_image() {
+    local source_dir="$1"
+    local output_path="$2"
+    local label="$3"
+
+    info "Building ${label} with gzip compression (matching TrueNAS convention) …"
+    mksquashfs "${source_dir}" "${output_path}" \
+        -comp gzip \
+        -all-root \
+        -noappend \
+        || die "Failed to build ${label}"
+}
+
+build_release_artifact() {
+    local source_dir="$1"
+    local output_path="$2"
+    local label="$3"
+
+    build_squashfs_image "${source_dir}" "${output_path}" "${label}"
+    write_sha256_file "${output_path}"
+}
+
+write_sha256_file() {
+    local target_path="$1"
+    local checksum_path="${target_path}.sha256"
+    local checksum=""
+
+    [[ -f "${target_path}" ]] || die "Cannot write checksum: file not found: ${target_path}"
+
+    checksum="$(sha256sum "${target_path}" | awk '{print $1}')"
+    [[ -n "${checksum}" ]] || die "Failed to calculate SHA256 for ${target_path}"
+
+    printf '%s\n' "${checksum}" > "${checksum_path}"
+    ok "SHA256 written: ${checksum_path}"
+}
+
+print_artifact_summary_line() {
+    local label="$1"
+    local path="$2"
+
+    echo -e "  ${GREEN}►${NC} ${label} : ${path}"
+    if [[ -f "${path}.sha256" ]]; then
+        echo -e "  ${GREEN}►${NC} ${label} SHA256 : ${path}.sha256"
+    fi
+}
+
+update_repacked_update_manifest() {
+    local update_dir="$1"
+    local rootfs_path="${update_dir}/rootfs.squashfs"
+    local manifest_path=""
+    local rootfs_sha1=""
+
+    for candidate in "${update_dir}/MANIFEST" "${update_dir}/manifest.json"; do
+        if [[ -f "${candidate}" ]]; then
+            manifest_path="${candidate}"
+            break
+        fi
+    done
+
+    [[ -n "${manifest_path}" ]] || die "Repack failed: no MANIFEST file found in extracted truenas.update"
+    [[ -f "${rootfs_path}" ]] || die "Repack failed: rootfs.squashfs missing when updating MANIFEST"
+
+    rootfs_sha1="$(sha1sum "${rootfs_path}" | awk '{print $1}')"
+    [[ -n "${rootfs_sha1}" ]] || die "Failed to calculate SHA1 for rebuilt rootfs.squashfs"
+
+    info "Updating MANIFEST checksum for rootfs.squashfs → ${rootfs_sha1}"
+    grep -q '"checksums"' "${manifest_path}" \
+        || die "MANIFEST does not contain a checksums object"
+    grep -q '"rootfs.squashfs"' "${manifest_path}" \
+        || die "MANIFEST checksums missing rootfs.squashfs entry"
+    ROOTFS_SHA1="${rootfs_sha1}" perl -0pi -e 's/("rootfs\.squashfs"\s*:\s*")[^"]+(")/$1.$ENV{ROOTFS_SHA1}.$2/ge' "${manifest_path}" \
+        || die "Failed to rewrite rootfs.squashfs checksum in MANIFEST"
+
+    if [[ -f "${update_dir}/MANIFEST.sig" ]]; then
+        warn "Removing stale MANIFEST.sig after MANIFEST rewrite"
+        rm -f "${update_dir}/MANIFEST.sig"
+    fi
+}
+
+build_truenas_update_url() {
+    local version="$1"
+    local codename="${2:-}"
+    local update_filename=""
+
+    update_filename="$(build_truenas_update_filename "${version}")"
+
+    if [[ "${version}" =~ ^26\..*BETA ]]; then
+        printf 'https://update-public.sys.truenas.net/TrueNAS-26-BETA/%s\n' "${update_filename}"
+        return 0
+    fi
+
+    [[ -n "${codename}" ]] || return 1
+
+    printf 'https://download.truenas.com/TrueNAS-SCALE-%s/%s/%s?download=1\n' \
+        "${codename}" "${version}" "${update_filename}"
+}
+
+build_truenas_update_filename() {
+    local version="$1"
+
+    if [[ "${version}" =~ ^26\..*BETA ]]; then
+        printf 'TrueNAS-%s.update\n' "${version}"
+    else
+        printf 'TrueNAS-SCALE-%s.update\n' "${version}"
+    fi
+}
+
+select_nvidia_build_cc() {
+    local override="${NVIDIA_BUILD_CC:-}"
+    local detected_cc=""
+
+    if [[ -n "${override}" ]]; then
+        command -v "${override}" >/dev/null 2>&1 \
+            || die "NVIDIA_BUILD_CC override not found in PATH: ${override}"
+        printf '%s\n' "${override}"
+        return 0
+    fi
+
+    if command -v gcc >/dev/null 2>&1; then
+        if printf 'int main(void) { return 0; }\n' | gcc -fmin-function-alignment=16 -x c - -o /tmp/gcc-flag-check >/dev/null 2>&1; then
+            detected_cc="gcc"
+        elif command -v gcc-14 >/dev/null 2>&1; then
+            detected_cc="gcc-14"
+        else
+            detected_cc="gcc"
+        fi
+        rm -f /tmp/gcc-flag-check
+    elif command -v gcc-14 >/dev/null 2>&1; then
+        detected_cc="gcc-14"
+    fi
+
+    [[ -n "${detected_cc}" ]] || die "No suitable GCC compiler found in the container"
+    printf '%s\n' "${detected_cc}"
+}
+
 # ── sanity checks ────────────────────────────────────────────────────────────
-banner "NVIDIA sysext builder for TrueNAS SCALE"
+banner "NVIDIA sysext builder for TrueNAS"
 
 : "${NVIDIA_VERSION:?NVIDIA_VERSION environment variable is not set}"
 : "${TRUENAS_VERSION:?TRUENAS_VERSION environment variable is not set}"
-: "${TRUENAS_CODENAME:?TRUENAS_CODENAME environment variable is not set}"
+
+NVIDIA_KERNEL_MODULE_TYPE="${NVIDIA_KERNEL_MODULE_TYPE:-open}"
+TRUENAS_CODENAME="${TRUENAS_CODENAME:-}"
+EMBED_NVIDIA_RAW_IN_UPDATE="${EMBED_NVIDIA_RAW_IN_UPDATE:-false}"
 
 [[ -d /output ]] \
     || die "/output directory not found. Ensure it is bind-mounted."
@@ -50,8 +246,13 @@ if [[ -f /workspace/truenas.update ]]; then
     info "Using pre-existing /workspace/truenas.update"
     UPDATE_FILE="/workspace/truenas.update"
 else
-    DOWNLOAD_URL="https://download.truenas.com/TrueNAS-SCALE-${TRUENAS_CODENAME}/${TRUENAS_VERSION}/TrueNAS-SCALE-${TRUENAS_VERSION}.update?download=1"
-    info "Downloading TrueNAS SCALE ${TRUENAS_VERSION} (${TRUENAS_CODENAME}) update file …"
+    DOWNLOAD_URL="$(build_truenas_update_url "${TRUENAS_VERSION}" "${TRUENAS_CODENAME}")" \
+        || die "Unable to determine download URL for TRUENAS_VERSION=${TRUENAS_VERSION}. Set /workspace/truenas.update or provide a compatible TRUENAS_CODENAME."
+    if [[ -n "${TRUENAS_CODENAME}" ]]; then
+        info "Downloading TrueNAS ${TRUENAS_VERSION} (${TRUENAS_CODENAME}) update file …"
+    else
+        info "Downloading TrueNAS ${TRUENAS_VERSION} update file …"
+    fi
     info "URL: ${DOWNLOAD_URL}"
     wget -q --show-progress -O "${UPDATE_FILE}" "${DOWNLOAD_URL}" \
         || die "Failed to download TrueNAS update file from ${DOWNLOAD_URL}"
@@ -59,7 +260,11 @@ else
 fi
 
 info "NVIDIA driver version : ${NVIDIA_VERSION}"
-info "TrueNAS version       : ${TRUENAS_VERSION} (${TRUENAS_CODENAME})"
+if [[ -n "${TRUENAS_CODENAME}" ]]; then
+    info "TrueNAS version       : ${TRUENAS_VERSION} (${TRUENAS_CODENAME})"
+else
+    info "TrueNAS version       : ${TRUENAS_VERSION}"
+fi
 info "Update file           : ${UPDATE_FILE}"
 
 # ── directory layout ─────────────────────────────────────────────────────────
@@ -273,9 +478,12 @@ ok "NVIDIA installer ready: ${BUILD_DIR}/${RUN_FILE}"
 #     --silent                          non-interactive
 #     --kernel-source-path              TrueNAS's custom-named headers
 #     --kernel-name                     real numerical version for depmod
-#     --kernel-module-type=open         open-source kernel modules bypass
-#                                       MITIGATION_RETHUNK / naked-return
-#                                       hard errors on hardened kernels
+#     --kernel-module-type=<value>      selects NVIDIA kernel module flavor
+#                                       open        -> open GPU kernel modules
+#                                       proprietary -> legacy closed-source modules
+#                                       'open' avoids MITIGATION_RETHUNK /
+#                                       naked-return hard errors on hardened
+#                                       TrueNAS kernels for many modern GPUs
 #     --allow-installation-with-running-driver
 #                                       don't abort if host has nvidia.ko
 #     --no-rebuild-initramfs            cross-compiling; don't touch initramfs
@@ -294,7 +502,10 @@ ok "NVIDIA installer ready: ${BUILD_DIR}/${RUN_FILE}"
 # =============================================================================
 banner "Phase 4: Compiling & installing NVIDIA driver"
 
-export CC=gcc
+NVIDIA_BUILD_CC="$(select_nvidia_build_cc)"
+info "Using compiler for NVIDIA kernel modules: ${NVIDIA_BUILD_CC}"
+export CC="${NVIDIA_BUILD_CC}"
+export HOSTCC="${NVIDIA_BUILD_CC}"
 export IGNORE_CC_MISMATCH=1
 
 # ── 4a: BEFORE snapshot ─────────────────────────────────────────────────────
@@ -338,7 +549,7 @@ fi
 #    Flags closely match the official TrueNAS build:
 #      --skip-module-load  --silent  --kernel-name=<ver>
 #      --allow-installation-with-running-driver  --no-rebuild-initramfs
-#      --kernel-module-type=open
+#      --kernel-module-type=<open|proprietary>
 #    Additional flags for our cross-compile container environment:
 #      --kernel-source-path  --no-drm  --no-x-check  --no-nouveau-check
 #      --no-systemd  --no-backup
@@ -619,10 +830,7 @@ EXT_RELEASE_DIR="${STAGING_DIR}/usr/lib/extension-release.d"
 mkdir -p "${EXT_RELEASE_DIR}"
 
 info "Writing extension-release.nvidia metadata …"
-cat <<EOF > "${EXT_RELEASE_DIR}/extension-release.nvidia"
-ID=debian
-VERSION_ID="12"
-EOF
+write_truenas_extension_release "${EXT_RELEASE_DIR}/extension-release.nvidia"
 ok "extension-release.nvidia written"
 
 # =============================================================================
@@ -630,10 +838,12 @@ ok "extension-release.nvidia written"
 # =============================================================================
 banner "Phase 6: Creating nvidia.raw squashfs image"
 
-# Build a descriptive output filename
-# e.g. nvidia_595.58.03_6.12.33-production+truenas.raw
-OUTPUT_FILENAME="nvidia_${NVIDIA_VERSION}_${KERNEL_VERSION}.raw"
-OUTPUT_PATH="/output/${OUTPUT_FILENAME}"
+OUTPUT_DIR="/output/${TRUENAS_VERSION}"
+OUTPUT_FILENAME="nvidia.raw"
+OUTPUT_PATH="${OUTPUT_DIR}/${OUTPUT_FILENAME}"
+OFFICIAL_UPDATE_FILENAME="$(build_truenas_update_filename "${TRUENAS_VERSION}")"
+
+mkdir -p "${OUTPUT_DIR}"
 
 # Show staging tree size
 STAGING_SIZE=$(du -sh "${STAGING_DIR}" | cut -f1)
@@ -648,28 +858,77 @@ du -sh "${STAGING_DIR}"/usr/*/ 2>/dev/null | sed 's/^/  /'
 # convention.  Note: zstd level 19 compressed this same content to 381 MB
 # (37% ratio) but the reference manual build used gzip (~42% ratio → 438 MB).
 # The content is identical; only compression efficiency differs.
-info "Building squashfs with gzip compression (matching TrueNAS convention) …"
-mksquashfs "${STAGING_DIR}" "${OUTPUT_PATH}" \
-    -comp gzip \
-    -all-root \
-    -noappend \
-    || die "mksquashfs failed"
+build_release_artifact "${STAGING_DIR}" "${OUTPUT_PATH}" "nvidia.raw"
 
 FINAL_SIZE=$(du -h "${OUTPUT_PATH}" | cut -f1)
 FINAL_BYTES=$(stat -c%s "${OUTPUT_PATH}" 2>/dev/null || echo "unknown")
 ok "${OUTPUT_FILENAME} created successfully"
+
+UPDATED_TRUENAS_UPDATE_PATH=""
+UPDATED_TRUENAS_UPDATE_FILENAME=""
+
+if env_is_true "${EMBED_NVIDIA_RAW_IN_UPDATE}"; then
+    # =========================================================================
+    # PHASE 7 — Repack truenas.update with the newly built nvidia.raw
+    # =========================================================================
+    banner "Phase 7: Repacking truenas.update with the new nvidia.raw"
+
+    UPDATE_REPACK_DIR="/tmp/update_repack"
+    UPDATE_ROOTFS_REPACK_DIR="/tmp/update_rootfs_repack"
+    UPDATED_ROOTFS_SQUASHFS="/tmp/rootfs.updated.squashfs"
+    UPDATED_TRUENAS_UPDATE_FILENAME="${OFFICIAL_UPDATE_FILENAME}"
+    UPDATED_TRUENAS_UPDATE_PATH="${OUTPUT_DIR}/${UPDATED_TRUENAS_UPDATE_FILENAME}"
+
+    rm -rf "${UPDATE_REPACK_DIR}" "${UPDATE_ROOTFS_REPACK_DIR}" "${UPDATED_ROOTFS_SQUASHFS}"
+    mkdir -p "${UPDATE_REPACK_DIR}" "${UPDATE_ROOTFS_REPACK_DIR}"
+
+    info "Extracting full truenas.update for repacking …"
+    unsquashfs -f -d "${UPDATE_REPACK_DIR}" "${UPDATE_FILE}" \
+        || die "Failed to extract truenas.update for repacking"
+
+    [[ -f "${UPDATE_REPACK_DIR}/rootfs.squashfs" ]] \
+        || die "Repack failed: rootfs.squashfs missing from extracted truenas.update"
+
+    info "Extracting full rootfs.squashfs for nvidia.raw replacement …"
+    unsquashfs -f -d "${UPDATE_ROOTFS_REPACK_DIR}" "${UPDATE_REPACK_DIR}/rootfs.squashfs" \
+        || die "Failed to extract rootfs.squashfs for repacking"
+
+    EMBEDDED_NVIDIA_RAW_PATH="$(resolve_embedded_nvidia_raw_path "${UPDATE_ROOTFS_REPACK_DIR}")" \
+        || die "Unable to locate the bundled nvidia.raw inside truenas.update"
+
+    info "Replacing bundled nvidia.raw at: ${EMBEDDED_NVIDIA_RAW_PATH}"
+    cp -f "${OUTPUT_PATH}" "${EMBEDDED_NVIDIA_RAW_PATH}" \
+        || die "Failed to replace bundled nvidia.raw"
+
+    info "Rebuilding rootfs.squashfs …"
+    rm -f "${UPDATE_REPACK_DIR}/rootfs.squashfs"
+    build_squashfs_image "${UPDATE_ROOTFS_REPACK_DIR}" "${UPDATED_ROOTFS_SQUASHFS}" "rootfs.squashfs"
+    mv "${UPDATED_ROOTFS_SQUASHFS}" "${UPDATE_REPACK_DIR}/rootfs.squashfs"
+    update_repacked_update_manifest "${UPDATE_REPACK_DIR}"
+
+    info "Building updated truenas.update …"
+    rm -f "${UPDATED_TRUENAS_UPDATE_PATH}"
+    build_release_artifact "${UPDATE_REPACK_DIR}" "${UPDATED_TRUENAS_UPDATE_PATH}" "truenas.update"
+
+    ok "Updated truenas.update created: ${UPDATED_TRUENAS_UPDATE_PATH}"
+fi
 
 # =============================================================================
 # Done — Summary
 # =============================================================================
 banner "Build complete!"
 
-echo -e "  ${GREEN}►${NC} Output     : /output/${OUTPUT_FILENAME}"
+print_artifact_summary_line "Output" "${OUTPUT_PATH}"
 echo -e "  ${GREEN}►${NC} Image size : ${FINAL_SIZE} (${FINAL_BYTES} bytes)"
-echo -e "  ${GREEN}►${NC} Driver     : NVIDIA ${NVIDIA_VERSION}"
+echo -e "  ${GREEN}►${NC} Driver     : NVIDIA ${NVIDIA_VERSION} (${NVIDIA_KERNEL_MODULE_TYPE})"
 echo -e "  ${GREEN}►${NC} Kernel     : ${KERNEL_VERSION}"
 echo -e "  ${GREEN}►${NC} Modules    : ${KO_COUNT} .ko file(s)"
 echo -e "  ${GREEN}►${NC} Staged     : ${STAGED_COUNT} total files"
+
+if [[ -n "${UPDATED_TRUENAS_UPDATE_PATH}" ]]; then
+    print_artifact_summary_line "Update" "${UPDATED_TRUENAS_UPDATE_PATH}"
+fi
+
 echo ""
 
 # Size sanity check against the known-good manual build (~438 MB with gzip)
@@ -683,6 +942,5 @@ fi
 
 echo ""
 echo -e "  Deploy to TrueNAS:"
-echo -e "    ${CYAN}./deploy-nvidia.sh output/${OUTPUT_FILENAME}${NC}"
+echo -e "    ${CYAN}./deploy-nvidia.sh ${OUTPUT_PATH}${NC}"
 echo ""
-

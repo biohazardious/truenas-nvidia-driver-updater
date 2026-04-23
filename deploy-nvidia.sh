@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# deploy-nvidia.sh — Deploy nvidia.raw sysext to TrueNAS SCALE
+# deploy-nvidia.sh — Deploy nvidia.raw sysext to TrueNAS
 #
 # Usage:  ./deploy-nvidia.sh <path-to-nvidia.raw>
 #
@@ -10,6 +10,7 @@
 #   3. Backs up the existing nvidia.raw alongside this script
 #   4. Copies the new nvidia.raw into place
 #   5. Re-locks /usr and merges extensions
+#   6. Prints sysext compatibility diagnostics automatically if merge fails
 # =============================================================================
 set -euo pipefail
 
@@ -20,6 +21,39 @@ info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()   { echo -e "${RED}[FATAL]${NC} $*" >&2; exit 1; }
+
+print_sysext_diagnostics() {
+    local raw_path="$1"
+
+    echo ""
+    warn "systemd-sysext reported an incompatible image. Collecting diagnostics …"
+
+    echo ""
+    echo -e "${BOLD}--- Host /usr/lib/os-release ---${NC}"
+    if [[ -f /usr/lib/os-release ]]; then
+        cat /usr/lib/os-release
+    else
+        warn "/usr/lib/os-release not found"
+    fi
+
+    echo ""
+    echo -e "${BOLD}--- Embedded extension-release metadata ---${NC}"
+    if command -v unsquashfs >/dev/null 2>&1; then
+        if ! unsquashfs -cat "${raw_path}" usr/lib/extension-release.d/extension-release.nvidia 2>/dev/null; then
+            warn "Could not read usr/lib/extension-release.d/extension-release.nvidia from ${raw_path}"
+        fi
+    else
+        warn "unsquashfs is not available; cannot inspect extension-release metadata inside ${raw_path}"
+    fi
+
+    echo ""
+    echo -e "${BOLD}--- systemd-sysext status ---${NC}"
+    systemd-sysext status || true
+
+    echo ""
+    echo -e "${BOLD}--- SYSTEMD_LOG_LEVEL=debug systemd-sysext refresh ---${NC}"
+    SYSTEMD_LOG_LEVEL=debug systemd-sysext refresh || true
+}
 
 SYSEXT_DIR="/usr/share/truenas/sysext-extensions"
 NVIDIA_RAW="${SYSEXT_DIR}/nvidia.raw"
@@ -85,7 +119,10 @@ zfs set readonly=on "${USR_DATASET}"
 ok "Dataset locked (readonly=on)"
 
 info "Merging sysext extensions …"
-systemd-sysext merge
+if ! systemd-sysext merge; then
+    print_sysext_diagnostics "${NVIDIA_RAW}"
+    die "systemd-sysext merge failed"
+fi
 ok "Extensions merged"
 
 # ── Summary ─────────────────────────────────────────────────────────────────
