@@ -3,7 +3,7 @@ services:
     build: .
     container_name: truenas-nvidia-builder
     environment:
-      - NVIDIA_VERSION=590.44.01
+      - NVIDIA_VERSION=595.80
       # NVIDIA installer values:
       #   open         -> Open GPU kernel modules. Preferred for most newer GPUs on current TrueNAS releases.
       #   proprietary  -> Legacy closed-source kernel modules. Use when open modules are incompatible with your GPU/driver stack.
@@ -11,9 +11,9 @@ services:
       # Optional compiler override for the NVIDIA module build, e.g. gcc or gcc-14.
       # Leave unset/empty to let entrypoint auto-detect a suitable compiler.
       - NVIDIA_BUILD_CC=
-      - TRUENAS_VERSION=26.0.0-BETA.1
+      - TRUENAS_VERSION=25.10.3.1
       # Required for 25.x and earlier downloads. Leave empty for TrueNAS 26+.
-      - TRUENAS_CODENAME=
+      - TRUENAS_CODENAME=Goldeye
       # true/false — when enabled, also generate a new truenas.update with the
       # bundled /usr/share/truenas/sysext-extensions/nvidia.raw replaced.
       - EMBED_NVIDIA_RAW_IN_UPDATE=false
