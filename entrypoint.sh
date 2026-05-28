@@ -128,11 +128,13 @@ write_sha256_file() {
 
 print_artifact_summary_line() {
     local label="$1"
-    local path="$2"
+    local display_path="$2"
+    # Optional: actual container path for file checks (defaults to display_path)
+    local check_path="${3:-${display_path}}"
 
-    echo -e "  ${GREEN}►${NC} ${label} : ${path}"
-    if [[ -f "${path}.sha256" ]]; then
-        echo -e "  ${GREEN}►${NC} ${label} SHA256 : ${path}.sha256"
+    echo -e "  ${GREEN}►${NC} ${label} : ${display_path}"
+    if [[ -f "${check_path}.sha256" ]]; then
+        echo -e "  ${GREEN}►${NC} ${label} SHA256 : ${display_path}.sha256"
     fi
 }
 
@@ -918,7 +920,10 @@ fi
 # =============================================================================
 banner "Build complete!"
 
-print_artifact_summary_line "Output" "${OUTPUT_PATH}"
+# Convert container paths (/output/...) to host-relative paths (./output/...)
+HOST_OUTPUT_PATH="./output/${TRUENAS_VERSION}/${OUTPUT_FILENAME}"
+
+print_artifact_summary_line "Output" "${HOST_OUTPUT_PATH}" "${OUTPUT_PATH}"
 echo -e "  ${GREEN}►${NC} Image size : ${FINAL_SIZE} (${FINAL_BYTES} bytes)"
 echo -e "  ${GREEN}►${NC} Driver     : NVIDIA ${NVIDIA_VERSION} (${NVIDIA_KERNEL_MODULE_TYPE})"
 echo -e "  ${GREEN}►${NC} Kernel     : ${KERNEL_VERSION}"
@@ -926,7 +931,8 @@ echo -e "  ${GREEN}►${NC} Modules    : ${KO_COUNT} .ko file(s)"
 echo -e "  ${GREEN}►${NC} Staged     : ${STAGED_COUNT} total files"
 
 if [[ -n "${UPDATED_TRUENAS_UPDATE_PATH}" ]]; then
-    print_artifact_summary_line "Update" "${UPDATED_TRUENAS_UPDATE_PATH}"
+    HOST_UPDATE_PATH="$(echo "${UPDATED_TRUENAS_UPDATE_PATH}" | sed 's|^/output/|./output/|')"
+    print_artifact_summary_line "Update" "${HOST_UPDATE_PATH}" "${UPDATED_TRUENAS_UPDATE_PATH}"
 fi
 
 echo ""
@@ -942,5 +948,5 @@ fi
 
 echo ""
 echo -e "  Deploy to TrueNAS:"
-echo -e "    ${CYAN}./deploy-nvidia.sh ${OUTPUT_PATH}${NC}"
+echo -e "    ${CYAN}./deploy-nvidia.sh ./output/${TRUENAS_VERSION}/${OUTPUT_FILENAME}${NC}"
 echo ""
