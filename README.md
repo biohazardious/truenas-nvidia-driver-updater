@@ -8,6 +8,7 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 
 ## Features
 
+- **Interactive wizard** — `configure.sh` fetches real version lists with smart tagging (★ Latest Stable, ★ Production Branch, etc.) and guides you through setup. Uses whiptail TUI dialogs when available (TrueNAS has it), with bash `select` menus as fallback
 - **Fully automated** — downloads TrueNAS update file, extracts kernel headers, compiles the driver, packages everything
 - **TrueNAS 25/26 aware** — supports 25.x codename-based downloads and TrueNAS 26 update URLs
 - **Production-kernel aware** — correctly selects the production kernel over debug variants
@@ -22,17 +23,61 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 
 ### 1. Configure
 
-Edit `docker-compose.yaml` with your target versions:
+Run the interactive wizard — it fetches available versions and generates `docker-compose.yaml` for you:
+
+```bash
+chmod +x configure.sh
+./configure.sh
+```
+
+The wizard walks you through 4 steps with numbered menus. Key versions are tagged so you don't need to look anything up:
+
+```
+  Step 1: Select TrueNAS Version
+
+   1) 25.10.3.1 (Goldeye)  ★ Latest Stable
+   2) 26.0.0-BETA.1  ★ Latest Pre-release
+   3) 25.04.2.6 (Fangtooth)  ★ Previous Stable
+   4) 25.10.3 (Goldeye)
+   5) 25.10.2.1 (Goldeye)
+   ...
+   84) ✎ Enter manually
+   #? 1
+
+  Step 2: Select NVIDIA Driver Version
+
+   1) 595.80  ★ Production Branch
+   2) 610.43.02  ★ New Feature Branch
+   3) 470.256.02  ★ Legacy GPU (470.xx)
+   4) 595.44.01
+   5) 590.144.01
+   ...
+   95) ✎ Enter manually
+   #? 1
+
+  Step 3: Select Kernel Module Type      →  open / proprietary
+  Step 4: Embed nvidia.raw in .update?   →  yes / no
+```
+
+After the last step, `docker-compose.yaml` is generated automatically. The wizard also offers to start the build for you.
+
+> **Adaptive UI** — auto-detects `whiptail` for full TUI dialog boxes (available on TrueNAS). Falls back to plain bash menus if whiptail isn't found. Use `--no-whiptail` to force bash mode.
+
+<details>
+<summary><b>Alternative: manual configuration</b></summary>
+
+Edit `docker-compose.yaml` directly:
 
 ```yaml
 environment:
-  - NVIDIA_VERSION=590.44.01       # NVIDIA driver version
-  - NVIDIA_KERNEL_MODULE_TYPE=open # open or proprietary
-  - NVIDIA_BUILD_CC=               # optional: gcc / gcc-14 / other compiler in PATH
-  - TRUENAS_VERSION=26.0.0-BETA.1  # TrueNAS version
-  - TRUENAS_CODENAME=              # Required for 25.x and earlier only
+  - NVIDIA_VERSION=595.80           # NVIDIA driver version
+  - NVIDIA_KERNEL_MODULE_TYPE=open  # open or proprietary
+  - NVIDIA_BUILD_CC=                # optional: gcc / gcc-14 / other compiler in PATH
+  - TRUENAS_VERSION=25.10.3.1       # TrueNAS version
+  - TRUENAS_CODENAME=Goldeye        # Required for 25.x and earlier only
   - EMBED_NVIDIA_RAW_IN_UPDATE=false  # also emit a rebuilt truenas.update when true
 ```
+</details>
 
 ### 2. Build
 
@@ -232,8 +277,9 @@ ls -la backups/
 
 ```
 .
+├── configure.sh            # Interactive setup wizard (generates docker-compose.yaml)
 ├── Dockerfile              # Debian 12 build container
-├── docker-compose.yaml     # Build configuration (versions here)
+├── docker-compose.yaml     # Build configuration (auto-generated or manual)
 ├── entrypoint.sh           # Main build script
 ├── deploy-nvidia.sh        # TrueNAS deployment script
 ├── output/                 # Build outputs organized by TrueNAS version
@@ -245,6 +291,7 @@ ls -la backups/
 ## Requirements
 
 - **Build machine**: Docker with `docker compose`
+- **Configuration wizard**: `curl` or `wget` (for fetching version lists)
 - **TrueNAS**: 24.04+ / 25.x / 26.x (systemd-sysext support)
 - **GPU**: Any NVIDIA GPU supported by the target driver version
 
