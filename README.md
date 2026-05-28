@@ -53,7 +53,7 @@ The wizard auto-detects your TrueNAS version and GPU, then walks you through 4 s
   Step 4: Embed nvidia.raw in .update?   →  yes / no
 ```
 
-After the last step, `docker-compose.yaml` is generated automatically.
+After the last step, `.env` is generated — Docker Compose reads it automatically. `docker-compose.yaml` is a git-tracked template and never modified.
 
 > **Adaptive UI** — auto-detects `whiptail` for full TUI dialog boxes (available on TrueNAS). Falls back to plain bash menus if whiptail isn't found. Use `--no-whiptail` to force bash mode.
 
@@ -84,23 +84,29 @@ Already configured but want to change just one thing? Use `--reconfigure`:
 ./configure.sh --reconfigure
 ```
 
-It reads the existing `docker-compose.yaml`, lets you pick which setting to change, and regenerates the file — no need to re-run the full wizard.
+It reads the existing `.env`, lets you pick which setting to change, and regenerates the file — no need to re-run the full wizard.
 </details>
 
 <details>
 <summary><b>Manual configuration</b></summary>
 
-Edit `docker-compose.yaml` directly:
+Copy `.env.example` to `.env` and edit:
 
-```yaml
-environment:
-  - NVIDIA_VERSION=595.80           # NVIDIA driver version
-  - NVIDIA_KERNEL_MODULE_TYPE=open  # open or proprietary
-  - NVIDIA_BUILD_CC=                # optional: gcc / gcc-14 / other compiler in PATH
-  - TRUENAS_VERSION=25.10.3.1       # TrueNAS version
-  - TRUENAS_CODENAME=Goldeye        # Required for 25.x and earlier only
-  - EMBED_NVIDIA_RAW_IN_UPDATE=false  # also emit a rebuilt truenas.update when true
+```bash
+cp .env.example .env
 ```
+
+```ini
+# .env
+NVIDIA_VERSION=595.80
+TRUENAS_VERSION=25.10.3.1
+NVIDIA_KERNEL_MODULE_TYPE=open
+TRUENAS_CODENAME=Goldeye
+NVIDIA_BUILD_CC=
+EMBED_NVIDIA_RAW_IN_UPDATE=false
+```
+
+`docker-compose.yaml` is a git-tracked template — it reads values from `.env` automatically. Never edit `docker-compose.yaml` directly.
 </details>
 
 ### 2. Build
