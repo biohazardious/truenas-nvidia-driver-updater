@@ -11,6 +11,9 @@ services:
       # Optional compiler override for the NVIDIA module build, e.g. gcc or gcc-14.
       # Leave unset/empty to let entrypoint auto-detect a suitable compiler.
       - NVIDIA_BUILD_CC=
+      # true/false — install nvidia-drm.ko so /dev/dri can be created on the host.
+      # Set false only if the target TrueNAS kernel cannot load nvidia_drm.
+      - NVIDIA_INSTALL_DRM=true
       - TRUENAS_VERSION=26.0.0-BETA.1
       # Required for 25.x and earlier downloads. Leave empty for TrueNAS 26+.
       - TRUENAS_CODENAME=
