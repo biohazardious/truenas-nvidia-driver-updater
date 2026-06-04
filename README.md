@@ -23,7 +23,7 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 
 ### 1. Configure
 
-Run the interactive wizard — it auto-detects your system, fetches version lists, and generates `docker-compose.yaml`:
+Run the interactive wizard — it auto-detects your system, fetches version lists, and generates `.env`:
 
 ```bash
 chmod +x configure.sh
@@ -103,6 +103,7 @@ TRUENAS_VERSION=25.10.3.1
 NVIDIA_KERNEL_MODULE_TYPE=open
 TRUENAS_CODENAME=Goldeye
 NVIDIA_BUILD_CC=
+NVIDIA_INSTALL_DRM=true
 EMBED_NVIDIA_RAW_IN_UPDATE=false
 ```
 
@@ -145,6 +146,10 @@ Output naming follows the TrueNAS version:
 - set `NVIDIA_BUILD_CC=gcc` to force the default compiler
 - set `NVIDIA_BUILD_CC=gcc-14` to force GCC 14 for newer TrueNAS kernels
 
+`NVIDIA_INSTALL_DRM=true` installs `nvidia-drm.ko` by default. This lets the TrueNAS host load `nvidia_drm` and create `/dev/dri`, which official apps such as Steam Headless may map when GPU support is detected.
+
+Set `NVIDIA_INSTALL_DRM=false` only if your target TrueNAS kernel cannot load `nvidia_drm`; the script will pass `--no-drm` to the NVIDIA installer in that case.
+
 ### 3. Deploy to TrueNAS
 
 Copy the generated `output/<TRUENAS_VERSION>/nvidia.raw` and `deploy-nvidia.sh` to your TrueNAS system, then:
@@ -166,6 +171,9 @@ The deploy script handles everything:
 
 ```bash
 nvidia-smi
+modinfo nvidia_drm
+modprobe nvidia_drm modeset=1
+ls -la /dev/dri
 ```
 
 ---
@@ -222,7 +230,7 @@ TrueNAS 25/26 uses an immutable root filesystem. `systemd-sysext` provides a sup
 |----------|-----------|
 | `--kernel-module-type=open` | Uses the open GPU kernel modules; this is the recommended default here and avoids `MITIGATION_RETHUNK` / naked-return hard errors on hardened TrueNAS kernels for many modern GPUs |
 | Auto-detect `gcc` / `gcc-14` with optional `NVIDIA_BUILD_CC` override | Newer TrueNAS kernels may require GCC 14-only module build flags, while older driver/kernel combinations may still benefit from forcing a specific compiler |
-| `--no-drm` | TrueNAS kernel lacks `drm_fbdev_ttm_driver_fbdev_probe`, causing `nvidia-drm.ko` to fail with "Unknown symbol". DRM/KMS is for display output — irrelevant on a headless NAS |
+| `NVIDIA_INSTALL_DRM=true` by default | Ships `nvidia-drm.ko` so the host can create `/dev/dri` for apps that require DRM device mapping. Set `NVIDIA_INSTALL_DRM=false` to pass `--no-drm` when a target kernel cannot load `nvidia_drm` |
 | Production kernel preference | TrueNAS ships both debug and production kernels; the production kernel is what actually boots. Alphabetical sorting would pick the wrong one |
 | Combined `modules.dep` | The sysext's `modules.dep` overlays the system's via overlayfs. Shipping an nvidia-only `modules.dep` would make all other kernel modules (nf_tables, bridge, etc.) invisible, breaking Docker and networking |
 | `extension-release.nvidia` → `ID=_any` | Matches TrueNAS's own sysext packaging behavior and avoids host-version compatibility rejection during `systemd-sysext merge` |

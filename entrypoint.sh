@@ -18,6 +18,9 @@
 #   NVIDIA_BUILD_CC     — Optional compiler override for NVIDIA kernel module
 #                         builds (for example: gcc, gcc-14)
 #                         By default the script auto-detects a suitable GCC.
+#   NVIDIA_INSTALL_DRM  — true/false. When true, build/install nvidia-drm.ko
+#                         so hosts can create /dev/dri after modprobe
+#                         nvidia_drm modeset=1.
 #   TRUENAS_CODENAME   — Required for 25.x and earlier download URLs
 #                         (e.g. Goldeye). Not used for TrueNAS 26+.
 #   /workspace/truenas.update — Pre-downloaded update file (skips download)
@@ -234,6 +237,7 @@ banner "NVIDIA sysext builder for TrueNAS"
 : "${TRUENAS_VERSION:?TRUENAS_VERSION environment variable is not set}"
 
 NVIDIA_KERNEL_MODULE_TYPE="${NVIDIA_KERNEL_MODULE_TYPE:-open}"
+NVIDIA_INSTALL_DRM="${NVIDIA_INSTALL_DRM:-true}"
 TRUENAS_CODENAME="${TRUENAS_CODENAME:-}"
 EMBED_NVIDIA_RAW_IN_UPDATE="${EMBED_NVIDIA_RAW_IN_UPDATE:-false}"
 
@@ -494,12 +498,10 @@ ok "NVIDIA installer ready: ${BUILD_DIR}/${RUN_FILE}"
 #     --no-nouveau-check                irrelevant inside build container
 #     --no-systemd                      skip systemd unit installation
 #     --no-backup                       no backup of "previous" driver files
-#     --no-drm                          skip nvidia-drm.ko — TrueNAS kernel
-#                                       lacks drm_fbdev_ttm_driver_fbdev_probe
-#                                       causing "Unknown symbol" at load time
-#                                       which cascades into Docker failures.
-#                                       DRM/KMS is for display; irrelevant on
-#                                       a headless NAS.
+#     --no-drm                          optional escape hatch when a target
+#                                       kernel cannot load nvidia-drm.ko.
+#                                       By default DRM is installed so /dev/dri
+#                                       can exist for TrueNAS Apps that map it.
 #     --install-libglvnd                include GLvnd dispatch libraries
 # =============================================================================
 banner "Phase 4: Compiling & installing NVIDIA driver"
@@ -553,11 +555,11 @@ fi
 #      --allow-installation-with-running-driver  --no-rebuild-initramfs
 #      --kernel-module-type=<open|proprietary>
 #    Additional flags for our cross-compile container environment:
-#      --kernel-source-path  --no-drm  --no-x-check  --no-nouveau-check
+#      --kernel-source-path  --no-x-check  --no-nouveau-check
 #      --no-systemd  --no-backup
 # ─────────────────────────────────────────────────────────────────────────────
 info "Running NVIDIA installer in silent cross-compile mode …"
-"./${RUN_FILE}" \
+NVIDIA_INSTALLER_ARGS=(
     --silent \
     --kernel-source-path="${KERNEL_HEADERS_PATH}" \
     --kernel-name="${KERNEL_VERSION}" \
@@ -569,8 +571,17 @@ info "Running NVIDIA installer in silent cross-compile mode …"
     --no-nouveau-check \
     --no-systemd \
     --no-backup \
-    --no-drm \
-    --install-libglvnd \
+    --install-libglvnd
+)
+
+if env_is_true "${NVIDIA_INSTALL_DRM}"; then
+    info "NVIDIA DRM module install: enabled"
+else
+    info "NVIDIA DRM module install: disabled (--no-drm)"
+    NVIDIA_INSTALLER_ARGS+=(--no-drm)
+fi
+
+"./${RUN_FILE}" "${NVIDIA_INSTALLER_ARGS[@]}" \
     || die "NVIDIA installer failed. Check output above for details."
 
 ok "NVIDIA driver installed successfully"
@@ -814,7 +825,11 @@ check_file "nvidia.ko (MAIN)"       "*/nvidia.ko"
 check_file "nvidia-modeset.ko"      "*/nvidia-modeset.ko"
 check_file "nvidia-uvm.ko"          "*/nvidia-uvm.ko"
 check_file "nvidia-peermem.ko"      "*/nvidia-peermem.ko"
-info "  nvidia-drm.ko — intentionally excluded (--no-drm; TrueNAS kernel lacks DRM TTM fbdev)"
+if env_is_true "${NVIDIA_INSTALL_DRM}"; then
+    check_file "nvidia-drm.ko"      "*/nvidia-drm.ko"
+else
+    info "  nvidia-drm.ko — intentionally excluded (NVIDIA_INSTALL_DRM=${NVIDIA_INSTALL_DRM})"
+fi
 check_file "nvidia-container-runtime (Docker GPU)" "*/usr/bin/nvidia-container-runtime"
 check_file "nvidia-container-cli"    "*/usr/bin/nvidia-container-cli"
 check_file "nvidia-ctk"             "*/usr/bin/nvidia-ctk"
@@ -826,6 +841,14 @@ if [[ -z "${MAIN_MODULE}" ]]; then
     die "CRITICAL: nvidia.ko (the main kernel module) is MISSING from the staged image. nvidia-smi will fail."
 fi
 ok "Main nvidia.ko module confirmed at: ${MAIN_MODULE}"
+
+if env_is_true "${NVIDIA_INSTALL_DRM}"; then
+    DRM_MODULE=$(find "${STAGING_DIR}" -name 'nvidia-drm.ko' -type f 2>/dev/null | head -1)
+    if [[ -z "${DRM_MODULE}" ]]; then
+        die "CRITICAL: NVIDIA_INSTALL_DRM=true but nvidia-drm.ko is MISSING from the staged image. /dev/dri will not be created."
+    fi
+    ok "nvidia-drm.ko module confirmed at: ${DRM_MODULE}"
+fi
 
 # ── 5d: Write extension-release metadata ────────────────────────────────────
 EXT_RELEASE_DIR="${STAGING_DIR}/usr/lib/extension-release.d"
@@ -928,6 +951,7 @@ echo -e "  ${GREEN}►${NC} Image size : ${FINAL_SIZE} (${FINAL_BYTES} bytes)"
 echo -e "  ${GREEN}►${NC} Driver     : NVIDIA ${NVIDIA_VERSION} (${NVIDIA_KERNEL_MODULE_TYPE})"
 echo -e "  ${GREEN}►${NC} Kernel     : ${KERNEL_VERSION}"
 echo -e "  ${GREEN}►${NC} Modules    : ${KO_COUNT} .ko file(s)"
+echo -e "  ${GREEN}►${NC} DRM        : ${NVIDIA_INSTALL_DRM}"
 echo -e "  ${GREEN}►${NC} Staged     : ${STAGED_COUNT} total files"
 
 if [[ -n "${UPDATED_TRUENAS_UPDATE_PATH}" ]]; then
