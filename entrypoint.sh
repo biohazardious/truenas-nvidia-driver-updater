@@ -10,19 +10,38 @@
 #
 # Optional:
 #   NVIDIA_KERNEL_MODULE_TYPE
-#                       — Passed directly to NVIDIA installer as
+#                       — Passed to the NVIDIA installer as
 #                         --kernel-module-type=<value>
 #                         Supported values commonly used here:
 #                           open        -> Open GPU kernel modules
 #                           proprietary -> Legacy closed-source modules
+#                         Only honored when the installer supports the flag
+#                         (~555 and newer). On older branches the flavor can't
+#                         be selected and the installer's default (proprietary)
+#                         is built. Installer flags in general are gated by what
+#                         the extracted installer actually supports, so building
+#                         older drivers (e.g. 470) won't fail on unknown options.
 #   NVIDIA_BUILD_CC     — Optional compiler override for NVIDIA kernel module
-#                         builds (for example: gcc, gcc-14)
-#                         By default the script auto-detects a suitable GCC.
+#                         builds (for example: gcc-12, gcc-14). By default the
+#                         script matches the GCC major the target kernel was
+#                         built with (from CONFIG_CC_VERSION_TEXT); building with
+#                         a much newer GCC breaks NVIDIA's conftest detection.
 #   NVIDIA_INSTALL_DRM  — true/false. When true, build/install nvidia-drm.ko
 #                         so hosts can create /dev/dri after modprobe
 #                         nvidia_drm modeset=1.
 #   TRUENAS_CODENAME   — Required for 25.x and earlier download URLs
 #                         (e.g. Goldeye). Not used for TrueNAS 26+.
+#   SKIP_KERNEL_COMPAT_CHECK
+#                       — true/false (default false). When false, the build
+#                         aborts early if the chosen driver branch is known to
+#                         be incompatible with the target kernel (e.g. legacy
+#                         470 on kernel 6.10+). Set true to attempt anyway.
+#   /patches (or NVIDIA_PATCH_DIR, or /workspace/patches)
+#                       — Optional. *.patch/*.diff files dropped here are applied
+#                         to the extracted NVIDIA source before compiling — e.g.
+#                         community patches to build an EOL driver (470) on a
+#                         newer kernel. Their presence also relaxes the early
+#                         driver/kernel compatibility abort.
 #   /workspace/truenas.update — Pre-downloaded update file (skips download)
 #   /output                   — Bind-mounted output directory
 #   EMBED_NVIDIA_RAW_IN_UPDATE=true
@@ -53,12 +72,132 @@ banner(){ echo -e "\n${BOLD}═════════════════�
           echo -e "${BOLD}  $*${NC}";
           echo -e "${BOLD}════════════════════════════════════════════════════════════${NC}\n"; }
 
+# Persist nvidia-installer's log out of the (ephemeral) container to the mounted
+# /output directory, echo its tail inline so the real failure is visible without
+# digging out the file, then abort.
+NVIDIA_INSTALLER_LOG="/var/log/nvidia-installer.log"
+save_installer_log_and_die() {
+    local message="$1"
+    if [[ -f "${NVIDIA_INSTALLER_LOG}" ]]; then
+        if [[ -d /output ]] && cp -f "${NVIDIA_INSTALLER_LOG}" /output/nvidia-installer.log 2>/dev/null; then
+            warn "Full installer log saved to ./output/nvidia-installer.log"
+        fi
+        echo -e "${YELLOW}──── last 40 lines of ${NVIDIA_INSTALLER_LOG} ────${NC}" >&2
+        tail -n 40 "${NVIDIA_INSTALLER_LOG}" >&2 || true
+        echo -e "${YELLOW}────────────────────────────────────────────────────────${NC}" >&2
+    else
+        warn "No ${NVIDIA_INSTALLER_LOG} was produced to save."
+    fi
+    die "${message}"
+}
+
+# Probe a URL after a failed download so the reason is visible (404 → wrong
+# version/codename, 403, DNS/connection error, …). wget -q hides this otherwise.
+report_url_status() {
+    local url="$1"
+    warn "Probing the URL to diagnose the failure …"
+    wget --spider -S -T 15 -t 1 "${url}" 2>&1 \
+        | grep -iE 'HTTP/|not found|forbidden|moved|redirect|length:|resolve|refused|timed out|unable' \
+        | sed 's/^[[:space:]]*/    /' \
+        || warn "    (no diagnostic detail available)"
+}
+
 env_is_true() {
     local value="${1:-}"
     case "${value,,}" in
         1|true|yes|on) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# Returns 0 (true) when the extracted nvidia-installer recognizes a given long
+# option. Older driver branches lack many flags that newer ones added, and the
+# installer aborts on the FIRST unrecognized option, so we cannot hardcode a
+# version→flag matrix (LTS branches like 535/550 even lag the feature branches).
+# Instead we grep the option name out of the installer binary itself — each
+# option's long name is a string literal compiled into the binary — which is
+# authoritative for whatever version we happen to be building.
+#
+# Requires NVIDIA_INSTALLER_BIN to be set (see Phase 3 extraction step).
+installer_supports_option() {
+    local name="${1#--}"          # strip leading --
+    name="${name%%=*}"            # strip any =value
+    # Explicit option name present verbatim (e.g. "no-drm", "skip-module-load").
+    if LC_ALL=C grep -aqF -- "${name}" "${NVIDIA_INSTALLER_BIN}"; then
+        return 0
+    fi
+    # Boolean options are stored only by their positive name; the "--no-" form is
+    # synthesized by nvgetopt. So "--no-rebuild-initramfs" is supported when the
+    # binary contains "rebuild-initramfs".
+    if [[ "${name}" == no-* ]] \
+       && LC_ALL=C grep -aqF -- "${name#no-}" "${NVIDIA_INSTALLER_BIN}"; then
+        return 0
+    fi
+    return 1
+}
+
+# Highest Linux kernel (MAJOR.MINOR) each EOL/legacy NVIDIA branch can still
+# build its kernel modules against. Newer kernels remove/altered APIs the old
+# module source relies on, so the build fails late, deep in the compile. We use
+# this to fail FAST with a clear message instead. Only branches with a hard,
+# well-documented ceiling are listed; modern branches receive ongoing kernel
+# support and are treated as unrestricted (no entry → no limit).
+#
+# Extend as new ceilings become known. Sources: NVIDIA Linux forums / distro
+# bug trackers + testing. Built with the kernel's own GCC (see
+# select_nvidia_build_cc), the stock 470 .run compiles cleanly through kernel
+# 6.6 (verified: TrueNAS 24.04/24.10) and breaks at 6.10 when follow_pfn was
+# removed — so its last patch-free kernel is 6.9. Newer needs source patches
+# (supply them via the patch dir; see NVIDIA_PATCH_DIR).
+declare -A NVIDIA_BRANCH_MAX_KERNEL=(
+    [390]="5.15"
+    [470]="6.9"
+)
+
+# Returns 0 when version $1 is strictly greater than $2 (both "MAJOR.MINOR").
+kernel_version_gt() {
+    [[ "$1" == "$2" ]] && return 1
+    [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
+}
+
+# Warn (and by default abort) when the selected driver branch is known to be
+# incompatible with the target kernel — before the long download + compile.
+# Set SKIP_KERNEL_COMPAT_CHECK=true to attempt anyway (e.g. with patched source).
+check_driver_kernel_compatibility() {
+    local driver_major="${NVIDIA_VERSION%%.*}"
+    local max="${NVIDIA_BRANCH_MAX_KERNEL[${driver_major}]:-}"
+    [[ -z "${max}" ]] && return 0          # no known ceiling for this branch
+
+    local kernel_mm=""
+    [[ "${KERNEL_VERSION}" =~ ^([0-9]+\.[0-9]+) ]] && kernel_mm="${BASH_REMATCH[1]}"
+    [[ -z "${kernel_mm}" ]] && return 0     # couldn't parse kernel → don't guess
+
+    kernel_version_gt "${kernel_mm}" "${max}" || return 0   # within supported range
+
+    # Patches supplied → the user is providing the kernel-API fix themselves.
+    if [[ ${#PATCH_FILES[@]} -gt 0 ]]; then
+        info "NVIDIA ${NVIDIA_VERSION} predates kernel ${kernel_mm}, but ${#PATCH_FILES[@]} source patch(es) were supplied — proceeding."
+        return 0
+    fi
+
+    banner "Driver / kernel compatibility check"
+    warn "NVIDIA ${NVIDIA_VERSION} (legacy ${driver_major} branch) builds only against Linux"
+    warn "kernels up to ~${max}, but this TrueNAS image uses kernel ${KERNEL_VERSION} (${kernel_mm})."
+    warn "The ${driver_major} branch is end-of-life; its kernel modules will almost certainly"
+    warn "FAIL to compile against this kernel (newer kernels drop/changed APIs it relies on)."
+    warn ""
+    warn "Fix: pick a current driver branch that supports kernel ${kernel_mm} (run ./configure.sh,"
+    warn "or set a newer NVIDIA_VERSION such as 535/550/560+). Use the ${driver_major} branch only"
+    warn "for older GPUs on an older TrueNAS release (older kernel)."
+
+    warn "Or supply community source patches (./patches → /patches) to make it build,"
+    warn "or set SKIP_KERNEL_COMPAT_CHECK=true to attempt the unpatched build anyway."
+
+    if env_is_true "${SKIP_KERNEL_COMPAT_CHECK:-false}"; then
+        warn "SKIP_KERNEL_COMPAT_CHECK=true — attempting the build anyway."
+        return 0
+    fi
+    die "Aborting before download/compile."
 }
 
 resolve_embedded_nvidia_raw_path() {
@@ -188,6 +327,11 @@ build_truenas_update_url() {
 
     [[ -n "${codename}" ]] || return 1
 
+    # The download path segment has no spaces (e.g. "Electric Eel" is the display
+    # name, but the directory is "TrueNAS-SCALE-ElectricEel"). Strip spaces so a
+    # human-friendly codename from .env still produces a valid URL.
+    codename="${codename// /}"
+
     printf 'https://download.truenas.com/TrueNAS-SCALE-%s/%s/%s?download=1\n' \
         "${codename}" "${version}" "${update_filename}"
 }
@@ -202,6 +346,27 @@ build_truenas_update_filename() {
     fi
 }
 
+# Detect the GCC major version the target kernel was compiled with, read from
+# CONFIG_CC_VERSION_TEXT in the extracted kernel config. Returns e.g. "12".
+detect_kernel_build_gcc_major() {
+    local cfg line
+    for cfg in "${KERNEL_HEADERS_PATH}/.config" \
+               "${KERNEL_HEADERS_PATH}/include/config/auto.conf" \
+               "${ROOTFS_DIR}/boot/config-${KERNEL_VERSION}"; do
+        [[ -f "${cfg}" ]] || continue
+        line="$(grep -m1 '^CONFIG_CC_VERSION_TEXT=' "${cfg}" 2>/dev/null)" || true
+        [[ -n "${line}" ]] || continue
+        [[ "${line}" == *[Gg][Cc][Cc]* ]] || continue          # gcc toolchains only
+        # The value ends with the full compiler version, e.g.
+        #   CONFIG_CC_VERSION_TEXT="gcc-12 (Debian 12.2.0-14) 12.2.0"
+        if [[ "${line}" =~ ([0-9]+)\.[0-9]+\.[0-9]+\"?[[:space:]]*$ ]]; then
+            printf '%s' "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 select_nvidia_build_cc() {
     local override="${NVIDIA_BUILD_CC:-}"
     local detected_cc=""
@@ -213,6 +378,23 @@ select_nvidia_build_cc() {
         return 0
     fi
 
+    # Best: match the GCC the kernel itself was built with. Compiling a module
+    # with a much newer GCC than the kernel used breaks NVIDIA's conftest API
+    # detection — notably GCC 14, which makes implicit-declaration a hard error
+    # and yields bogus "implicit declaration of dma_is_direct/phys_to_dma"
+    # failures on kernels (6.1/6.6 etc.) that build fine with their own GCC.
+    local kgcc=""
+    kgcc="$(detect_kernel_build_gcc_major)" || true
+    if [[ -n "${kgcc}" ]]; then
+        if command -v "gcc-${kgcc}" >/dev/null 2>&1; then
+            info "Kernel was built with GCC ${kgcc}; matching it (gcc-${kgcc})" >&2
+            printf 'gcc-%s\n' "${kgcc}"
+            return 0
+        fi
+        warn "Kernel was built with GCC ${kgcc}, but gcc-${kgcc} is not installed — falling back to auto-detect (set NVIDIA_BUILD_CC to override)" >&2
+    fi
+
+    # Fallback: pick a gcc that at least understands the kernel's build flags.
     if command -v gcc >/dev/null 2>&1; then
         if printf 'int main(void) { return 0; }\n' | gcc -fmin-function-alignment=16 -x c - -o /tmp/gcc-flag-check >/dev/null 2>&1; then
             detected_cc="gcc"
@@ -241,8 +423,44 @@ NVIDIA_INSTALL_DRM="${NVIDIA_INSTALL_DRM:-true}"
 TRUENAS_CODENAME="${TRUENAS_CODENAME:-}"
 EMBED_NVIDIA_RAW_IN_UPDATE="${EMBED_NVIDIA_RAW_IN_UPDATE:-false}"
 
+# Which installer flags are actually available depends on the exact driver
+# version, so it's resolved in Phase 4 after the installer is extracted and its
+# real option set can be probed (see installer_supports_option). In particular
+# --kernel-module-type only exists on recent branches (~555+); on older ones the
+# flavor can't be selected and proprietary is built.
+
 [[ -d /output ]] \
     || die "/output directory not found. Ensure it is bind-mounted."
+
+# ── Persistent download cache (optional) ─────────────────────────────────────
+#    When a /cache volume is mounted (see docker-compose.yaml), the large
+#    TrueNAS update (~1.8 GB) and the NVIDIA .run (~300 MB) are stored there and
+#    reused across runs (wget -c resumes partial files). Without the mount,
+#    downloads go to ephemeral /tmp and are re-fetched on every run.
+CACHE_DIR="/cache"
+if [[ -d "${CACHE_DIR}" ]] && [[ -w "${CACHE_DIR}" ]]; then
+    info "Persistent download cache enabled: ${CACHE_DIR}"
+else
+    CACHE_DIR=""
+    info "No writable /cache volume mounted — downloads will not be cached across runs"
+fi
+
+# ── User-supplied source patches (optional) ──────────────────────────────────
+#    To build an EOL driver on a kernel newer than NVIDIA supports (e.g. 470 on
+#    6.10+), drop community *.patch/*.diff files into ./patches (mounted at
+#    /patches) or ./patches via the workspace mount. They are applied to the
+#    extracted NVIDIA source before compiling (see Phase 4). Their presence also
+#    relaxes the driver/kernel compatibility abort, since you've supplied the fix.
+PATCH_SEARCH_DIRS=("${NVIDIA_PATCH_DIR:-/patches}" "/workspace/patches")
+declare -a PATCH_FILES=()
+while IFS= read -r _patch; do
+    [[ -n "${_patch}" ]] && PATCH_FILES+=("${_patch}")
+done < <(find "${PATCH_SEARCH_DIRS[@]}" -maxdepth 1 -type f \( -name '*.patch' -o -name '*.diff' \) 2>/dev/null | LC_ALL=C sort)
+
+if [[ ${#PATCH_FILES[@]} -gt 0 ]]; then
+    info "Found ${#PATCH_FILES[@]} source patch(es) to apply before compiling:"
+    printf '  %s\n' "${PATCH_FILES[@]##*/}"
+fi
 
 # ── Obtain the TrueNAS update file ──────────────────────────────────────────
 UPDATE_FILE="/tmp/truenas.update"
@@ -254,14 +472,25 @@ if [[ -f /workspace/truenas.update ]]; then
 else
     DOWNLOAD_URL="$(build_truenas_update_url "${TRUENAS_VERSION}" "${TRUENAS_CODENAME}")" \
         || die "Unable to determine download URL for TRUENAS_VERSION=${TRUENAS_VERSION}. Set /workspace/truenas.update or provide a compatible TRUENAS_CODENAME."
+
+    # Cache the update under its real filename so different versions coexist.
+    if [[ -n "${CACHE_DIR}" ]]; then
+        UPDATE_FILE="${CACHE_DIR}/$(build_truenas_update_filename "${TRUENAS_VERSION}")"
+        if [[ -s "${UPDATE_FILE}" ]]; then
+            info "Found cached update: ${UPDATE_FILE} ($(du -h "${UPDATE_FILE}" | cut -f1)) — resuming/validating (delete to force fresh download)"
+        fi
+    fi
+
     if [[ -n "${TRUENAS_CODENAME}" ]]; then
         info "Downloading TrueNAS ${TRUENAS_VERSION} (${TRUENAS_CODENAME}) update file …"
     else
         info "Downloading TrueNAS ${TRUENAS_VERSION} update file …"
     fi
     info "URL: ${DOWNLOAD_URL}"
-    wget -q --show-progress -O "${UPDATE_FILE}" "${DOWNLOAD_URL}" \
-        || die "Failed to download TrueNAS update file from ${DOWNLOAD_URL}"
+    wget -q --show-progress -c -O "${UPDATE_FILE}" "${DOWNLOAD_URL}" || {
+        report_url_status "${DOWNLOAD_URL}"
+        die "Failed to download TrueNAS update file from ${DOWNLOAD_URL}"
+    }
     ok "Downloaded $(du -h "${UPDATE_FILE}" | cut -f1)"
 fi
 
@@ -452,26 +681,102 @@ elif [[ -f "${ROOTFS_DIR}/usr/lib/modules/${KERNEL_VERSION}/build/Module.symvers
            "${KERNEL_HEADERS_PATH}/Module.symvers"
 fi
 
+# Now that the real target kernel is known, fail fast on a known driver/kernel
+# incompatibility rather than after a long download + doomed compile.
+check_driver_kernel_compatibility
+
 # =============================================================================
 # PHASE 3 — Download the NVIDIA .run installer
 # =============================================================================
 banner "Phase 3: Downloading NVIDIA ${NVIDIA_VERSION} driver"
 
+# Stay in BUILD_DIR: the NVIDIA installer self-extracts into a subdir of the
+# CWD, so we keep that ephemeral while the .run itself may live in the cache.
 cd "${BUILD_DIR}"
 
 RUN_FILE="NVIDIA-Linux-x86_64-${NVIDIA_VERSION}-no-compat32.run"
 DOWNLOAD_URL="https://us.download.nvidia.com/XFree86/Linux-x86_64/${NVIDIA_VERSION}/${RUN_FILE}"
 
-if [[ -f "${RUN_FILE}" ]]; then
-    info "Run file already present, skipping download"
+# Cache the installer across runs when a /cache volume is mounted; otherwise
+# download into the ephemeral BUILD_DIR.
+if [[ -n "${CACHE_DIR}" ]]; then
+    RUN_FILE_PATH="${CACHE_DIR}/${RUN_FILE}"
 else
-    info "Downloading from ${DOWNLOAD_URL} …"
-    wget -q --show-progress -c "${DOWNLOAD_URL}" \
-        || die "Failed to download ${RUN_FILE}"
+    RUN_FILE_PATH="${BUILD_DIR}/${RUN_FILE}"
 fi
 
-chmod +x "${RUN_FILE}"
-ok "NVIDIA installer ready: ${BUILD_DIR}/${RUN_FILE}"
+if [[ -s "${RUN_FILE_PATH}" ]] && [[ -n "${CACHE_DIR}" ]]; then
+    info "Found cached installer: ${RUN_FILE_PATH} — resuming/validating"
+fi
+info "Downloading from ${DOWNLOAD_URL} … (resumes if partially cached)"
+wget -q --show-progress -c -O "${RUN_FILE_PATH}" "${DOWNLOAD_URL}" || {
+    report_url_status "${DOWNLOAD_URL}"
+    die "Failed to download ${RUN_FILE} from ${DOWNLOAD_URL}"
+}
+
+chmod +x "${RUN_FILE_PATH}"
+ok "NVIDIA installer ready: ${RUN_FILE_PATH}"
+
+# ── Extract the installer once, for option probing (and patching) ────────────
+#    nvidia-installer aborts on the first unrecognized option and the set of
+#    options varies widely by driver version, so we extract the package and read
+#    the supported options straight from the nvidia-installer binary. The same
+#    extraction is reused when source patches are supplied (we then run this
+#    extracted nvidia-installer instead of the .run). It's isolated in its own
+#    directory (its own CWD) and lands in /tmp, outside the snapshot scope.
+INSTALLER_EXTRACT_DIR="${BUILD_DIR}/installer-src"
+rm -rf "${INSTALLER_EXTRACT_DIR}"
+mkdir -p "${INSTALLER_EXTRACT_DIR}"
+info "Extracting installer to detect supported options …"
+( cd "${INSTALLER_EXTRACT_DIR}" && "${RUN_FILE_PATH}" --extract-only >/dev/null 2>&1 ) \
+    || die "Failed to extract NVIDIA installer for option probing"
+
+NVIDIA_INSTALLER_BIN="$(find "${INSTALLER_EXTRACT_DIR}" -maxdepth 2 -name nvidia-installer -type f 2>/dev/null | head -1)"
+[[ -n "${NVIDIA_INSTALLER_BIN}" ]] \
+    || die "nvidia-installer binary not found after extraction — cannot determine supported options"
+NVIDIA_SRC_ROOT="$(dirname "${NVIDIA_INSTALLER_BIN}")"
+chmod +x "${NVIDIA_INSTALLER_BIN}" 2>/dev/null || true   # in case we run it directly
+ok "Installer option probe ready: ${NVIDIA_INSTALLER_BIN}"
+
+# ── Apply user-supplied source patches into the extracted tree ───────────────
+USE_EXTRACTED_TREE=false
+if [[ ${#PATCH_FILES[@]} -gt 0 ]]; then
+    banner "Applying ${#PATCH_FILES[@]} source patch(es)"
+    for _patch in "${PATCH_FILES[@]}"; do
+        info "Applying $(basename "${_patch}") …"
+        # Patches may be written relative to the package root (paths like
+        # kernel/nvidia-drm/...) or to the kernel module dir (nvidia-drm/...),
+        # so try both directories. Dry-run each combination FIRST and only apply
+        # the one that applies cleanly, so a wrong target can't half-apply and
+        # corrupt the tree.
+        _applied=false
+        for _dir in "${NVIDIA_SRC_ROOT}" "${NVIDIA_SRC_ROOT}/kernel"; do
+            [[ -d "${_dir}" ]] || continue
+            for _plevel in 1 0 2; do
+                if patch -d "${_dir}" -p"${_plevel}" --dry-run -f < "${_patch}" >/dev/null 2>&1; then
+                    patch -d "${_dir}" -p"${_plevel}" --no-backup-if-mismatch -f < "${_patch}" >/dev/null 2>&1
+                    ok "Applied: $(basename "${_patch}") (${_dir##*/}/ -p${_plevel})"
+                    _applied=true
+                    break 2
+                fi
+            done
+        done
+        ${_applied} || die "Patch failed to apply: ${_patch}. Ensure it matches NVIDIA ${NVIDIA_VERSION} and uses kernel/-relative or package-root paths."
+    done
+    # Build from the patched tree (run this nvidia-installer, not the pristine .run).
+    USE_EXTRACTED_TREE=true
+    ok "Source patched; the build will use the patched tree"
+fi
+
+# Run the installer with the given args, from the patched extracted tree when
+# patches were applied, otherwise straight from the (pristine) .run.
+run_nvidia_installer() {
+    if env_is_true "${USE_EXTRACTED_TREE}"; then
+        ( cd "${NVIDIA_SRC_ROOT}" && ./nvidia-installer "$@" )
+    else
+        "${RUN_FILE_PATH}" "$@"
+    fi
+}
 
 # =============================================================================
 # PHASE 4 — Snapshot the filesystem, then compile + install the NVIDIA driver
@@ -480,29 +785,35 @@ ok "NVIDIA installer ready: ${BUILD_DIR}/${RUN_FILE}"
 #   installer, then take an AFTER snapshot.  The diff gives us every single
 #   file NVIDIA placed — no glob patterns, no guesswork, nothing missed.
 #
-#   Installer flags rationale:
+#   Installer flags rationale (flags marked † are version-gated — only passed
+#   when the extracted installer recognizes them; see installer_supports_option):
 #     --silent                          non-interactive
 #     --kernel-source-path              TrueNAS's custom-named headers
 #     --kernel-name                     real numerical version for depmod
-#     --kernel-module-type=<value>      selects NVIDIA kernel module flavor
-#                                       open        -> open GPU kernel modules
-#                                       proprietary -> legacy closed-source modules
-#                                       'open' avoids MITIGATION_RETHUNK /
-#                                       naked-return hard errors on hardened
-#                                       TrueNAS kernels for many modern GPUs
-#     --allow-installation-with-running-driver
-#                                       don't abort if host has nvidia.ko
-#     --no-rebuild-initramfs            cross-compiling; don't touch initramfs
-#     --skip-module-load                don't modprobe inside the container
 #     --no-x-check                      no X server in a container
 #     --no-nouveau-check                irrelevant inside build container
 #     --no-systemd                      skip systemd unit installation
 #     --no-backup                       no backup of "previous" driver files
-#     --no-drm                          optional escape hatch when a target
+#     --install-libglvnd                include GLvnd dispatch libraries
+#   † --allow-installation-with-running-driver
+#                                       don't abort if host has nvidia.ko (545+).
+#                                       On older drivers that lack it, a two-pass
+#                                       --no-kernel-module then --kernel-module-only
+#                                       install is used instead (see 4c).
+#   † --skip-module-load                don't modprobe inside the container (550+)
+#   † --no-rebuild-initramfs            cross-compiling; don't touch initramfs (550+)
+#   † --kernel-module-type=<value>      selects NVIDIA kernel module flavor (~555+)
+#                                       open        -> open GPU kernel modules
+#                                       proprietary -> legacy closed-source modules
+#                                       'open' avoids MITIGATION_RETHUNK /
+#                                       naked-return hard errors on hardened
+#                                       TrueNAS kernels for many modern GPUs.
+#                                       When unavailable, the installer builds
+#                                       its default (proprietary) flavor.
+#   † --no-drm                          optional escape hatch when a target
 #                                       kernel cannot load nvidia-drm.ko.
 #                                       By default DRM is installed so /dev/dri
 #                                       can exist for TrueNAS Apps that map it.
-#     --install-libglvnd                include GLvnd dispatch libraries
 # =============================================================================
 banner "Phase 4: Compiling & installing NVIDIA driver"
 
@@ -550,39 +861,105 @@ else
 fi
 
 # ── 4c: Run the NVIDIA driver installer ─────────────────────────────────────
-#    Flags closely match the official TrueNAS build:
-#      --skip-module-load  --silent  --kernel-name=<ver>
-#      --allow-installation-with-running-driver  --no-rebuild-initramfs
-#      --kernel-module-type=<open|proprietary>
-#    Additional flags for our cross-compile container environment:
-#      --kernel-source-path  --no-x-check  --no-nouveau-check
-#      --no-systemd  --no-backup
+#    Core flags are passed on every version; version-varying flags are added
+#    only when the probed installer supports them (older branches reject them
+#    outright, and nvidia-installer aborts on the first unrecognized option).
 # ─────────────────────────────────────────────────────────────────────────────
 info "Running NVIDIA installer in silent cross-compile mode …"
+
+# Core flags present in every supported branch (470+). These must always be
+# passed, so they are not gated.
 NVIDIA_INSTALLER_ARGS=(
-    --silent \
-    --kernel-source-path="${KERNEL_HEADERS_PATH}" \
-    --kernel-name="${KERNEL_VERSION}" \
-    --kernel-module-type=${NVIDIA_KERNEL_MODULE_TYPE} \
-    --allow-installation-with-running-driver \
-    --no-rebuild-initramfs \
-    --skip-module-load \
-    --no-x-check \
-    --no-nouveau-check \
-    --no-systemd \
-    --no-backup \
+    --silent
+    --kernel-source-path="${KERNEL_HEADERS_PATH}"
+    --kernel-name="${KERNEL_VERSION}"
+    --no-x-check
+    --no-nouveau-check
+    --no-backup
+    --no-systemd
     --install-libglvnd
 )
+
+# Append a flag only if this installer version recognizes it; otherwise warn and
+# skip so the installer doesn't abort on an "unrecognized option".
+add_optional_flag() {
+    local flag="$1"
+    if installer_supports_option "${flag}"; then
+        NVIDIA_INSTALLER_ARGS+=("${flag}")
+    else
+        warn "Installer for NVIDIA ${NVIDIA_VERSION} does not support ${flag%%=*} — skipping it"
+    fi
+}
+
+# Version-varying flags (introduced across 545–555; LTS branches lag). Gated by
+# what the extracted installer actually supports rather than by version number.
+# (--allow-installation-with-running-driver is handled separately below, as it
+# decides single- vs two-pass install.)
+add_optional_flag "--skip-module-load"                        # 550+
+add_optional_flag "--no-rebuild-initramfs"                    # 550+
+
+# Kernel module flavor selection (--kernel-module-type) only exists on ~555+.
+# When unavailable, the installer builds its default (proprietary) flavor and
+# the requested type cannot be honored — reflect that in logs and the summary.
+if installer_supports_option "--kernel-module-type"; then
+    info "NVIDIA kernel module flavor: ${NVIDIA_KERNEL_MODULE_TYPE} (via --kernel-module-type)"
+    NVIDIA_INSTALLER_ARGS+=(--kernel-module-type="${NVIDIA_KERNEL_MODULE_TYPE}")
+else
+    if [[ "${NVIDIA_KERNEL_MODULE_TYPE,,}" != "proprietary" ]]; then
+        warn "NVIDIA ${NVIDIA_VERSION} predates --kernel-module-type; cannot select '${NVIDIA_KERNEL_MODULE_TYPE}' modules."
+        warn "Building the installer's default (proprietary) modules instead."
+    fi
+    NVIDIA_KERNEL_MODULE_TYPE="proprietary"
+    info "NVIDIA kernel module flavor: proprietary (installer default; --kernel-module-type unavailable)"
+fi
 
 if env_is_true "${NVIDIA_INSTALL_DRM}"; then
     info "NVIDIA DRM module install: enabled"
 else
     info "NVIDIA DRM module install: disabled (--no-drm)"
-    NVIDIA_INSTALLER_ARGS+=(--no-drm)
+    add_optional_flag "--no-drm"
 fi
 
-"./${RUN_FILE}" "${NVIDIA_INSTALLER_ARGS[@]}" \
-    || die "NVIDIA installer failed. Check output above for details."
+# The build container shares the host kernel, so the host's loaded NVIDIA modules
+# (nvidia, nvidia-drm, …) are visible to the installer. nvidia-installer aborts
+# on this ("An NVIDIA kernel module appears to already be loaded") unless told to
+# tolerate it. Two strategies, picked by what the installer supports:
+#
+#   • 545+  : pass --allow-installation-with-running-driver and install in one go.
+#   • <545  : that flag doesn't exist, but the loaded-module check is skipped both
+#             when building NO kernel module (--no-kernel-module) and when building
+#             ONLY the kernel module for a non-running kernel (--kernel-module-only
+#             with --kernel-name, which we always set). So we install in two passes
+#             — userspace FIRST, because --kernel-module-only refuses to run unless
+#             a driver is already installed, then the kernel module on top.
+#
+# Resolve the strategy now, while the probe binary still exists.
+if installer_supports_option "--allow-installation-with-running-driver"; then
+    ALLOW_RUNNING_DRIVER=true
+else
+    ALLOW_RUNNING_DRIVER=false
+fi
+
+# Reclaim the extraction before the installer self-extracts, so peak disk usage
+# isn't doubled — UNLESS we're building from the (patched) extracted tree.
+if ! env_is_true "${USE_EXTRACTED_TREE}"; then
+    rm -rf "${INSTALLER_EXTRACT_DIR}"
+fi
+
+if env_is_true "${ALLOW_RUNNING_DRIVER}"; then
+    NVIDIA_INSTALLER_ARGS+=(--allow-installation-with-running-driver)
+    info "Installing in a single pass (host's running driver tolerated via --allow-installation-with-running-driver) …"
+    run_nvidia_installer "${NVIDIA_INSTALLER_ARGS[@]}" \
+        || save_installer_log_and_die "NVIDIA installer failed. Check output above for details."
+else
+    warn "Installer lacks --allow-installation-with-running-driver; using a two-pass install so the host's loaded NVIDIA modules don't abort it"
+    info "Pass 1/2: userspace components (--no-kernel-module) …"
+    run_nvidia_installer "${NVIDIA_INSTALLER_ARGS[@]}" --no-kernel-module \
+        || save_installer_log_and_die "NVIDIA installer failed during the userspace pass. Check output above for details."
+    info "Pass 2/2: kernel modules on top of it (--kernel-module-only) …"
+    run_nvidia_installer "${NVIDIA_INSTALLER_ARGS[@]}" --kernel-module-only \
+        || save_installer_log_and_die "NVIDIA installer failed during the kernel-module pass. Check output above for details."
+fi
 
 ok "NVIDIA driver installed successfully"
 
@@ -800,14 +1177,22 @@ ok "Combined module database shipped (${MODFILES_COUNT} metadata files, covers a
 # ── 5c: Verify critical files are present ────────────────────────────────────
 info "Verifying critical files …"
 
+# Count critical components that are missing, so the size summary below can key
+# off what's actually absent instead of an absolute (driver-version-specific)
+# byte threshold. Pass a third arg "optional" for components that legitimately
+# vary by driver branch (their absence is reported as info, not a warning).
+MISSING_CRITICAL=0
 check_file() {
-    local label="$1" pattern="$2"
+    local label="$1" pattern="$2" criticality="${3:-critical}"
     local count
     count=$(find "${STAGING_DIR}" -path "${pattern}" 2>/dev/null | wc -l)
     if [[ ${count} -gt 0 ]]; then
         ok "  ${label} (${count} file(s))"
+    elif [[ "${criticality}" == "optional" ]]; then
+        info "  ${label} — not present (optional / branch-dependent)"
     else
         warn "  ${label} — NOT FOUND (pattern: ${pattern})"
+        (( MISSING_CRITICAL++ )) || true
     fi
 }
 
@@ -820,7 +1205,13 @@ check_file "libEGL_nvidia (EGL)"     "*/libEGL_nvidia.so*"
 check_file "libGLX_nvidia (GLX)"     "*/libGLX_nvidia.so*"
 check_file "libnvcuvid (video dec)"  "*/libnvcuvid.so*"
 check_file "Vulkan ICD JSON"         "*/nvidia_icd.json"
-check_file "GSP firmware"            "*/firmware/nvidia/*/gsp_*"
+# GSP firmware ships only on GSP-era drivers (~515+, Turing+ GPUs); legacy
+# branches like 470 have none, so don't flag its absence there.
+if (( ${NVIDIA_VERSION%%.*} >= 515 )); then
+    check_file "GSP firmware"        "*/firmware/nvidia/*/gsp_*"
+else
+    info "  GSP firmware — not applicable (NVIDIA ${NVIDIA_VERSION} predates GSP firmware)"
+fi
 check_file "nvidia.ko (MAIN)"       "*/nvidia.ko"
 check_file "nvidia-modeset.ko"      "*/nvidia-modeset.ko"
 check_file "nvidia-uvm.ko"          "*/nvidia-uvm.ko"
@@ -961,13 +1352,19 @@ fi
 
 echo ""
 
-# Size sanity check against the known-good manual build (~438 MB with gzip)
-if [[ "${FINAL_BYTES}" != "unknown" ]] && [[ ${FINAL_BYTES} -lt 420000000 ]]; then
-    warn "Image is under 420 MB — this may indicate missing components."
-    warn "Expected ~430-450 MB based on manual builds (gzip compression)."
-    warn "Review the 'Verifying critical files' section above for clues."
+# Image-completeness check. We DON'T compare to a fixed "expected" size — that
+# varies a lot by driver branch (legacy 470 is ~300 MB with no GSP firmware;
+# modern 535/560+ are ~440 MB), and a hardcoded threshold cried wolf on smaller
+# legacy builds. Instead trust the explicit component verification above, and use
+# size only as a floor to catch a catastrophically truncated image.
+MIN_PLAUSIBLE_BYTES=100000000   # 100 MB — even legacy builds are well above this
+if [[ ${MISSING_CRITICAL} -gt 0 ]]; then
+    warn "${MISSING_CRITICAL} expected component(s) were NOT found — review the 'Verifying critical files' section above."
+elif [[ "${FINAL_BYTES}" != "unknown" ]] && [[ ${FINAL_BYTES} -lt ${MIN_PLAUSIBLE_BYTES} ]]; then
+    warn "Image is only ${FINAL_SIZE} — implausibly small; some components may be missing despite passing checks."
 elif [[ "${FINAL_BYTES}" != "unknown" ]]; then
-    ok "Image size looks healthy (≥420 MB)"
+    ok "Image complete: all expected components present (${FINAL_SIZE})."
+    info "Image size varies by driver branch — e.g. legacy 470 ~300 MB (no GSP firmware) vs 535/560+ ~440 MB."
 fi
 
 echo ""

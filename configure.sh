@@ -387,6 +387,48 @@ nvidia_major() {
     [[ "$1" =~ ^([0-9]+)\. ]] && printf '%s' "${BASH_REMATCH[1]}"
 }
 
+# Minimum driver major whose nvidia-installer understands --kernel-module-type
+# (the flag that selects the open vs proprietary flavor). It first appears in the
+# R555 feature branch; older branches — including the 535/550 LTS lines — lack it,
+# so the flavor can't be chosen and the installer builds proprietary by default.
+# This is only a wizard heuristic; the build itself probes the real installer
+# (see installer_supports_option() in entrypoint.sh) and is authoritative.
+NVIDIA_MODULE_TYPE_MIN_MAJOR=555
+
+# Returns 0 (true) when the given driver version can select the kernel module
+# flavor (open vs proprietary), i.e. major >= NVIDIA_MODULE_TYPE_MIN_MAJOR.
+nvidia_supports_module_type() {
+    local major=""
+    major="$(nvidia_major "$1")"
+    [[ "${major}" =~ ^[0-9]+$ ]] || return 1
+    (( major >= NVIDIA_MODULE_TYPE_MIN_MAJOR ))
+}
+
+# Legacy/EOL driver branches and the highest Linux kernel (MAJOR.MINOR) they can
+# still build against. Kept in sync with NVIDIA_BRANCH_MAX_KERNEL in entrypoint.sh.
+declare -A NVIDIA_BRANCH_MAX_KERNEL=(
+    [390]="5.15"
+    [470]="6.9"
+)
+
+# Early heads-up when a legacy/EOL driver branch is selected: those branches fail
+# to compile on recent kernels (e.g. TrueNAS 25.10/26 ship 6.12). This is advisory
+# only — the build does the authoritative check against the real image kernel
+# (see check_driver_kernel_compatibility() in entrypoint.sh).
+advise_legacy_driver() {
+    local version="$1"
+    local major=""
+    major="$(nvidia_major "${version}")"
+    local max="${NVIDIA_BRANCH_MAX_KERNEL[${major}]:-}"
+    [[ -z "${max}" ]] && return 0
+
+    warn "NVIDIA ${version} is a legacy/end-of-life branch."
+    warn "It only builds against Linux kernels up to ~${max}; recent TrueNAS releases"
+    warn "(e.g. 25.10 / 26 ship kernel 6.12) will FAIL to compile it."
+    warn "Use it only for older GPUs on an older TrueNAS release — otherwise pick a"
+    warn "current branch (★ Production / ★ New Feature) that supports your kernel."
+}
+
 # Find the latest version in the sorted list matching a given major prefix
 nvidia_latest_in_series() {
     local target_major="$1"; shift
@@ -1017,6 +1059,26 @@ main() {
         local selected_embed="${CLI_EMBED:-false}"
         local selected_cc=""
 
+        # Validate enumerated flags up front so bad input fails loudly here
+        # rather than deep inside the container build.
+        case "${selected_module_type}" in
+            open|proprietary) ;;
+            *) err "Invalid --module '${selected_module_type}' (expected: open or proprietary)"; exit 1 ;;
+        esac
+        case "${selected_embed}" in
+            true|false) ;;
+            *) err "Invalid --embed '${selected_embed}' (expected: true or false)"; exit 1 ;;
+        esac
+
+        # Pre-515 drivers only ship proprietary modules; don't write a config
+        # the build will just have to override.
+        if ! nvidia_supports_module_type "${selected_nvidia}"; then
+            if [[ "${selected_module_type}" != "proprietary" ]]; then
+                warn "NVIDIA ${selected_nvidia} can't select the module flavor (--kernel-module-type needs ~555+); forcing --module proprietary"
+            fi
+            selected_module_type="proprietary"
+        fi
+
         # Resolve codename
         local major_minor=""
         major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
@@ -1026,6 +1088,8 @@ main() {
         ok "NVIDIA:  ${selected_nvidia}"
         ok "Module:  ${selected_module_type}"
         ok "Embed:   ${selected_embed}"
+
+        advise_legacy_driver "${selected_nvidia}"
 
         generate_env_file \
             "${selected_nvidia}" \
@@ -1121,10 +1185,15 @@ main() {
                     done
                     ui_menu selected_nvidia "NVIDIA Driver" \
                         "Select new NVIDIA driver:" "${nvidia_menu_args[@]}"
+                    advise_legacy_driver "${selected_nvidia}"
                 fi
                 ;;
             module)
-                if [[ "${UI_MODE}" == "whiptail" ]]; then
+                if ! nvidia_supports_module_type "${selected_nvidia}"; then
+                    selected_module_type="proprietary"
+                    ui_msgbox "Module Type" \
+                        "NVIDIA ${selected_nvidia} can't select the kernel module flavor (--kernel-module-type requires driver branch ~555+).\n\nThe build will use proprietary modules; setting module type to 'proprietary'."
+                elif [[ "${UI_MODE}" == "whiptail" ]]; then
                     wt_size
                     selected_module_type=$(whiptail --title "Module Type" \
                         --menu "Select kernel module type:" \
@@ -1150,6 +1219,15 @@ main() {
                 fi
                 ;;
         esac
+
+        # Keep module type consistent with the (possibly just-changed) driver:
+        # a switch to a pre-515 branch must drop back to proprietary.
+        if ! nvidia_supports_module_type "${selected_nvidia}"; then
+            if [[ "${selected_module_type}" != "proprietary" ]]; then
+                warn "NVIDIA ${selected_nvidia} can't select the module flavor (--kernel-module-type needs ~555+); setting module type to proprietary."
+            fi
+            selected_module_type="proprietary"
+        fi
 
         generate_env_file \
             "${selected_nvidia}" "${selected_truenas}" "${selected_codename}" \
@@ -1287,6 +1365,7 @@ main() {
 
     [[ -n "${selected_nvidia}" ]] || { err "No NVIDIA version selected. Aborting."; exit 1; }
     ok "Selected: ${selected_nvidia}"
+    advise_legacy_driver "${selected_nvidia}"
     echo ""
 
     # ── Step 3: Kernel Module Type ───────────────────────────────────────────
@@ -1294,7 +1373,13 @@ main() {
 
     local selected_module_type=""
 
-    if [[ "${UI_MODE}" == "whiptail" ]]; then
+    if ! nvidia_supports_module_type "${selected_nvidia}"; then
+        # Pre-515 drivers (e.g. 470.xx) have no open modules and reject
+        # --kernel-module-type, so don't offer a choice that can't be honored.
+        selected_module_type="proprietary"
+        ui_msgbox "Step 3: Kernel Module Type" \
+            "NVIDIA ${selected_nvidia} can't select the kernel module flavor: --kernel-module-type was added in the ~555 driver series (the 535/550 LTS lines lack it).\n\nThe build will use proprietary modules, so the module type is set to 'proprietary' automatically."
+    elif [[ "${UI_MODE}" == "whiptail" ]]; then
         wt_size
         selected_module_type=$(whiptail --title "Step 3: Kernel Module Type" \
             --menu "'open' is recommended for most modern GPUs (Turing/Ampere/Ada and newer).\n'proprietary' uses legacy closed-source modules for older hardware." \

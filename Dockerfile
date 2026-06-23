@@ -2,10 +2,11 @@ FROM debian:bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# TrueNAS 25/26 kernels may be built with GCC 14 and use module build flags
-# that GCC 12 from bookworm does not understand (for example
-# -fmin-function-alignment=16). Keep the base image on bookworm, but pull only
-# gcc-14 from trixie for module compilation compatibility.
+# The entrypoint builds NVIDIA modules with the SAME GCC major the target kernel
+# was compiled with (entrypoint.sh: select_nvidia_build_cc) — a much newer GCC
+# breaks NVIDIA's conftest API detection (GCC 14 makes implicit-declaration a
+# hard error). Bookworm provides gcc-12; pull gcc-13 and gcc-14 from trixie so we
+# can match the common TrueNAS toolchains (e.g. 6.1/6.6 → gcc-12/13, 6.12 → gcc-14).
 RUN printf 'deb http://deb.debian.org/debian trixie main\n' > /etc/apt/sources.list.d/trixie.list \
     && printf 'Package: *\nPin: release n=trixie\nPin-Priority: 50\n' > /etc/apt/preferences.d/trixie
 
@@ -13,10 +14,10 @@ RUN printf 'deb http://deb.debian.org/debian trixie main\n' > /etc/apt/sources.l
 # and nvidia-container-toolkit installation (gnupg for apt repo key)
 RUN apt-get update && apt-get install -y \
     build-essential wget curl squashfs-tools kmod xz-utils \
-    bison flex libelf-dev bc rsync \
+    bison flex libelf-dev bc rsync patch \
     libssl-dev pkg-config pciutils \
     gnupg ca-certificates \
-    && apt-get install -y -t trixie gcc-14 \
+    && apt-get install -y -t trixie gcc-13 gcc-14 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

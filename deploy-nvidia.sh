@@ -55,6 +55,39 @@ print_sysext_diagnostics() {
     SYSTEMD_LOG_LEVEL=debug systemd-sysext refresh || true
 }
 
+# Restore the system to its prior working state after a failed merge.
+#   - If a backup exists, put the previous nvidia.raw back.
+#   - Otherwise (fresh install) remove the rejected image entirely.
+# Then re-lock /usr and re-merge so the box isn't left broken.
+rollback_to_previous_state() {
+    local backup="${1:-}"   # previous nvidia.raw, empty on a fresh install
+
+    echo ""
+    warn "Rolling back to the previous working state …"
+
+    systemd-sysext unmerge 2>/dev/null || true
+    zfs set readonly=off "${USR_DATASET}" \
+        || die "Rollback failed: could not unlock ${USR_DATASET}. Manual recovery required."
+
+    if [[ -n "${backup}" ]] && [[ -f "${backup}" ]]; then
+        info "Restoring previous nvidia.raw from $(basename "${backup}")"
+        cp "${backup}" "${NVIDIA_RAW}"
+        chmod 644 "${NVIDIA_RAW}"
+    else
+        info "No previous nvidia.raw to restore (fresh install) — removing the rejected image"
+        rm -f "${NVIDIA_RAW}"
+    fi
+
+    zfs set readonly=on "${USR_DATASET}" \
+        || warn "Rollback: failed to re-lock ${USR_DATASET}"
+
+    if systemd-sysext merge; then
+        ok "Rollback complete — system restored to its previous state"
+    else
+        warn "Rollback merge also failed — the system may need manual recovery"
+    fi
+}
+
 SYSEXT_DIR="/usr/share/truenas/sysext-extensions"
 NVIDIA_RAW="${SYSEXT_DIR}/nvidia.raw"
 
@@ -86,6 +119,7 @@ zfs set readonly=off "${USR_DATASET}"
 ok "Dataset unlocked (readonly=off)"
 
 # ── Step 3: Backup existing nvidia.raw ──────────────────────────────────────
+BACKUP=""   # set below when a prior image exists; used for rollback on failure
 if [[ -f "${NVIDIA_RAW}" ]]; then
     mkdir -p "${BACKUP_DIR}"
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -121,7 +155,8 @@ ok "Dataset locked (readonly=on)"
 info "Merging sysext extensions …"
 if ! systemd-sysext merge; then
     print_sysext_diagnostics "${NVIDIA_RAW}"
-    die "systemd-sysext merge failed"
+    rollback_to_previous_state "${BACKUP}"
+    die "systemd-sysext merge failed — the new nvidia.raw was rejected. The previous state has been restored; see diagnostics above."
 fi
 ok "Extensions merged"
 

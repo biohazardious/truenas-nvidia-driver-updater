@@ -25,6 +25,9 @@ services:
       # true/false — when enabled, also generate a rebuilt truenas.update with
       # the bundled nvidia.raw replaced.
       - EMBED_NVIDIA_RAW_IN_UPDATE=${EMBED_NVIDIA_RAW_IN_UPDATE:-false}
+      # true/false — set true to bypass the early driver/kernel compatibility
+      # abort (e.g. building a legacy branch with patched sources).
+      - SKIP_KERNEL_COMPAT_CHECK=${SKIP_KERNEL_COMPAT_CHECK:-false}
     # Force standard runtime — TrueNAS may default to nvidia-container-runtime,
     # which fails when the driver is being rebuilt (chicken-and-egg).
     runtime: runc
@@ -32,4 +35,12 @@ services:
       # If truenas.update exists here, it will be used instead of downloading
       - .:/workspace
       - ./output:/output
+      # Persistent download cache: the ~1.8 GB TrueNAS update and ~300 MB NVIDIA
+      # installer are stored here and reused across runs instead of being
+      # re-downloaded every time. Safe to delete to force fresh downloads.
+      - ./cache:/cache
+      # Optional: drop community *.patch/*.diff files here to apply them to the
+      # NVIDIA source before compiling (e.g. to build an EOL driver like 470 on a
+      # newer kernel). Empty/absent = no patches applied.
+      - ./patches:/patches
     privileged: true

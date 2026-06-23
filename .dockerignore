@@ -1,0 +1,7 @@
+# The image only needs entrypoint.sh (see Dockerfile). Everything else is
+# excluded so `docker compose build` doesn't ship the whole context — most
+# importantly the large build artifacts and update files — to the daemon.
+*
+
+# …except the entrypoint the Dockerfile copies in.
+!entrypoint.sh

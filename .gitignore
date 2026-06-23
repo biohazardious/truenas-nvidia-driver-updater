@@ -12,6 +12,9 @@ backups/
 *.update
 truenas.update
 
+# Persistent download cache (created by the docker-compose ./cache mount)
+cache/
+
 # Docker build cache
 .docker/
 
@@ -29,3 +32,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Claude
+CLAUDE.md
+.claude/
+.wolf/
