@@ -80,6 +80,9 @@ Non-interactive mode (for automation / CI):
     --nvidia VERSION      NVIDIA driver version (e.g. 595.80)
     --module TYPE         Kernel module type: open (default) or proprietary
     --embed true|false    Embed nvidia.raw in truenas.update (default: false)
+    --patch MODE          Source patches: none, custom, predefined, or auto
+                          (default: auto). 'predefined' downloads the curated
+                          set for the driver branch (for EOL drivers on new kernels).
 
 The wizard will:
   1. Detect your system (auto-detect TrueNAS version and GPU if running locally)
@@ -109,6 +112,7 @@ CLI_TRUENAS=""
 CLI_NVIDIA=""
 CLI_MODULE=""
 CLI_EMBED=""
+CLI_PATCH=""
 CLI_RECONFIGURE=false
 
 # ── parse arguments ──────────────────────────────────────────────────────────
@@ -121,10 +125,12 @@ while [[ $# -gt 0 ]]; do
         --nvidia)         CLI_NVIDIA="$2"; shift ;;
         --module)         CLI_MODULE="$2"; shift ;;
         --embed)          CLI_EMBED="$2"; shift ;;
+        --patch)          CLI_PATCH="$2"; shift ;;
         --truenas=*)      CLI_TRUENAS="${1#*=}" ;;
         --nvidia=*)       CLI_NVIDIA="${1#*=}" ;;
         --module=*)       CLI_MODULE="${1#*=}" ;;
         --embed=*)        CLI_EMBED="${1#*=}" ;;
+        --patch=*)        CLI_PATCH="${1#*=}" ;;
         *) warn "Unknown argument: $1" ;;
     esac
     shift
@@ -425,8 +431,176 @@ advise_legacy_driver() {
     warn "NVIDIA ${version} is a legacy/end-of-life branch."
     warn "It only builds against Linux kernels up to ~${max}; recent TrueNAS releases"
     warn "(e.g. 25.10 / 26 ship kernel 6.12) will FAIL to compile it."
-    warn "Use it only for older GPUs on an older TrueNAS release — otherwise pick a"
-    warn "current branch (★ Production / ★ New Feature) that supports your kernel."
+    warn "Use it only for older GPUs on an older TrueNAS release, pick a current"
+    warn "branch (★ Production / ★ New Feature), or drop community patches into"
+    warn "patches/<kernel>/ (e.g. patches/6.12/) to patch it — see the README."
+}
+
+# Map a TrueNAS version (e.g. 25.10.3.1) to its kernel MAJOR.MINOR. Used only for
+# the wizard heads-up below; the build reads the REAL kernel from the image and
+# is authoritative. Extend as new TrueNAS releases ship.
+declare -A TRUENAS_KERNEL_MM=(
+    ["23.10"]="6.1"
+    ["24.04"]="6.6"
+    ["24.10"]="6.6"
+    ["25.04"]="6.12"
+    ["25.10"]="6.12"
+)
+truenas_kernel_mm() {
+    local mm=""
+    mm="$(echo "$1" | grep -oP '^\d+\.\d+' || true)"
+    printf '%s' "${TRUENAS_KERNEL_MM[${mm}]:-}"
+}
+
+# Warn at config time when the build WILL patch the driver — i.e. the repo's
+# patches/<kernel>/ for the selected TrueNAS version's kernel contains patches.
+advise_patches() {
+    local truenas_version="$1"
+    local kmm=""
+    kmm="$(truenas_kernel_mm "${truenas_version}")"
+    [[ -n "${kmm}" ]] || return 0
+
+    local self_dir=""
+    self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local pdir="${self_dir}/patches/${kmm}"
+    [[ -d "${pdir}" ]] || return 0
+
+    local -a found=()
+    while IFS= read -r f; do
+        [[ -n "${f}" ]] && found+=("${f}")
+    done < <(find "${pdir}" -maxdepth 1 -type f \( -name '*.patch' -o -name '*.diff' \) 2>/dev/null | sort)
+    [[ ${#found[@]} -gt 0 ]] || return 0
+
+    warn "Source patches found for kernel ${kmm} (patches/${kmm}/): ${#found[@]} file(s)."
+    warn "The build will PATCH the NVIDIA driver with them — a community-patched,"
+    warn "non-standard build that NVIDIA does not support. Remove them to build stock."
+}
+
+# Repo directory (where configure.sh lives).
+config_repo_dir() { cd "$(dirname "${BASH_SOURCE[0]}")" && pwd; }
+
+# True when the selected driver can't build on the selected TrueNAS kernel unaided
+# (legacy branch + kernel newer than its ceiling) — i.e. patches are needed.
+patching_relevant() {
+    local driver_major=""
+    driver_major="$(nvidia_major "$1")"
+    local max="${NVIDIA_BRANCH_MAX_KERNEL[${driver_major}]:-}"
+    [[ -n "${max}" ]] || return 1
+    local kmm=""
+    kmm="$(truenas_kernel_mm "$2")"
+    [[ -n "${kmm}" ]] || return 1
+    [[ "${kmm}" != "${max}" \
+       && "$(printf '%s\n%s\n' "${kmm}" "${max}" | sort -V | tail -n1)" == "${kmm}" ]]
+}
+
+# Download the curated predefined patch set for a driver branch (per its
+# predefined-patches/<driver>/PATCHES.list) into predefined-patches/<driver>/,
+# numbered to preserve apply order. Returns non-zero on any failure.
+fetch_predefined_patches() {
+    local driver_major="$1"
+    local pdir="$(config_repo_dir)/predefined-patches/${driver_major}"
+    local manifest="${pdir}/PATCHES.list"
+    [[ -f "${manifest}" ]] || { err "No predefined patch set for NVIDIA ${driver_major}."; return 1; }
+
+    local base="" line
+    local -a names=()
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]] && continue
+        if [[ "${line}" =~ ^@base[[:space:]]+(.+)$ ]]; then
+            base="$(echo "${BASH_REMATCH[1]}" | tr -d '[:space:]')"
+            continue
+        fi
+        names+=("$(echo "${line}" | tr -d '[:space:]')")
+    done < "${manifest}"
+
+    [[ -n "${base}" ]] || { err "Predefined manifest missing an @base URL."; return 1; }
+    [[ ${#names[@]} -gt 0 ]] || { err "Predefined manifest lists no patches."; return 1; }
+
+    # Clear any stale downloads so a re-run is clean
+    find "${pdir}" -maxdepth 1 -type f \( -name '*.patch' -o -name '*.diff' \) -delete 2>/dev/null || true
+
+    info "Downloading ${#names[@]} predefined patch(es) for NVIDIA ${driver_major} …"
+    local n=0 name out
+    for name in "${names[@]}"; do
+        n=$((n + 1))
+        out="$(printf '%s/%02d-%s' "${pdir}" "${n}" "${name}")"
+        if ! fetch_url "${base}/${name}" > "${out}" 2>/dev/null || [[ ! -s "${out}" ]]; then
+            rm -f "${out}"
+            err "Failed to download ${name} from ${base}/"
+            return 1
+        fi
+        echo -e "  ${GREEN}✓${NC} ${name}"
+    done
+    ok "Saved ${n} patch(es) to predefined-patches/${driver_major}/"
+    warn "These are COMMUNITY patches, not tested/endorsed here — verify your build."
+    return 0
+}
+
+# Ask how to handle source patches, but only when the driver/kernel combo needs
+# them. Sets SELECTED_PATCH_MODE to none|custom|predefined (default none).
+SELECTED_PATCH_MODE="none"
+choose_patch_mode() {
+    local nvidia_version="$1" truenas_version="$2"
+    SELECTED_PATCH_MODE="none"
+
+    patching_relevant "${nvidia_version}" "${truenas_version}" || return 0
+
+    local driver_major="" kmm=""
+    driver_major="$(nvidia_major "${nvidia_version}")"
+    kmm="$(truenas_kernel_mm "${truenas_version}")"
+    local have_predefined="no"
+    [[ -f "$(config_repo_dir)/predefined-patches/${driver_major}/PATCHES.list" ]] && have_predefined="yes"
+
+    banner "Kernel Patches"
+    echo -e "  ${YELLOW}NVIDIA ${nvidia_version} (legacy) won't build on kernel ${kmm} unaided.${NC}"
+    echo -e "  ${DIM}You can patch the driver source so it compiles, or skip and use a newer driver.${NC}"
+    echo ""
+
+    local choice=""
+    if [[ "${UI_MODE}" == "whiptail" ]]; then
+        wt_size
+        local -a opts=()
+        [[ "${have_predefined}" == "yes" ]] && opts+=("predefined" "Download curated community patches for ${driver_major} (recommended)")
+        opts+=("custom" "Use my own patches in patches/${kmm}/")
+        opts+=("none" "No patches (build will likely fail)")
+        choice=$(whiptail --title "Kernel Patches" \
+            --menu "NVIDIA ${nvidia_version} needs source patches for kernel ${kmm}:" \
+            ${WT_HEIGHT} ${WT_WIDTH} 3 "${opts[@]}" 3>&1 1>&2 2>&3) || choice="none"
+    else
+        local -a labels=() tags=()
+        if [[ "${have_predefined}" == "yes" ]]; then
+            labels+=("Download curated community patches (recommended)"); tags+=("predefined")
+        fi
+        labels+=("Use my own patches in patches/${kmm}/"); tags+=("custom")
+        labels+=("No patches (build will likely fail)"); tags+=("none")
+        PS3="  #? "
+        local sel
+        select sel in "${labels[@]}"; do
+            if [[ -n "${sel}" ]]; then choice="${tags[$((REPLY-1))]}"; break; fi
+            echo -e "  ${RED}Invalid selection.${NC}"
+        done
+    fi
+    [[ -n "${choice}" ]] || choice="none"
+
+    case "${choice}" in
+        predefined)
+            if fetch_predefined_patches "${driver_major}"; then
+                SELECTED_PATCH_MODE="predefined"
+            else
+                warn "Falling back to 'custom' — add patches to patches/${kmm}/ before building."
+                SELECTED_PATCH_MODE="custom"
+            fi
+            ;;
+        custom)
+            SELECTED_PATCH_MODE="custom"
+            info "Place your patches in patches/${kmm}/ before building (see README)."
+            ;;
+        *)
+            SELECTED_PATCH_MODE="none"
+            ;;
+    esac
+    ok "Patch mode: ${SELECTED_PATCH_MODE}"
 }
 
 # Find the latest version in the sorted list matching a given major prefix
@@ -931,6 +1105,7 @@ generate_env_file() {
     local embed_update="$5"
     local build_cc="$6"
     local output_file="$7"
+    local patch_mode="${8:-auto}"
 
     cat > "${output_file}" <<EOF
 # Generated by configure.sh — $(date '+%Y-%m-%d %H:%M:%S')
@@ -955,6 +1130,13 @@ NVIDIA_BUILD_CC=${build_cc}
 
 # When true, also produces a rebuilt truenas.update with nvidia.raw embedded.
 EMBED_NVIDIA_RAW_IN_UPDATE=${embed_update}
+
+# Source-patch mode for building EOL drivers on newer kernels:
+#   none        -> never patch
+#   custom      -> your own patches in patches/<kernel>/ (or flat patches/)
+#   predefined  -> curated set in predefined-patches/<driver>/ (see configure.sh)
+#   auto        -> apply patches/<kernel>/ if present (default; backward compatible)
+NVIDIA_PATCH_MODE=${patch_mode}
 EOF
 }
 
@@ -1004,7 +1186,7 @@ detect_nvidia_gpu() {
 read_existing_config() {
     local env_file="$1"
 
-    declare -g EXISTING_TRUENAS="" EXISTING_NVIDIA="" EXISTING_MODULE="" EXISTING_EMBED="" EXISTING_CODENAME=""
+    declare -g EXISTING_TRUENAS="" EXISTING_NVIDIA="" EXISTING_MODULE="" EXISTING_EMBED="" EXISTING_CODENAME="" EXISTING_PATCH_MODE=""
 
     [[ -f "${env_file}" ]] || return 1
 
@@ -1022,6 +1204,7 @@ read_existing_config() {
             NVIDIA_KERNEL_MODULE_TYPE)  EXISTING_MODULE="${value}" ;;
             EMBED_NVIDIA_RAW_IN_UPDATE) EXISTING_EMBED="${value}" ;;
             TRUENAS_CODENAME)           EXISTING_CODENAME="${value}" ;;
+            NVIDIA_PATCH_MODE)          EXISTING_PATCH_MODE="${value}" ;;
         esac
     done < "${env_file}"
 
@@ -1057,6 +1240,7 @@ main() {
         local selected_nvidia="${CLI_NVIDIA}"
         local selected_module_type="${CLI_MODULE:-open}"
         local selected_embed="${CLI_EMBED:-false}"
+        local selected_patch_mode="${CLI_PATCH:-auto}"
         local selected_cc=""
 
         # Validate enumerated flags up front so bad input fails loudly here
@@ -1069,6 +1253,15 @@ main() {
             true|false) ;;
             *) err "Invalid --embed '${selected_embed}' (expected: true or false)"; exit 1 ;;
         esac
+        case "${selected_patch_mode}" in
+            none|custom|predefined|auto) ;;
+            *) err "Invalid --patch '${selected_patch_mode}' (expected: none, custom, predefined, or auto)"; exit 1 ;;
+        esac
+        # In non-interactive mode, fetch the predefined set now if requested.
+        if [[ "${selected_patch_mode}" == "predefined" ]]; then
+            fetch_predefined_patches "$(nvidia_major "${selected_nvidia}")" \
+                || { err "Could not fetch predefined patches; aborting."; exit 1; }
+        fi
 
         # Pre-515 drivers only ship proprietary modules; don't write a config
         # the build will just have to override.
@@ -1089,7 +1282,10 @@ main() {
         ok "Module:  ${selected_module_type}"
         ok "Embed:   ${selected_embed}"
 
+        ok "Patch:   ${selected_patch_mode}"
+
         advise_legacy_driver "${selected_nvidia}"
+        advise_patches "${selected_truenas}"
 
         generate_env_file \
             "${selected_nvidia}" \
@@ -1098,7 +1294,8 @@ main() {
             "${selected_module_type}" \
             "${selected_embed}" \
             "${selected_cc}" \
-            "${env_file}"
+            "${env_file}" \
+            "${selected_patch_mode}"
 
         ok ".env generated!"
         return 0
@@ -1153,6 +1350,7 @@ main() {
         local selected_nvidia="${EXISTING_NVIDIA}"
         local selected_module_type="${EXISTING_MODULE}"
         local selected_embed="${EXISTING_EMBED}"
+        local selected_patch_mode="${EXISTING_PATCH_MODE:-auto}"
         local selected_cc=""
 
         case "${reconfigure_what}" in
@@ -1186,6 +1384,7 @@ main() {
                     ui_menu selected_nvidia "NVIDIA Driver" \
                         "Select new NVIDIA driver:" "${nvidia_menu_args[@]}"
                     advise_legacy_driver "${selected_nvidia}"
+                    advise_patches "${selected_truenas}"
                 fi
                 ;;
             module)
@@ -1232,7 +1431,7 @@ main() {
         generate_env_file \
             "${selected_nvidia}" "${selected_truenas}" "${selected_codename}" \
             "${selected_module_type}" "${selected_embed}" "${selected_cc}" \
-            "${env_file}"
+            "${env_file}" "${selected_patch_mode}"
         ok ".env updated! (changed: ${reconfigure_what})"
         return 0
     fi
@@ -1366,6 +1565,7 @@ main() {
     [[ -n "${selected_nvidia}" ]] || { err "No NVIDIA version selected. Aborting."; exit 1; }
     ok "Selected: ${selected_nvidia}"
     advise_legacy_driver "${selected_nvidia}"
+    advise_patches "${selected_truenas}"
     echo ""
 
     # ── Step 3: Kernel Module Type ───────────────────────────────────────────
@@ -1428,6 +1628,10 @@ main() {
     local selected_cc=""
     # Auto-detect is the default, don't bother asking unless advanced mode
 
+    # ── Kernel patches (only asked when the driver/kernel combo needs them) ──
+    choose_patch_mode "${selected_nvidia}" "${selected_truenas}"
+    local selected_patch_mode="${SELECTED_PATCH_MODE}"
+
     # ── Summary & Confirmation ───────────────────────────────────────────────
     banner "Configuration Summary"
 
@@ -1438,6 +1642,7 @@ main() {
     summary+="\n  Module Type        : ${selected_module_type}"
     summary+="\n  Embed in .update   : ${selected_embed}"
     summary+="\n  Compiler Override  : ${selected_cc:-auto-detect}"
+    [[ "${selected_patch_mode}" != "none" ]] && summary+="\n  Patch Mode         : ${selected_patch_mode}"
 
     if [[ "${UI_MODE}" == "whiptail" ]]; then
         ui_msgbox "Configuration Summary" "$(echo -e "${summary}")"
@@ -1450,6 +1655,8 @@ main() {
         echo -e "  ${GREEN}►${NC} Module Type        : ${BOLD}${selected_module_type}${NC}"
         echo -e "  ${GREEN}►${NC} Embed in .update   : ${BOLD}${selected_embed}${NC}"
         echo -e "  ${GREEN}►${NC} Compiler Override  : ${BOLD}${selected_cc:-auto-detect}${NC}"
+        [[ "${selected_patch_mode}" != "none" ]] && \
+            echo -e "  ${GREEN}►${NC} Patch Mode         : ${BOLD}${selected_patch_mode}${NC}"
         echo ""
     fi
 
@@ -1470,7 +1677,8 @@ main() {
         "${selected_module_type}" \
         "${selected_embed}" \
         "${selected_cc}" \
-        "${env_file}"
+        "${env_file}" \
+        "${selected_patch_mode}"
 
     ok ".env generated!"
     echo ""

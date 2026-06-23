@@ -15,6 +15,13 @@ truenas.update
 # Persistent download cache (created by the docker-compose ./cache mount)
 cache/
 
+# User-supplied driver source patches (manual patch mode)
+patches/
+
+# Downloaded predefined patch files (the PATCHES.list manifests stay tracked)
+predefined-patches/**/*.patch
+predefined-patches/**/*.diff
+
 # Docker build cache
 .docker/
 

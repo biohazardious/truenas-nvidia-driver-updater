@@ -28,6 +28,10 @@ services:
       # true/false — set true to bypass the early driver/kernel compatibility
       # abort (e.g. building a legacy branch with patched sources).
       - SKIP_KERNEL_COMPAT_CHECK=${SKIP_KERNEL_COMPAT_CHECK:-false}
+      # Source-patch mode: none | custom | predefined | auto (default auto).
+      # 'predefined' applies the curated set in ./predefined-patches/<driver>/;
+      # 'custom' uses ./patches/<kernel>/. See ./configure.sh and the README.
+      - NVIDIA_PATCH_MODE=${NVIDIA_PATCH_MODE:-auto}
     # Force standard runtime — TrueNAS may default to nvidia-container-runtime,
     # which fails when the driver is being rebuilt (chicken-and-egg).
     runtime: runc
@@ -39,8 +43,9 @@ services:
       # installer are stored here and reused across runs instead of being
       # re-downloaded every time. Safe to delete to force fresh downloads.
       - ./cache:/cache
-      # Optional: drop community *.patch/*.diff files here to apply them to the
-      # NVIDIA source before compiling (e.g. to build an EOL driver like 470 on a
-      # newer kernel). Empty/absent = no patches applied.
+      # Optional: community source patches to build an EOL driver (e.g. 470) on a
+      # newer kernel. Put them in a kernel-keyed subdir, e.g. ./patches/6.12/*.patch
+      # for TrueNAS 25.x; the build auto-selects the dir matching the image kernel.
+      # Empty/absent = no patches applied.
       - ./patches:/patches
     privileged: true

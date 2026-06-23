@@ -37,10 +37,12 @@
 #                         be incompatible with the target kernel (e.g. legacy
 #                         470 on kernel 6.10+). Set true to attempt anyway.
 #   /patches (or NVIDIA_PATCH_DIR, or /workspace/patches)
-#                       — Optional. *.patch/*.diff files dropped here are applied
-#                         to the extracted NVIDIA source before compiling — e.g.
-#                         community patches to build an EOL driver (470) on a
-#                         newer kernel. Their presence also relaxes the early
+#                       — Optional source patches applied to the extracted NVIDIA
+#                         source before compiling — e.g. community patches to
+#                         build an EOL driver (470) on a newer kernel. Put them in
+#                         a kernel-keyed subdir matching the target kernel, e.g.
+#                         /patches/6.12/*.patch (a flat /patches/*.patch acts as a
+#                         generic fallback). Their presence relaxes the early
 #                         driver/kernel compatibility abort.
 #   /workspace/truenas.update — Pre-downloaded update file (skips download)
 #   /output                   — Bind-mounted output directory
@@ -198,6 +200,71 @@ check_driver_kernel_compatibility() {
         return 0
     fi
     die "Aborting before download/compile."
+}
+
+# Populate PATCH_FILES with the source patches to apply, chosen by
+# NVIDIA_PATCH_MODE (default "auto"):
+#   none        — never patch.
+#   predefined  — use the curated set shipped in the repo at
+#                 /workspace/predefined-patches/<driver-major>/ (fetched by
+#                 ./configure.sh from PATCHES.list).
+#   custom|auto — user-supplied patches, preferring the kernel-specific subdir
+#                 then a generic flat dir:
+#                   <dir>/<MAJOR.MINOR>/   e.g. patches/6.12/   (per-kernel)
+#                   <dir>/                 e.g. patches/        (generic)
+#                 where <dir> is $NVIDIA_PATCH_DIR (default /patches) and
+#                 /workspace/patches. (auto = same as custom; backward compatible.)
+# Must run AFTER KERNEL_VERSION is known. Sets PATCH_SOURCE_DESC for messages.
+detect_patch_files() {
+    PATCH_FILES=()
+    PATCH_SOURCE_DESC=""
+    local mode="${NVIDIA_PATCH_MODE:-auto}"; mode="${mode,,}"
+    local _p
+
+    case "${mode}" in
+        none)
+            return 0
+            ;;
+        predefined)
+            local driver_major="${NVIDIA_VERSION%%.*}"
+            local pdir="/workspace/predefined-patches/${driver_major}"
+            while IFS= read -r _p; do
+                [[ -n "${_p}" ]] && PATCH_FILES+=("${_p}")
+            done < <(find "${pdir}" -maxdepth 1 -type f \( -name '*.patch' -o -name '*.diff' \) 2>/dev/null | LC_ALL=C sort)
+            if [[ ${#PATCH_FILES[@]} -gt 0 ]]; then
+                PATCH_SOURCE_DESC="predefined set for NVIDIA ${driver_major}"
+            else
+                warn "NVIDIA_PATCH_MODE=predefined but no patches found in predefined-patches/${driver_major}/."
+                warn "Run ./configure.sh and pick the predefined option to fetch them, or add them manually."
+            fi
+            return 0
+            ;;
+        custom|auto|*)
+            local kernel_mm=""
+            [[ "${KERNEL_VERSION}" =~ ^([0-9]+\.[0-9]+) ]] && kernel_mm="${BASH_REMATCH[1]}"
+            local -a kernel_dirs=() flat_dirs=()
+            local base
+            for base in "${NVIDIA_PATCH_DIR:-/patches}" "/workspace/patches"; do
+                [[ -n "${kernel_mm}" ]] && kernel_dirs+=("${base}/${kernel_mm}")
+                flat_dirs+=("${base}")
+            done
+            # kernel-specific patches take precedence over a generic flat dir
+            if [[ ${#kernel_dirs[@]} -gt 0 ]]; then
+                while IFS= read -r _p; do
+                    [[ -n "${_p}" ]] && PATCH_FILES+=("${_p}")
+                done < <(find "${kernel_dirs[@]}" -maxdepth 1 -type f \( -name '*.patch' -o -name '*.diff' \) 2>/dev/null | LC_ALL=C sort)
+                if [[ ${#PATCH_FILES[@]} -gt 0 ]]; then
+                    PATCH_SOURCE_DESC="kernel ${kernel_mm}"
+                    return 0
+                fi
+            fi
+            while IFS= read -r _p; do
+                [[ -n "${_p}" ]] && PATCH_FILES+=("${_p}")
+            done < <(find "${flat_dirs[@]}" -maxdepth 1 -type f \( -name '*.patch' -o -name '*.diff' \) 2>/dev/null | LC_ALL=C sort)
+            [[ ${#PATCH_FILES[@]} -gt 0 ]] && PATCH_SOURCE_DESC="generic patches dir"
+            return 0
+            ;;
+    esac
 }
 
 resolve_embedded_nvidia_raw_path() {
@@ -445,22 +512,11 @@ else
     info "No writable /cache volume mounted — downloads will not be cached across runs"
 fi
 
-# ── User-supplied source patches (optional) ──────────────────────────────────
-#    To build an EOL driver on a kernel newer than NVIDIA supports (e.g. 470 on
-#    6.10+), drop community *.patch/*.diff files into ./patches (mounted at
-#    /patches) or ./patches via the workspace mount. They are applied to the
-#    extracted NVIDIA source before compiling (see Phase 4). Their presence also
-#    relaxes the driver/kernel compatibility abort, since you've supplied the fix.
-PATCH_SEARCH_DIRS=("${NVIDIA_PATCH_DIR:-/patches}" "/workspace/patches")
+# Source patches are discovered later (Phase 2), once the target kernel version
+# is known, so we can pick the kernel-specific patch set. Declared empty here so
+# the compatibility check can safely reference it under `set -u`.
 declare -a PATCH_FILES=()
-while IFS= read -r _patch; do
-    [[ -n "${_patch}" ]] && PATCH_FILES+=("${_patch}")
-done < <(find "${PATCH_SEARCH_DIRS[@]}" -maxdepth 1 -type f \( -name '*.patch' -o -name '*.diff' \) 2>/dev/null | LC_ALL=C sort)
-
-if [[ ${#PATCH_FILES[@]} -gt 0 ]]; then
-    info "Found ${#PATCH_FILES[@]} source patch(es) to apply before compiling:"
-    printf '  %s\n' "${PATCH_FILES[@]##*/}"
-fi
+PATCH_SOURCE_DESC=""
 
 # ── Obtain the TrueNAS update file ──────────────────────────────────────────
 UPDATE_FILE="/tmp/truenas.update"
@@ -681,8 +737,18 @@ elif [[ -f "${ROOTFS_DIR}/usr/lib/modules/${KERNEL_VERSION}/build/Module.symvers
            "${KERNEL_HEADERS_PATH}/Module.symvers"
 fi
 
-# Now that the real target kernel is known, fail fast on a known driver/kernel
-# incompatibility rather than after a long download + doomed compile.
+# Now that the real target kernel is known, discover any (kernel-specific)
+# source patches, then fail fast on a known driver/kernel incompatibility unless
+# patches are supplied to make it build.
+detect_patch_files
+if [[ ${#PATCH_FILES[@]} -gt 0 ]]; then
+    banner "Driver source will be PATCHED"
+    warn "Applying ${#PATCH_FILES[@]} source patch(es) (${PATCH_SOURCE_DESC}) to NVIDIA ${NVIDIA_VERSION} before compiling:"
+    printf '  %s\n' "${PATCH_FILES[@]##*/}" >&2
+    warn "This produces a COMMUNITY-PATCHED, non-standard driver build — unsupported by NVIDIA."
+    warn "You are responsible for the patches' correctness. Continuing in 5s (Ctrl-C to abort) …"
+    sleep 5 || true
+fi
 check_driver_kernel_compatibility
 
 # =============================================================================
@@ -768,14 +834,22 @@ if [[ ${#PATCH_FILES[@]} -gt 0 ]]; then
     ok "Source patched; the build will use the patched tree"
 fi
 
-# Run the installer with the given args, from the patched extracted tree when
-# patches were applied, otherwise straight from the (pristine) .run.
+# Run the installer with the given args. Without patches we run the .run, which
+# self-extracts a FRESH copy each invocation. With patches we must run our
+# patched tree — but nvidia-installer mutates its working dir as it installs, so
+# running the same tree twice (the two-pass install) breaks the 2nd pass
+# ("Unable to open 'kernel/dkms.conf'"). Mirror the .run's behavior: copy the
+# pristine patched tree to a throwaway dir per invocation and run there.
 run_nvidia_installer() {
     if env_is_true "${USE_EXTRACTED_TREE}"; then
-        ( cd "${NVIDIA_SRC_ROOT}" && ./nvidia-installer "$@" )
-    else
-        "${RUN_FILE_PATH}" "$@"
+        local work rc=0
+        work="$(mktemp -d "${BUILD_DIR}/installer-run.XXXXXX")"
+        cp -a "${NVIDIA_SRC_ROOT}/." "${work}/"
+        if ( cd "${work}" && ./nvidia-installer "$@" ); then rc=0; else rc=$?; fi
+        rm -rf "${work}"
+        return ${rc}
     fi
+    "${RUN_FILE_PATH}" "$@"
 }
 
 # =============================================================================

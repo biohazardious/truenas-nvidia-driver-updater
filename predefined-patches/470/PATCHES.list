@@ -1,0 +1,38 @@
+# Curated patch set for the NVIDIA 470 (470.256.02) legacy branch to build on
+# mainline Linux kernels (6.10+), used by NVIDIA_PATCH_MODE=predefined.
+#
+# Source: joanbm/nvidia-470xx-linux-mainline (community-maintained, dual MIT/GPL
+# like the driver's open bits). These are version-guarded and applied as a stack,
+# in the order below — the same order that project's extract_and_patch uses — so
+# the result builds across 6.10 through 7.x. configure.sh downloads them (in this
+# order, with numeric prefixes) into predefined-patches/470/ when you choose the
+# "predefined" patch option.
+#
+# NOTE: community patches, NOT tested/endorsed by this project. Verify your build.
+# To update: bump @base or the list to match the upstream project.
+#
+# Format:
+#   @base <raw-base-url>      base URL the filenames below are fetched from
+#   <filename>                one patch filename per line, in apply order
+#   # ...                     comments / blank lines ignored
+
+@base https://raw.githubusercontent.com/joanbm/nvidia-470xx-linux-mainline/master/patches
+
+0001-Fix-conftest-to-ignore-implicit-function-declaration.patch
+0002-Fix-conftest-to-use-a-short-wchar_t.patch
+0003-Fix-conftest-to-use-nv_drm_gem_vmap-which-has-the-se.patch
+kernel-6.10.patch
+kernel-6.12.patch
+nvidia-470xx-fix-gcc-15.patch
+nvidia-470xx-fix-linux-6.13.patch
+nvidia-470xx-fix-linux-6.14.patch
+nvidia-470xx-fix-linux-6.15.patch
+nvidia-470xx-fix-linux-6.17.patch
+nvidia-470xx-fix-linux-6.19-part1.patch
+nvidia-470xx-fix-linux-6.19-part2.patch
+nvidia-470xx-fix-linux-7.0.patch
+nvidia-470xx-fix-linux-7.2-part1.patch
+nvidia-470xx-fix-linux-7.2-part2.patch
+nvidia-470xx-fix-linux-7.2-part3.patch
+disable-objtool-override.patch
+enable-drm-modeset-by-default.patch

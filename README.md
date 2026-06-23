@@ -280,37 +280,50 @@ If the target kernel is newer than the branch supports, the build **aborts immed
 
 ### Building EOL drivers on newer kernels (patches)
 
-When a legacy driver needs source fixes to build on a newer kernel (e.g. 470 on TrueNAS 25.x / kernel 6.12), drop community patch files into the **`./patches/`** directory (mounted at `/patches`). Any `*.patch` / `*.diff` there is applied to the extracted NVIDIA source before compiling.
+When a legacy driver needs source fixes to build on a newer kernel (e.g. 470 on TrueNAS 25.x / kernel 6.12), the builder can patch the NVIDIA source before compiling. The behavior is set by **`NVIDIA_PATCH_MODE`** (`./configure.sh` asks you when the chosen driver/kernel combo needs it):
 
-**Worked example — NVIDIA 470 on TrueNAS 25.x (kernel 6.12):**
+| Mode | What it does |
+|------|--------------|
+| `none` | Never patch (build will fail if the driver can't compile on that kernel). |
+| `predefined` | Apply the **curated set we ship** for that driver branch — `predefined-patches/<driver>/` — fetched from a known community project. The easy button. |
+| `custom` | Apply **your own** patches from `patches/<kernel>/` (e.g. `patches/6.12/`). |
+| `auto` (default) | Apply `patches/<kernel>/` if present, else build stock. Backward-compatible. |
+
+**Easiest path — predefined (NVIDIA 470 on TrueNAS 25.x):** run `./configure.sh`, pick the 470 driver and a 25.x TrueNAS version, and when prompted choose **"Download curated community patches."** It downloads the curated set into `predefined-patches/470/` and sets `NVIDIA_PATCH_MODE=predefined`. Non-interactively:
 
 ```bash
-mkdir -p patches
-# Patches from the maintained nvidia-470xx-linux-mainline project (see below).
-# Apply order is filename-sorted, so prefix kernel patches to run after the
-# numbered conftest fixes:
-base=https://raw.githubusercontent.com/joanbm/nvidia-470xx-linux-mainline/master/patches
-curl -L -o patches/10-kernel-6.10.patch "$base/kernel-6.10.patch"
-curl -L -o patches/12-kernel-6.12.patch "$base/kernel-6.12.patch"
-
-docker compose run --rm nvidia-builder   # NVIDIA_VERSION=470.256.02, TrueNAS 25.x
+./configure.sh --truenas 25.10.3.1 --nvidia 470.256.02 --patch predefined
+docker compose run --rm nvidia-builder
 ```
 
-**Where to find patches** (you supply and vet them — they're version- and kernel-specific):
+**Own patches — custom:** drop patch files into a kernel-keyed subdir `patches/<MAJOR.MINOR>/` and set `NVIDIA_PATCH_MODE=custom`:
+
+```bash
+mkdir -p patches/6.12
+base=https://raw.githubusercontent.com/joanbm/nvidia-470xx-linux-mainline/master/patches
+curl -L -o patches/6.12/10-kernel-6.10.patch "$base/kernel-6.10.patch"
+curl -L -o patches/6.12/12-kernel-6.12.patch "$base/kernel-6.12.patch"
+```
+
+When any patches are applied, **both `./configure.sh` and the build warn you** it's a community-patched, non-standard build, and the build pauses briefly before continuing.
+
+**Where the curated set comes from / where to find your own** (you vet them — they're version- and kernel-specific):
 
 | Source | What it is |
 |--------|-----------|
-| [joanbm/nvidia-470xx-linux-mainline](https://github.com/joanbm/nvidia-470xx-linux-mainline/tree/master/patches) | Dedicated, maintained 470xx patches for mainline kernels — includes `kernel-6.10.patch`, `kernel-6.12.patch`, and fixes through 6.1x/7.x. Best starting point for 470. |
-| [AUR `nvidia-470xx-dkms`](https://aur.archlinux.org/packages/nvidia-470xx-dkms) | Arch package that carries the same family of 470xx kernel-compat patches in its repo. |
-| [Frogging-Family/nvidia-all](https://github.com/Frogging-Family/nvidia-all) | Broad NVIDIA driver patch collection (many branches), applied per kernel. |
-| Distro source packages | Debian/Ubuntu `nvidia-graphics-drivers-470` carry `debian/patches/` for newer kernels. |
+| [joanbm/nvidia-470xx-linux-mainline](https://github.com/joanbm/nvidia-470xx-linux-mainline/tree/master/patches) | The project our **predefined 470 set** is curated from (`predefined-patches/470/PATCHES.list`). Maintained patches for mainline kernels through 6.1x/7.x. |
+| [AUR `nvidia-470xx-dkms`](https://aur.archlinux.org/packages/nvidia-470xx-dkms) | Arch package carrying the same family of 470xx kernel-compat patches. |
+| [Frogging-Family/nvidia-all](https://github.com/Frogging-Family/nvidia-all) | Broad NVIDIA driver patch collection (many branches). |
+| Distro source packages | Debian/Ubuntu `nvidia-graphics-drivers-470` carry `debian/patches/`. |
 
 How it works:
 
+- `predefined` reads `predefined-patches/<driver-major>/`; `custom`/`auto` read `patches/<kernel>/` (kernel-specific, chosen by the **real image kernel**) with a flat `patches/*.patch` fallback.
 - Each patch is **dry-run first** to find the right target (NVIDIA package root *or* its `kernel/` subdir) and strip level (`-p1`/`-p0`/`-p2`), then applied — so a mismatched patch can't half-apply. One that won't apply **aborts the build** with the filename.
-- Patches apply in **sorted filename order**; many fixes are cumulative, so name them so the kernel patches run after any prerequisite/conftest patches (as in the example above).
-- Supplying patches automatically **relaxes the driver/kernel compatibility abort** — you've provided the fix, so the builder proceeds without `SKIP_KERNEL_COMPAT_CHECK`.
-- Patches must match your exact `NVIDIA_VERSION`. The example targets `470.256.02`; a different driver version may need different patches.
+- Patches apply in **sorted filename order** (the predefined fetch numbers them to preserve the upstream apply order); many fixes are cumulative.
+- Applying patches automatically **relaxes the driver/kernel compatibility abort** — you've provided the fix.
+- Patches must match your exact `NVIDIA_VERSION`. The predefined 470 set targets `470.256.02`; a different driver version may need different patches.
+- The predefined set is **community-sourced and not tested/endorsed by this project** — verify your build. To update it, edit `predefined-patches/<driver>/PATCHES.list`.
 
 ---
 
@@ -440,3 +453,4 @@ MIT — see [LICENSE](LICENSE).
 - Inspired by the official [TrueNAS SCALE extension build system](https://github.com/truenas/scale-build)
 - NVIDIA driver installer from [NVIDIA's official download site](https://www.nvidia.com/Download/index.aspx)
 - nvidia-container-toolkit from [NVIDIA's container toolkit repo](https://github.com/NVIDIA/nvidia-container-toolkit)
+- Legacy 470-on-mainline-kernel patches by [**joanbm**'s nvidia-470xx-linux-mainline](https://github.com/joanbm/nvidia-470xx-linux-mainline) — the curated set used by the `predefined` patch mode to build the EOL 470 branch on kernel 6.10+
