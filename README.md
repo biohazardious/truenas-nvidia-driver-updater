@@ -1,6 +1,6 @@
 # TrueNAS NVIDIA Driver Updater
 
-Build and deploy **any** NVIDIA driver as a `systemd-sysext` image (`nvidia.raw`) for **TrueNAS 25/26** — fully automated via Docker.
+Build and deploy **any** NVIDIA driver as a `systemd-sysext` image (`nvidia.raw`) for **TrueNAS 23/24/25/26** — fully automated via Docker.
 
 TrueNAS ships with a specific NVIDIA driver version baked into its immutable root filesystem. This tool lets you compile and package a different driver version (newer or older) without modifying the base OS, using the `systemd-sysext` overlay mechanism that TrueNAS natively supports.
 
@@ -10,7 +10,7 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 
 - **Interactive wizard** — `configure.sh` fetches real version lists with smart tagging (★ Latest Stable, ★ Production Branch, etc.) and guides you through setup. Uses whiptail TUI dialogs when available (TrueNAS has it), with bash `select` menus as fallback
 - **Fully automated** — downloads TrueNAS update file, extracts kernel headers, compiles the driver, packages everything
-- **TrueNAS 25/26 aware** — supports 25.x codename-based downloads and TrueNAS 26 update URLs
+- **TrueNAS 23/24/25/26 aware** — supports 23.x, 24.x, 25.x codename-based downloads and TrueNAS 26 update URLs
 - **Production-kernel aware** — correctly selects the production kernel over debug variants
 - **Complete module database** — ships a combined `modules.dep` covering all system + NVIDIA modules (no `depmod -a` needed on read-only target)
 - **nvidia-container-toolkit included** — Docker GPU passthrough works out of the box
