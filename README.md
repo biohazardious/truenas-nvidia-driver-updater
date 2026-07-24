@@ -16,7 +16,8 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 - **nvidia-container-toolkit included** — Docker GPU passthrough works out of the box
 - **Optional update repack** — can also emit a rebuilt `truenas.update` with the new `nvidia.raw` embedded
 - **Before/after filesystem diff** — captures 100% of NVIDIA installer output, no fragile glob patterns
-- **Backup & rollback** — deployment script preserves previous images with timestamps
+- **Backup & rollback** — deployment script preserves previous images with timestamps and restores them on any failure (including `Ctrl-C`)
+- **Reboot-free driver swap** — deploy script pauses TrueNAS's Docker NVIDIA integration and unloads the old kernel modules, so the new driver is live as soon as `nvidia-smi` runs
 - **Auto sysext diagnostics** — deployment script prints host/image metadata when `systemd-sysext merge` rejects the image
 
 ## Quick Start
@@ -163,12 +164,19 @@ chmod +x deploy-nvidia.sh
 ```
 
 The deploy script handles everything:
+- Turns off TrueNAS's own Docker NVIDIA integration for the duration of the swap (`midclt call -j docker.update '{"nvidia": false}'`) and turns it back on afterwards, so middleware never points at driver files that are being replaced
 - Unmerges active sysext extensions
 - Unlocks the read-only `/usr` ZFS dataset
 - Backs up the existing `nvidia.raw` (timestamped)
 - Installs the new image
 - Re-locks the dataset and merges extensions
+- Verifies the extension is actually **activated** — `/usr/share/truenas/sysext-extensions/` is only a storage location, not a `systemd-sysext` search path; activation is a symlink in `/etc/extensions` (persistent) or `/run/extensions` (tmpfs). TrueNAS middleware manages that symlink; if none exists, the script creates a transient one in `/run/extensions` and tells you to enable NVIDIA support properly
+- Refreshes the dynamic linker cache (`ldconfig`) so the newly merged `libnvidia-*.so` / `libcuda.so` are resolvable
+- Unloads the old driver's kernel modules (`nvidia_drm` → `nvidia_modeset` → `nvidia_uvm` → `nvidia`) so `nvidia-smi` loads the new ones **without a reboot**. If a module is still in use (running container, VM passthrough), it says so and asks for a reboot instead
 - If the merge fails, prints `systemd-sysext` compatibility diagnostics automatically
+- Restores the previous state on **any** failure — including `Ctrl-C` mid-run — via an `EXIT` trap, so `/usr` is never left writable and the Docker NVIDIA integration is never left disabled
+
+> Releases older than Electric Eel have no `docker.config` middleware namespace; the script detects that and skips the integration step instead of failing.
 
 ### 4. Verify
 
@@ -224,8 +232,9 @@ ls -la /dev/dri
 TrueNAS 25/26 uses an immutable root filesystem. `systemd-sysext` provides a supported overlay mechanism that merges the contents of `/usr` from extension images on top of the base OS — without modifying it. This means:
 
 - **Survives reboots** — extensions are re-merged on boot
-- **Survives updates** — rebuild `nvidia.raw` with new kernel headers after a TrueNAS update
 - **Clean rollback** — `systemd-sysext unmerge` restores the original state
+
+> **A TrueNAS update reverts the driver.** The `/usr` dataset (and with it `/usr/share/truenas/sysext-extensions/nvidia.raw`) is replaced wholesale by every TrueNAS update, so the stock driver comes back and the new kernel needs freshly compiled modules anyway. Rebuild against the new TrueNAS version and re-run `deploy-nvidia.sh` after each update. Nothing on `/usr` — and no activation symlink in `/etc/extensions` — is guaranteed to survive.
 
 ### Key Technical Decisions
 
@@ -241,6 +250,9 @@ TrueNAS 25/26 uses an immutable root filesystem. `systemd-sysext` provides a sup
 | Write sibling `.sha256` files for generated artifacts | Keeps `nvidia.raw` and optional `.update` outputs easy to verify in simple release directories and mirrors the user's existing artifact layout |
 | Rebuild `MANIFEST` checksums when repacking `truenas.update` | Replacing the bundled `nvidia.raw` changes `rootfs.squashfs`; the update manifest must be rewritten or TrueNAS rejects the repacked `.update` |
 | gzip compression | Matches TrueNAS's own squashfs convention for consistent image sizes |
+| Pause the Docker NVIDIA integration during deployment | TrueNAS middleware manages the NVIDIA container runtime itself; swapping `nvidia.raw` underneath it leaves the runtime configured against files that no longer exist. Disabling it for the swap and restoring it afterwards keeps middleware and the image in sync |
+| Unload the old kernel modules after merging | The previous driver stays resident in the kernel until unloaded, so `nvidia-smi` would keep reporting the old version (or a module/driver mismatch) until the next reboot |
+| `EXIT` trap around the whole deployment | The window between `zfs set readonly=off` and the final merge leaves `/usr` writable and the extensions unmerged. A trap guarantees that state is undone on error, `die`, or `Ctrl-C` — not only on a failed merge |
 
 ### Driver-version flag support
 
@@ -438,6 +450,10 @@ These must match. Rebuild with the correct `TRUENAS_VERSION`.
 
 The sysext's `modules.dep` is overriding the system's module database. This was a bug in early versions — ensure you're using the latest build script which ships a combined `modules.dep`.
 
+### A systemd unit shipped inside the sysext never starts
+
+Units merged from a sysext that rely on `[Install] WantedBy=multi-user.target` are silently skipped at boot on TrueNAS — no journal entry, no error. Start them explicitly (`systemctl start <unit>`) or from a PREINIT init/shutdown script instead of relying on `enable`.
+
 ### Docker warns "nvidia-container-runtime: no such file or directory"
 
 The `nvidia-container-toolkit` package is missing from the sysext. Ensure you're using the latest build script which installs it via apt.
@@ -454,3 +470,4 @@ MIT — see [LICENSE](LICENSE).
 - NVIDIA driver installer from [NVIDIA's official download site](https://www.nvidia.com/Download/index.aspx)
 - nvidia-container-toolkit from [NVIDIA's container toolkit repo](https://github.com/NVIDIA/nvidia-container-toolkit)
 - Legacy 470-on-mainline-kernel patches by [**joanbm**'s nvidia-470xx-linux-mainline](https://github.com/joanbm/nvidia-470xx-linux-mainline) — the curated set used by the `predefined` patch mode to build the EOL 470 branch on kernel 6.10+
+- [**truenas-community-sysexts** — Building Sysexts for TrueNAS SCALE](https://github.com/truenas-community-sysexts/.github/blob/main/docs/sysext-guide.md) — community reference for sysext activation paths, `/etc` → `/usr` remapping, the `modules.dep` overlay problem, and update-persistence patterns
