@@ -1361,8 +1361,12 @@ detect_nvidia_gpu() {
             warn "${#DETECTED_GPUS[@]} NVIDIA GPUs — no single driver supports all of them (see below)"
         elif [[ -n "${GPU_BRANCH_CEILING}" ]]; then
             ok "${#DETECTED_GPUS[@]} NVIDIA GPUs — a driver must be ${GPU_BRANCH_CEILING}.xx or older to serve all of them"
-        elif [[ -n "${GPU_BRANCH_FLOOR}" ]]; then
+        elif [[ -n "${GPU_BRANCH_FLOOR}" ]] && (( GPU_BRANCH_FLOOR > NVIDIA_MIN_MAJOR )); then
+            # Only worth saying when the floor actually rules something out —
+            # every branch this tool offers is already >= NVIDIA_MIN_MAJOR.
             ok "${#DETECTED_GPUS[@]} NVIDIA GPUs — a driver must be ${GPU_BRANCH_FLOOR}.xx or newer to serve all of them"
+        else
+            ok "${#DETECTED_GPUS[@]} NVIDIA GPUs detected"
         fi
     fi
 
