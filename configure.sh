@@ -436,6 +436,108 @@ advise_legacy_driver() {
     warn "patches/<kernel>/ (e.g. patches/6.12/) to patch it — see the README."
 }
 
+# ── GPU architecture ↔ driver branch fit ────────────────────────────────────
+# A driver can build, package and merge perfectly and still not drive the card:
+# NVIDIA drops older architectures from newer branches, and support for a new
+# card only appears from a certain branch onwards. The failure mode is silent —
+# nvidia-smi simply reports "No devices were found" after a 15-minute build — so
+# the wizard checks the fit up front.
+#
+# The chip codename is the primary signal: lspci prints it ("GP102 [GeForce GTX
+# 1080 Ti]") and it is unambiguous, unlike marketing names (a GTX 750 Ti is
+# Maxwell while the rest of the 7xx series is Kepler).
+declare -A NVIDIA_ARCH_LAST_BRANCH=(
+    [Fermi]="390"
+    [Kepler]="470"
+    [Maxwell]="580"
+    [Pascal]="580"
+    [Volta]="580"
+)
+declare -A NVIDIA_ARCH_FIRST_BRANCH=(
+    [Turing]="410"
+    [Ampere]="450"
+    [Ada]="520"
+    [Blackwell]="570"
+)
+
+# Derive the architecture from a detected GPU string. Sets DETECTED_GPU_ARCH,
+# left empty when nothing matches (the wizard then stays silent rather than
+# guessing).
+detect_gpu_architecture() {
+    declare -g DETECTED_GPU_ARCH=""
+    local model="${1:-}"
+    [[ -n "${model}" ]] || return 0
+
+    # Primary: chip codename prefix, e.g. GK110 / GM204 / GP102 / TU104 / AD102.
+    local chip=""
+    chip="$(printf '%s' "${model}" | grep -oE '\b(G[FKMPVB]|TU|GA|AD)[0-9]{3}' | head -1 || true)"
+    case "${chip}" in
+        GF*) DETECTED_GPU_ARCH="Fermi" ;;
+        GK*) DETECTED_GPU_ARCH="Kepler" ;;
+        GM*) DETECTED_GPU_ARCH="Maxwell" ;;
+        GP*) DETECTED_GPU_ARCH="Pascal" ;;
+        GV*) DETECTED_GPU_ARCH="Volta" ;;
+        TU*) DETECTED_GPU_ARCH="Turing" ;;
+        GA*) DETECTED_GPU_ARCH="Ampere" ;;
+        AD*) DETECTED_GPU_ARCH="Ada" ;;
+        GB*) DETECTED_GPU_ARCH="Blackwell" ;;
+    esac
+    [[ -n "${DETECTED_GPU_ARCH}" ]] && return 0
+
+    # Fallback: marketing name. Order matters — the exceptions come first.
+    local name=""
+    name="$(printf '%s' "${model}" | tr '[:lower:]' '[:upper:]')"
+    case "${name}" in
+        *RTX\ 50[0-9][0-9]*|*RTX\ PRO\ 6000*)      DETECTED_GPU_ARCH="Blackwell" ;;
+        *RTX\ 40[0-9][0-9]*|*\ L4*|*\ L40*)        DETECTED_GPU_ARCH="Ada" ;;
+        *RTX\ 30[0-9][0-9]*|*\ A[0-9][0-9]*)       DETECTED_GPU_ARCH="Ampere" ;;
+        *RTX\ 20[0-9][0-9]*|*GTX\ 16[0-9][0-9]*|*QUADRO\ RTX*|*TESLA\ T4*)
+                                                   DETECTED_GPU_ARCH="Turing" ;;
+        *TITAN\ V*|*GV100*|*TESLA\ V100*)          DETECTED_GPU_ARCH="Volta" ;;
+        *GTX\ 10[0-9][0-9]*|*GT\ 1030*|*TITAN\ XP*|*QUADRO\ P[0-9]*|*TESLA\ P[0-9]*)
+                                                   DETECTED_GPU_ARCH="Pascal" ;;
+        # GTX 745/750/750 Ti are Maxwell despite the 7xx name — match before Kepler.
+        *GTX\ 7[45][05]*|*GTX\ 9[0-9][0-9]*|*TITAN\ X*|*QUADRO\ M[0-9]*|*TESLA\ M[0-9]*)
+                                                   DETECTED_GPU_ARCH="Maxwell" ;;
+        *GTX\ 6[0-9][0-9]*|*GTX\ 7[0-9][0-9]*|*GT\ 7[0-9][0-9]*|*QUADRO\ K[0-9]*|*TESLA\ K[0-9]*)
+                                                   DETECTED_GPU_ARCH="Kepler" ;;
+        *GTX\ 4[0-9][0-9]*|*GTX\ 5[0-9][0-9]*)     DETECTED_GPU_ARCH="Fermi" ;;
+    esac
+    return 0
+}
+
+# Warn when the selected driver branch does not actually support the detected
+# card. Advisory only — the user may be building for a different machine.
+advise_gpu_branch_fit() {
+    local version="$1"
+    [[ -n "${DETECTED_GPU_ARCH:-}" ]] || return 0
+
+    local major=""
+    major="$(nvidia_major "${version}")"
+    [[ "${major}" =~ ^[0-9]+$ ]] || return 0
+
+    if [[ "${DETECTED_GPU_ARCH}" == "Fermi" ]]; then
+        warn "Your GPU is Fermi (GTX 400/500 series) — it needs the 390.xx branch,"
+        warn "which cannot build against any kernel TrueNAS ships. This tool can't"
+        warn "produce a working driver for that card."
+        return 0
+    fi
+
+    local last="${NVIDIA_ARCH_LAST_BRANCH[${DETECTED_GPU_ARCH}]:-}"
+    local first="${NVIDIA_ARCH_FIRST_BRANCH[${DETECTED_GPU_ARCH}]:-}"
+
+    if [[ -n "${last}" ]] && (( major > last )); then
+        warn "Your GPU is ${DETECTED_GPU_ARCH}; NVIDIA dropped that architecture after"
+        warn "the ${last}.xx branch. Driver ${version} will build and install fine but"
+        warn "WILL NOT drive this card — nvidia-smi reports 'No devices were found'."
+        warn "Pick the ${last}.xx branch instead (★ Recommended for your GPU)."
+    elif [[ -n "${first}" ]] && (( major < first )); then
+        warn "Your GPU is ${DETECTED_GPU_ARCH}; NVIDIA support for it starts at the"
+        warn "${first}.xx branch. Driver ${version} predates this card and will not"
+        warn "drive it. Pick a current branch (★ Production / ★ New Feature)."
+    fi
+}
+
 # Map a TrueNAS version (e.g. 25.10.3.1) to its kernel MAJOR.MINOR. Used only for
 # the wizard heads-up below; the build reads the REAL kernel from the image and
 # is authoritative. Extend as new TrueNAS releases ship.
@@ -710,6 +812,19 @@ fetch_nvidia_branch_info() {
         NVIDIA_VERSION_TAGS["${legacy}"]="★ Legacy GPU (470.xx)"
     fi
 
+    # When the detected card is only supported up to an older branch, surface the
+    # newest driver in THAT branch — otherwise the user picks the top of the list
+    # and ends up with a driver that ignores their GPU.
+    local arch_last="${NVIDIA_ARCH_LAST_BRANCH[${DETECTED_GPU_ARCH:-none}]:-}"
+    if [[ -n "${arch_last}" ]]; then
+        local recommended=""
+        recommended="$(nvidia_latest_in_series "${arch_last}" "${sorted[@]}")" || true
+        if [[ -n "${recommended}" ]]; then
+            local existing="${NVIDIA_VERSION_TAGS[${recommended}]:-}"
+            NVIDIA_VERSION_TAGS["${recommended}"]="★ Recommended for your ${DETECTED_GPU_ARCH} GPU${existing:+ · ${existing}}"
+        fi
+    fi
+
     local tag_count=${#NVIDIA_VERSION_TAGS[@]}
     if [[ ${tag_count} -gt 0 ]]; then
         ok "Identified ${tag_count} driver branch(es)"
@@ -769,8 +884,9 @@ fetch_nvidia_versions() {
     local -a tagged_order=()
     local -A tagged_seen=()
 
-    # Insert in priority order: Production first, then New Feature, then Legacy
-    for priority in "Production" "New Feature" "Legacy"; do
+    # Insert in priority order: the GPU-specific recommendation first (when the
+    # card needs an older branch), then Production, New Feature, Legacy.
+    for priority in "Recommended" "Production" "New Feature" "Legacy"; do
         for ver in "${sorted_arr[@]}"; do
             local tag="${NVIDIA_VERSION_TAGS[${ver}]:-}"
             if [[ -n "${tag}" ]] && [[ "${tag}" == *"${priority}"* ]] && [[ -z "${tagged_seen[${ver}]:-}" ]]; then
@@ -1177,8 +1293,18 @@ detect_nvidia_gpu() {
         | sed 's/.*NVIDIA Corporation //' \
         | head -1)" || true
 
+    detect_gpu_architecture "${DETECTED_GPU_MODEL}"
+
     if [[ -n "${DETECTED_GPU_MODEL}" ]]; then
         ok "Detected GPU: NVIDIA ${DETECTED_GPU_MODEL}"
+        if [[ -n "${DETECTED_GPU_ARCH:-}" ]]; then
+            local last="${NVIDIA_ARCH_LAST_BRANCH[${DETECTED_GPU_ARCH}]:-}"
+            if [[ -n "${last}" ]]; then
+                ok "  Architecture: ${DETECTED_GPU_ARCH} — last supporting driver branch: ${last}.xx"
+            else
+                ok "  Architecture: ${DETECTED_GPU_ARCH} — supported by current driver branches"
+            fi
+        fi
     fi
 }
 
@@ -1285,6 +1411,8 @@ main() {
         ok "Patch:   ${selected_patch_mode}"
 
         advise_legacy_driver "${selected_nvidia}"
+
+        advise_gpu_branch_fit "${selected_nvidia}"
         advise_patches "${selected_truenas}"
 
         generate_env_file \
@@ -1384,6 +1512,7 @@ main() {
                     ui_menu selected_nvidia "NVIDIA Driver" \
                         "Select new NVIDIA driver:" "${nvidia_menu_args[@]}"
                     advise_legacy_driver "${selected_nvidia}"
+                    advise_gpu_branch_fit "${selected_nvidia}"
                     advise_patches "${selected_truenas}"
                 fi
                 ;;
@@ -1533,7 +1662,12 @@ main() {
     # Show GPU hint if detected
     if [[ -n "${DETECTED_GPU_MODEL}" ]]; then
         echo -e "  ${GREEN}Detected GPU:${NC} NVIDIA ${DETECTED_GPU_MODEL}"
-        echo -e "  ${DIM}Tip: ★ Production Branch is recommended for most users.${NC}"
+        local gpu_last="${NVIDIA_ARCH_LAST_BRANCH[${DETECTED_GPU_ARCH:-none}]:-}"
+        if [[ -n "${gpu_last}" ]]; then
+            echo -e "  ${YELLOW}${DETECTED_GPU_ARCH} card — newer branches dropped it; pick ${gpu_last}.xx (★ Recommended for your GPU).${NC}"
+        else
+            echo -e "  ${DIM}Tip: ★ Production Branch is recommended for most users.${NC}"
+        fi
         echo ""
     fi
 
@@ -1565,6 +1699,7 @@ main() {
     [[ -n "${selected_nvidia}" ]] || { err "No NVIDIA version selected. Aborting."; exit 1; }
     ok "Selected: ${selected_nvidia}"
     advise_legacy_driver "${selected_nvidia}"
+    advise_gpu_branch_fit "${selected_nvidia}"
     advise_patches "${selected_truenas}"
     echo ""
 

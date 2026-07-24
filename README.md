@@ -9,6 +9,7 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 ## Features
 
 - **Interactive wizard** — `configure.sh` fetches real version lists with smart tagging (★ Latest Stable, ★ Production Branch, etc.) and guides you through setup. Uses whiptail TUI dialogs when available (TrueNAS has it), with bash `select` menus as fallback
+- **GPU-aware driver recommendation** — detects the GPU architecture from the chip codename and points Kepler/Maxwell/Pascal/Volta owners at the last branch that still supports their card, warning before a build that would install cleanly and then not drive the GPU
 - **Fully automated** — downloads TrueNAS update file, extracts kernel headers, compiles the driver, packages everything
 - **TrueNAS 23/24/25/26 aware** — supports 23.x, 24.x, 25.x codename-based downloads and TrueNAS 26 update URLs
 - **Production-kernel aware** — correctly selects the production kernel over debug variants
@@ -35,7 +36,8 @@ The wizard auto-detects your TrueNAS version and GPU, then walks you through 4 s
 
 ```
 [OK]    Detected TrueNAS version: 25.10.3.1
-[OK]    Detected GPU: NVIDIA GeForce RTX 4090 [...]
+[OK]    Detected GPU: NVIDIA AD102 [GeForce RTX 4090] (rev a1)
+[OK]      Architecture: Ada — supported by current driver branches
 
   Step 1: TrueNAS Version  →  Auto-detected! Confirm or pick another.
 
@@ -289,6 +291,30 @@ Legacy/EOL NVIDIA branches only build against kernels up to a certain point — 
 If the target kernel is newer than the branch supports, the build **aborts immediately** with an explanation. The interactive wizard also shows an early heads-up when you select a legacy branch. To build anyway, either supply [source patches](#building-eol-drivers-on-newer-kernels-patches) (which also relaxes this check) or set `SKIP_KERNEL_COMPAT_CHECK=true`.
 
 > **Kepler note:** if your GPU is *only* supported by the 470 branch (Kepler — GeForce 600/700 series), it works out of the box up to TrueNAS 24.10. For TrueNAS 25.x (kernel 6.12) you'll need community kernel patches (see below). Newer GPUs (Maxwell/Pascal/Turing/Ampere/Ada+) should use a current branch (535/550/560+), which builds cleanly everywhere.
+
+### Does the driver actually support your GPU?
+
+A driver can compile, package and merge perfectly and still not drive your card — NVIDIA removes older architectures from newer branches, and `nvidia-smi` then just reports `No devices were found`. The wizard reads the chip codename from `lspci` (e.g. `GP102 [GeForce GTX 1080 Ti]`, which is unambiguous where marketing names are not — a GTX 750 Ti is Maxwell while the rest of the 7xx series is Kepler), maps it to an architecture, and both **tags the right driver** in the list and **warns before you build** if the selection doesn't fit:
+
+| Architecture | Cards | Last supporting branch |
+|---|---|---|
+| Kepler | GeForce 600/700, Quadro K, Tesla K | **470.xx** (needs patches on kernel 6.10+) |
+| Maxwell / Pascal / Volta | GTX 750 Ti, GTX 900/10-series, TITAN X/Xp/V, Quadro M/P, Tesla M/P/V | **580.xx** |
+| Turing and newer | RTX 20/30/40/50-series, GTX 16-series, A/L/B-series | current branches |
+| Fermi | GeForce 400/500 | 390.xx — **cannot be built for any TrueNAS kernel** |
+
+Newer cards have a floor too: Blackwell (RTX 50-series) needs 570.xx or newer, Ada 520+, Ampere 450+, Turing 410+. Picking below that gets the same silent failure, so it's flagged as well.
+
+```
+[OK]    Detected GPU: NVIDIA GP102 [GeForce GTX 1080 Ti] (rev a1)
+[OK]      Architecture: Pascal — last supporting driver branch: 580.xx
+
+   1) 580.142  ★ Recommended for your Pascal GPU
+   2) 610.43.02  ★ New Feature Branch
+   3) 595.80  ★ Production Branch
+```
+
+The check is **advisory** — you can still pick anything (e.g. when building for a different machine), and it stays silent when the GPU can't be identified rather than guessing.
 
 ### Building EOL drivers on newer kernels (patches)
 
