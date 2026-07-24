@@ -2,7 +2,9 @@
 # =============================================================================
 # deploy-nvidia.sh — Deploy nvidia.raw sysext to TrueNAS
 #
-# Usage:  ./deploy-nvidia.sh <path-to-nvidia.raw>
+# Usage:  ./deploy-nvidia.sh <path-to-nvidia.raw>   deploy an image
+#         ./deploy-nvidia.sh --check                report the current state only
+#         ./deploy-nvidia.sh --dry-run <image>      show every step, change nothing
 #
 # This script:
 #   1. Turns off TrueNAS's own Docker NVIDIA integration while the swap runs
@@ -45,7 +47,46 @@ NVIDIA_INTEGRATION_OFF=0  # 1 while TrueNAS's Docker NVIDIA support is disabled
 REBOOT_REQUIRED=0       # 1 when old modules could not be unloaded
 DEPLOY_COMPLETE=0       # 1 once everything succeeded
 
+# ── Modes ───────────────────────────────────────────────────────────────────
+DRY_RUN=0               # 1 = log every mutating command instead of running it
+CHECK_ONLY=0            # 1 = report the current state and exit
+
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+Usage:
+  $0 <path-to-nvidia.raw>    Deploy the image
+  $0 --dry-run <image>       Walk the whole flow, change nothing
+  $0 --check                 Report the current driver/sysext state and exit
+  $0 --help                  Show this help
+
+--check is read-only and also works without root, reporting less where a call
+needs privileges. It exits non-zero when it finds a problem.
+EOF
+}
+
+# Every mutating command goes through this. In --dry-run it is only printed, so
+# the flow, its ordering and its guards can be inspected on a live system
+# without touching anything.
+run_cmd() {
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        echo -e "${YELLOW}[DRY]${NC}   $*"
+        return 0
+    fi
+    "$@"
+}
+
+# Same as run_cmd, but silences the command in a real run. Redirecting the
+# run_cmd call itself would swallow the [DRY] line too, hiding the command from
+# the dry-run output — which is the one thing it exists to show.
+run_cmd_quiet() {
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        echo -e "${YELLOW}[DRY]${NC}   $*"
+        return 0
+    fi
+    "$@" >/dev/null 2>&1
+}
 
 # Read a boolean field from a JSON document on stdin, printing "true"/"false"
 # (or nothing if it can't be read). TrueNAS does not ship jq but always ships
@@ -92,7 +133,7 @@ disable_nvidia_integration() {
     fi
 
     info "Disabling TrueNAS Docker NVIDIA integration for the swap …"
-    if midclt call -j docker.update '{"nvidia": false}' >/dev/null 2>&1; then
+    if run_cmd_quiet midclt call -j docker.update '{"nvidia": false}'; then
         NVIDIA_INTEGRATION_OFF=1
         ok "Docker NVIDIA integration disabled (will be re-enabled at the end)"
     else
@@ -104,7 +145,7 @@ restore_nvidia_integration() {
     [[ ${NVIDIA_INTEGRATION_OFF} -eq 1 ]] || return 0
 
     info "Re-enabling TrueNAS Docker NVIDIA integration …"
-    if midclt call -j docker.update '{"nvidia": true}' >/dev/null 2>&1; then
+    if run_cmd_quiet midclt call -j docker.update '{"nvidia": true}'; then
         NVIDIA_INTEGRATION_OFF=0
         ok "Docker NVIDIA integration re-enabled"
     else
@@ -134,7 +175,7 @@ unload_nvidia_modules() {
 
     info "Unloading NVIDIA kernel modules: ${loaded[*]}"
     for m in "${loaded[@]}"; do
-        if rmmod "${m}" 2>/dev/null; then
+        if run_cmd rmmod "${m}" 2>/dev/null; then
             ok "  Unloaded ${m}"
         else
             warn "  ${m} is still in use (running container, VM passthrough, or display)"
@@ -167,8 +208,8 @@ ensure_extension_activated() {
     warn "nvidia.raw is installed but not activated — no symlink in /etc/extensions or /run/extensions"
     info "Creating a transient activation symlink in /run/extensions …"
 
-    if mkdir -p /run/extensions && ln -sf "${NVIDIA_RAW}" /run/extensions/nvidia.raw; then
-        systemd-sysext refresh || warn "systemd-sysext refresh failed"
+    if run_cmd mkdir -p /run/extensions && run_cmd ln -sf "${NVIDIA_RAW}" /run/extensions/nvidia.raw; then
+        run_cmd systemd-sysext refresh || warn "systemd-sysext refresh failed"
         ok "Extension activated for this boot"
         warn "/run is a tmpfs — this symlink is gone after a reboot. Enable NVIDIA support"
         warn "in the TrueNAS UI (Apps → Settings) so middleware manages the symlink persistently."
@@ -183,7 +224,7 @@ ensure_extension_activated() {
 refresh_linker_cache() {
     command -v ldconfig >/dev/null 2>&1 || return 0
     info "Refreshing the dynamic linker cache (ldconfig) …"
-    ldconfig || warn "ldconfig failed — new NVIDIA libraries may not resolve until reboot"
+    run_cmd ldconfig || warn "ldconfig failed — new NVIDIA libraries may not resolve until reboot"
 }
 
 print_sysext_diagnostics() {
@@ -235,12 +276,12 @@ rollback_to_previous_state() {
     echo ""
     warn "Rolling back to the previous working state …"
 
-    systemd-sysext unmerge 2>/dev/null || true
+    run_cmd systemd-sysext unmerge 2>/dev/null || true
 
-    if zfs set readonly=off "${USR_DATASET}" 2>/dev/null; then
+    if run_cmd run_cmd zfs set readonly=off "${USR_DATASET}" 2>/dev/null; then
         if [[ -n "${backup}" ]] && [[ -f "${backup}" ]]; then
             info "Restoring previous nvidia.raw from $(basename "${backup}")"
-            if cp "${backup}" "${NVIDIA_RAW}" && chmod 644 "${NVIDIA_RAW}"; then
+            if run_cmd cp "${backup}" "${NVIDIA_RAW}" && run_cmd chmod 644 "${NVIDIA_RAW}"; then
                 :
             else
                 warn "Could not restore ${NVIDIA_RAW} from ${backup}"
@@ -248,17 +289,17 @@ rollback_to_previous_state() {
             fi
         else
             info "No previous nvidia.raw to restore (fresh install) — removing the rejected image"
-            rm -f "${NVIDIA_RAW}" || { warn "Could not remove ${NVIDIA_RAW}"; failed=1; }
+            run_cmd rm -f "${NVIDIA_RAW}" || { warn "Could not remove ${NVIDIA_RAW}"; failed=1; }
         fi
     else
         warn "Could not unlock ${USR_DATASET} — leaving ${NVIDIA_RAW} untouched"
         failed=1
     fi
 
-    zfs set readonly=on "${USR_DATASET}" 2>/dev/null \
+    run_cmd run_cmd zfs set readonly=on "${USR_DATASET}" 2>/dev/null \
         || { warn "Failed to re-lock ${USR_DATASET}"; failed=1; }
 
-    systemd-sysext merge || { warn "Rollback merge failed"; failed=1; }
+    run_cmd systemd-sysext merge || { warn "Rollback merge failed"; failed=1; }
 
     if [[ ${failed} -eq 0 ]]; then
         ok "Rollback complete — system restored to its previous state"
@@ -266,6 +307,144 @@ rollback_to_previous_state() {
         warn "Rollback was incomplete — check the warnings above; manual recovery may be needed"
         warn "  zfs set readonly=on ${USR_DATASET} && systemd-sysext merge"
     fi
+}
+
+# =============================================================================
+# --check — read-only state report
+#
+# A driver can be installed, merged and still not work: the image may target a
+# different kernel than the one running (after a TrueNAS update), or it may
+# never have been activated. Both are silent — nvidia-smi just fails — so this
+# reports them explicitly instead of making the user piece it together.
+# =============================================================================
+
+# The kernel an image was built for, read from the module path inside it
+# (usr/lib/modules/<release>/…). Cheap: the listing is not extracted.
+image_target_kernel() {
+    local raw="$1"
+    command -v unsquashfs >/dev/null 2>&1 || return 0
+    unsquashfs -l "${raw}" 2>/dev/null \
+        | grep -m1 -oP 'usr/lib/modules/\K[^/]+' || true
+}
+
+# The driver version an image ships, taken from the versioned library name.
+image_driver_version() {
+    local raw="$1"
+    command -v unsquashfs >/dev/null 2>&1 || return 0
+    unsquashfs -l "${raw}" 2>/dev/null \
+        | grep -m1 -oP 'libcuda\.so\.\K[0-9]+\.[0-9.]+' || true
+}
+
+report_state() {
+    local problems=0
+    local host_kernel; host_kernel="$(uname -r)"
+
+    echo ""
+    echo -e "${BOLD}── Installed image ─────────────────────────────────────────${NC}"
+    if [[ -f "${NVIDIA_RAW}" ]]; then
+        echo "  path            ${NVIDIA_RAW}"
+        echo "  size            $(du -h "${NVIDIA_RAW}" 2>/dev/null | cut -f1)"
+        echo "  modified        $(date -r "${NVIDIA_RAW}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)"
+
+        local img_driver img_kernel
+        img_driver="$(image_driver_version "${NVIDIA_RAW}")"
+        img_kernel="$(image_target_kernel "${NVIDIA_RAW}")"
+        echo "  driver version  ${img_driver:-<could not read>}"
+        echo "  built for       ${img_kernel:-<could not read>}"
+
+        if [[ -n "${img_kernel}" ]] && [[ "${img_kernel}" != "${host_kernel}" ]]; then
+            problems=$((problems + 1))
+            IMAGE_KERNEL_MISMATCH="${img_kernel}"
+        fi
+    else
+        echo "  none installed at ${NVIDIA_RAW}"
+        problems=$((problems + 1))
+        NO_IMAGE=1
+    fi
+
+    echo ""
+    echo -e "${BOLD}── Host ────────────────────────────────────────────────────${NC}"
+    echo "  kernel          ${host_kernel}"
+
+    local loaded
+    loaded="$(lsmod 2>/dev/null | awk '{print $1}' | grep -E '^nvidia' | tr '\n' ' ' || true)"
+    echo "  loaded modules  ${loaded:-<none>}"
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local smi
+        smi="$(nvidia-smi --query-gpu=driver_version,name --format=csv,noheader 2>/dev/null | head -2 | tr '\n' ';' || true)"
+        echo "  nvidia-smi      ${smi:-<no devices / driver not responding>}"
+        [[ -z "${smi}" ]] && problems=$((problems + 1))
+    else
+        echo "  nvidia-smi      <not present>"
+    fi
+
+    echo ""
+    echo -e "${BOLD}── Activation ──────────────────────────────────────────────${NC}"
+    local activated=0 dir
+    for dir in /etc/extensions /run/extensions; do
+        if [[ -e "${dir}/nvidia.raw" ]]; then
+            echo "  ${dir}/nvidia.raw → $(readlink -f "${dir}/nvidia.raw" 2>/dev/null || echo '<not a symlink>')"
+            activated=1
+        fi
+    done
+    if [[ ${activated} -eq 0 ]]; then
+        echo "  no symlink in /etc/extensions or /run/extensions"
+        problems=$((problems + 1))
+        NOT_ACTIVATED=1
+    fi
+    echo "  systemd-sysext status:"
+    systemd-sysext status 2>&1 | sed 's/^/    /' || true
+
+    echo ""
+    echo -e "${BOLD}── Middleware ──────────────────────────────────────────────${NC}"
+    if command -v midclt >/dev/null 2>&1; then
+        local state
+        state="$( { midclt call docker.config 2>/dev/null || true; } | json_bool_field nvidia )" || true
+        case "${state}" in
+            true)  echo "  Docker NVIDIA integration: enabled" ;;
+            false) echo "  Docker NVIDIA integration: disabled" ;;
+            *)     echo "  Docker NVIDIA integration: not exposed on this release (or needs root)" ;;
+        esac
+    else
+        echo "  midclt not available"
+    fi
+
+    echo ""
+    echo -e "${BOLD}── Backups ─────────────────────────────────────────────────${NC}"
+    if [[ -d "${BACKUP_DIR}" ]]; then
+        local list
+        list="$(ls -1t "${BACKUP_DIR}"/nvidia.raw.backup_* 2>/dev/null || true)"
+        if [[ -n "${list}" ]]; then
+            echo "${list}" | while read -r b; do
+                echo "  $(basename "${b}")  ($(du -h "${b}" 2>/dev/null | cut -f1))"
+            done
+        else
+            echo "  none in ${BACKUP_DIR}"
+        fi
+    else
+        echo "  none (${BACKUP_DIR} does not exist)"
+    fi
+
+    echo ""
+    if [[ ${problems} -eq 0 ]]; then
+        echo -e "${GREEN}${BOLD}  ✓ No problems detected${NC}"
+        echo ""
+        return 0
+    fi
+
+    echo -e "${YELLOW}${BOLD}── Problems ────────────────────────────────────────────────${NC}"
+    [[ -n "${NO_IMAGE:-}" ]] && \
+        warn "No nvidia.raw installed — TrueNAS is running its stock driver (or none)."
+    if [[ -n "${IMAGE_KERNEL_MISMATCH:-}" ]]; then
+        warn "The installed image was built for kernel ${IMAGE_KERNEL_MISMATCH},"
+        warn "but this host runs ${host_kernel}. The modules will not load — this is"
+        warn "what a TrueNAS update does. Rebuild against ${host_kernel} and redeploy."
+    fi
+    [[ -n "${NOT_ACTIVATED:-}" ]] && \
+        warn "The image is not activated: no symlink in /etc/extensions or /run/extensions."
+    echo ""
+    return 1
 }
 
 # Runs on every exit path. A successful deployment has already cleaned up after
@@ -279,6 +458,13 @@ cleanup() {
         exit "${rc}"
     fi
 
+    # A dry run never changed anything, so there is nothing to undo.
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        echo ""
+        warn "Dry run stopped early (exit code ${rc}) — nothing was changed"
+        exit "${rc}"
+    fi
+
     echo ""
     warn "Deployment did not complete (exit code ${rc}) — restoring previous state …"
 
@@ -288,19 +474,45 @@ cleanup() {
     elif [[ ${UNMERGED} -eq 1 ]]; then
         # Extensions were unmerged but nothing was modified — just merge back.
         info "Re-merging sysext extensions …"
-        systemd-sysext merge || warn "Re-merge failed — run 'systemd-sysext merge' manually"
+        run_cmd systemd-sysext merge || warn "Re-merge failed — run 'systemd-sysext merge' manually"
     fi
 
     restore_nvidia_integration
     exit "${rc}"
 }
 
-# ── Validate input ──────────────────────────────────────────────────────────
-[[ $# -ge 1 ]] || die "Usage: $0 <path-to-nvidia.raw>"
-[[ $(id -u) -eq 0 ]] || die "This script must be run as root."
+# ── Parse arguments ─────────────────────────────────────────────────────────
+NEW_RAW=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --check)   CHECK_ONLY=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        -*)        die "Unknown option: $1 (see --help)" ;;
+        *)
+            [[ -z "${NEW_RAW}" ]] || die "Only one image can be given (got '${NEW_RAW}' and '$1')"
+            NEW_RAW="$1"; shift ;;
+    esac
+done
 
-NEW_RAW="$1"
+# --check mutates nothing, so it does not demand root — it just reports less.
+if [[ ${CHECK_ONLY} -eq 1 ]]; then
+    [[ -z "${NEW_RAW}" ]] || die "--check takes no image argument"
+    [[ $(id -u) -eq 0 ]] || warn "Not running as root — some values may be unavailable"
+    report_state
+    exit $?
+fi
+
+# ── Validate input ──────────────────────────────────────────────────────────
+[[ -n "${NEW_RAW}" ]] || { usage >&2; die "No image given"; }
+[[ $(id -u) -eq 0 ]] || die "This script must be run as root."
 [[ -f "${NEW_RAW}" ]] || die "File not found: ${NEW_RAW}"
+
+if [[ ${DRY_RUN} -eq 1 ]]; then
+    echo ""
+    warn "DRY RUN — every mutating command below is printed, not executed"
+    echo ""
+fi
 
 NEW_SIZE=$(stat -c%s "${NEW_RAW}" 2>/dev/null || echo "unknown")
 info "New image: ${NEW_RAW} (${NEW_SIZE} bytes)"
@@ -317,24 +529,28 @@ disable_nvidia_integration
 
 # ── Step 2: Unmerge active sysext ───────────────────────────────────────────
 info "Unmerging active sysext extensions …"
-systemd-sysext unmerge
+run_cmd systemd-sysext unmerge
 UNMERGED=1
 ok "Extensions unmerged"
 
 # ── Step 3: Unlock /usr ZFS dataset ─────────────────────────────────────────
 USR_DATASET="$(zfs list -H -o name /usr)"
 info "Unlocking ZFS dataset: ${USR_DATASET}"
-zfs set readonly=off "${USR_DATASET}"
+run_cmd zfs set readonly=off "${USR_DATASET}"
 ok "Dataset unlocked (readonly=off)"
 
 # ── Step 4: Backup existing nvidia.raw ──────────────────────────────────────
 if [[ -f "${NVIDIA_RAW}" ]]; then
-    mkdir -p "${BACKUP_DIR}"
+    run_cmd mkdir -p "${BACKUP_DIR}"
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     BACKUP="${BACKUP_DIR}/nvidia.raw.backup_${TIMESTAMP}"
     info "Backing up existing nvidia.raw → ${BACKUP}"
-    cp "${NVIDIA_RAW}" "${BACKUP}"
-    ok "Backup saved: ${BACKUP} ($(du -h "${BACKUP}" | cut -f1))"
+    run_cmd cp "${NVIDIA_RAW}" "${BACKUP}"
+    if [[ ${DRY_RUN} -eq 1 ]]; then
+        ok "Backup would be saved: ${BACKUP}"
+    else
+        ok "Backup saved: ${BACKUP} ($(du -h "${BACKUP}" | cut -f1))"
+    fi
 
     # Keep only the 5 most recent backups
     # ls exits non-zero when the glob matches nothing (first-ever deploy), and
@@ -344,7 +560,7 @@ if [[ -f "${NVIDIA_RAW}" ]]; then
         info "Cleaning old backups (keeping 5 most recent) …"
         ls -1t "${BACKUP_DIR}"/nvidia.raw.backup_* | tail -n +6 | while read -r old; do
             info "  Removing: $(basename "${old}")"
-            rm -f "${old}"
+            run_cmd rm -f "${old}"
         done
     fi
 else
@@ -353,17 +569,21 @@ fi
 
 # ── Step 5: Copy new nvidia.raw ────────────────────────────────────────────
 info "Installing new nvidia.raw …"
-cp "${NEW_RAW}" "${NVIDIA_RAW}"
-chmod 644 "${NVIDIA_RAW}"
-ok "Installed: ${NVIDIA_RAW} ($(stat -c%s "${NVIDIA_RAW}") bytes)"
+run_cmd cp "${NEW_RAW}" "${NVIDIA_RAW}"
+run_cmd chmod 644 "${NVIDIA_RAW}"
+if [[ ${DRY_RUN} -eq 1 ]]; then
+    ok "Would install: ${NVIDIA_RAW}"
+else
+    ok "Installed: ${NVIDIA_RAW} ($(stat -c%s "${NVIDIA_RAW}") bytes)"
+fi
 
 # ── Step 6: Re-lock /usr and merge ──────────────────────────────────────────
 info "Locking ZFS dataset: ${USR_DATASET}"
-zfs set readonly=on "${USR_DATASET}"
+run_cmd zfs set readonly=on "${USR_DATASET}"
 ok "Dataset locked (readonly=on)"
 
 info "Merging sysext extensions …"
-if ! systemd-sysext merge; then
+if ! run_cmd systemd-sysext merge; then
     print_sysext_diagnostics "${NVIDIA_RAW}"
     rollback_to_previous_state "${BACKUP}"
     die "systemd-sysext merge failed — the new nvidia.raw was rejected. The previous state has been restored; see diagnostics above."
@@ -391,6 +611,13 @@ DEPLOY_COMPLETE=1
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""
+if [[ ${DRY_RUN} -eq 1 ]]; then
+    echo -e "${GREEN}${BOLD}  ✓ Dry run complete — nothing was changed${NC}"
+    echo ""
+    echo -e "  Re-run without ${CYAN}--dry-run${NC} to apply, or ${CYAN}--check${NC} to inspect the current state."
+    echo ""
+    exit 0
+fi
 echo -e "${GREEN}${BOLD}  ✓ nvidia.raw deployed successfully${NC}"
 echo ""
 if [[ ${REBOOT_REQUIRED} -eq 1 ]]; then

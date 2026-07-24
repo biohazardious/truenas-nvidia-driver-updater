@@ -20,6 +20,7 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 - **Backup & rollback** — deployment script preserves previous images with timestamps and restores them on any failure (including `Ctrl-C`)
 - **Reboot-free driver swap** — deploy script pauses TrueNAS's Docker NVIDIA integration and unloads the old kernel modules, so the new driver is live as soon as `nvidia-smi` runs
 - **Auto sysext diagnostics** — deployment script prints host/image metadata when `systemd-sysext merge` rejects the image
+- **`--check` and `--dry-run`** — inspect what is installed (driver version, target kernel, activation, middleware state) or rehearse a deployment without touching anything
 
 ## Quick Start
 
@@ -179,6 +180,38 @@ The deploy script handles everything:
 - Restores the previous state on **any** failure — including `Ctrl-C` mid-run — via an `EXIT` trap, so `/usr` is never left writable and the Docker NVIDIA integration is never left disabled
 
 > Releases older than Electric Eel have no `docker.config` middleware namespace; the script detects that and skips the integration step instead of failing.
+
+#### Inspecting before (and after) deploying
+
+```bash
+./deploy-nvidia.sh --check              # read-only state report, no root needed
+./deploy-nvidia.sh --dry-run nvidia.raw # walk the whole flow, change nothing
+```
+
+`--check` answers the two questions that fail silently — *is the installed image built for the kernel I'm running*, and *is it actually activated* — instead of leaving you to piece it together from `nvidia-smi` errors:
+
+```
+── Installed image ─────────────────────────────────────────
+  path            /usr/share/truenas/sysext-extensions/nvidia.raw
+  size            412M
+  modified        2026-07-24 17:22:16
+  driver version  595.80
+  built for       6.12.15-production+truenas
+
+── Host ────────────────────────────────────────────────────
+  kernel          6.14.2-production+truenas
+  loaded modules  nvidia_drm nvidia
+  nvidia-smi      <no devices / driver not responding>
+
+── Problems ────────────────────────────────────────────────
+[WARN]  The installed image was built for kernel 6.12.15-production+truenas,
+[WARN]  but this host runs 6.14.2-production+truenas. The modules will not load — this is
+[WARN]  what a TrueNAS update does. Rebuild against 6.14.2-production+truenas and redeploy.
+```
+
+It reads the driver version and target kernel out of the image itself (from the squashfs listing — nothing is extracted), reports the activation symlinks, `systemd-sysext status`, the middleware integration state and available backups, and **exits non-zero when it finds a problem** so it can be used in a health check.
+
+`--dry-run` prints every mutating command it would run — `[DRY] zfs set readonly=off …`, `[DRY] cp …`, `[DRY] systemd-sysext merge` — in the real order, with all the same guards, and touches nothing.
 
 ### 4. Verify
 
