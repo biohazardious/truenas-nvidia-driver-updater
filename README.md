@@ -347,7 +347,28 @@ Newer cards have a floor too: Blackwell (RTX 50-series) needs 570.xx or newer, A
    3) 595.80  ★ Production Branch
 ```
 
-The check is **advisory** — you can still pick anything (e.g. when building for a different machine), and it stays silent when the GPU can't be identified rather than guessing.
+**More than one GPU?** Every NVIDIA card is read, not just the first, and the wizard works out the branch window that serves *all* of them — the lowest ceiling and the highest floor:
+
+```
+[OK]    Detected GPU: NVIDIA TU117GL [T1000 8GB] (rev a1)
+[OK]      Architecture: Turing — supported by current driver branches
+[OK]    Detected GPU: NVIDIA GB206 [RTX PRO 2000 Blackwell] (rev a1)
+[OK]      Architecture: Blackwell — supported by current driver branches
+[OK]    2 NVIDIA GPUs — a driver must be 570.xx or newer to serve all of them
+```
+
+When the window is empty — say a Kepler GT 710 (≤470) next to an RTX 5090 (≥570) — it says so plainly instead of recommending a branch that leaves one card dead:
+
+```
+[WARN]  The installed GPUs cannot be served by one driver:
+[WARN]    GK208B [GeForce GT 710] (Kepler) needs 470.xx or older
+[WARN]    GB202 [GeForce RTX 5090] (Blackwell) needs 570.xx or newer
+[WARN]  Whichever branch you build, the other card will not be driven.
+```
+
+**Card too new to be named?** A GPU missing from the local `pci.ids` database shows up as `Device 2c05` with no chip codename. That card is reported as unidentified and excluded from the recommendation — the other cards are still checked normally, and the summary says the check doesn't cover everything.
+
+The check is **advisory** — you can still pick anything (e.g. when building for a different machine), and it stays silent rather than guessing.
 
 ### Building EOL drivers on newer kernels (patches)
 

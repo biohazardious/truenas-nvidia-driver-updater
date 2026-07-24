@@ -510,31 +510,42 @@ detect_gpu_architecture() {
 # card. Advisory only — the user may be building for a different machine.
 advise_gpu_branch_fit() {
     local version="$1"
-    [[ -n "${DETECTED_GPU_ARCH:-}" ]] || return 0
 
     local major=""
     major="$(nvidia_major "${version}")"
     [[ "${major}" =~ ^[0-9]+$ ]] || return 0
 
-    if [[ "${DETECTED_GPU_ARCH}" == "Fermi" ]]; then
-        warn "Your GPU is Fermi (GTX 400/500 series) — it needs the 390.xx branch,"
-        warn "which cannot build against any kernel TrueNAS ships. This tool can't"
-        warn "produce a working driver for that card."
+    if [[ ${GPU_BRANCH_CONFLICT:-0} -eq 1 ]]; then
+        warn "The installed GPUs cannot be served by one driver:"
+        warn "  ${GPU_CEILING_CARD} (${GPU_CEILING_ARCH}) needs ${GPU_BRANCH_CEILING}.xx or older"
+        warn "  ${GPU_FLOOR_CARD} (${GPU_FLOOR_ARCH}) needs ${GPU_BRANCH_FLOOR}.xx or newer"
+        warn "Whichever branch you build, the other card will not be driven. Decide which"
+        warn "GPU this sysext is for — or move one of the cards to another machine."
         return 0
     fi
 
-    local last="${NVIDIA_ARCH_LAST_BRANCH[${DETECTED_GPU_ARCH}]:-}"
-    local first="${NVIDIA_ARCH_FIRST_BRANCH[${DETECTED_GPU_ARCH}]:-}"
+    if [[ "${GPU_BRANCH_CEILING:-}" == "390" ]]; then
+        warn "${GPU_CEILING_CARD} is Fermi — it needs the 390.xx branch, which cannot build"
+        warn "against any kernel TrueNAS ships. This tool can't produce a working driver"
+        warn "for that card."
+        return 0
+    fi
 
-    if [[ -n "${last}" ]] && (( major > last )); then
-        warn "Your GPU is ${DETECTED_GPU_ARCH}; NVIDIA dropped that architecture after"
-        warn "the ${last}.xx branch. Driver ${version} will build and install fine but"
-        warn "WILL NOT drive this card — nvidia-smi reports 'No devices were found'."
-        warn "Pick the ${last}.xx branch instead (★ Recommended for your GPU)."
-    elif [[ -n "${first}" ]] && (( major < first )); then
-        warn "Your GPU is ${DETECTED_GPU_ARCH}; NVIDIA support for it starts at the"
-        warn "${first}.xx branch. Driver ${version} predates this card and will not"
-        warn "drive it. Pick a current branch (★ Production / ★ New Feature)."
+    if [[ -n "${GPU_BRANCH_CEILING:-}" ]] && (( major > GPU_BRANCH_CEILING )); then
+        warn "${GPU_CEILING_CARD} is ${GPU_CEILING_ARCH}; NVIDIA dropped that architecture"
+        warn "after the ${GPU_BRANCH_CEILING}.xx branch. Driver ${version} will build and"
+        warn "install fine but WILL NOT drive that card — nvidia-smi reports"
+        warn "'No devices were found'. Pick ${GPU_BRANCH_CEILING}.xx instead (★ Recommended for your GPU)."
+    fi
+
+    if [[ -n "${GPU_BRANCH_FLOOR:-}" ]] && (( major < GPU_BRANCH_FLOOR )); then
+        warn "${GPU_FLOOR_CARD} is ${GPU_FLOOR_ARCH}; NVIDIA support for it starts at the"
+        warn "${GPU_BRANCH_FLOOR}.xx branch. Driver ${version} predates that card and will"
+        warn "not drive it. Pick a current branch (★ Production / ★ New Feature)."
+    fi
+
+    if [[ ${GPU_UNIDENTIFIED:-0} -eq 1 ]]; then
+        warn "One or more GPUs could not be identified — this check does not cover them."
     fi
 }
 
@@ -815,13 +826,13 @@ fetch_nvidia_branch_info() {
     # When the detected card is only supported up to an older branch, surface the
     # newest driver in THAT branch — otherwise the user picks the top of the list
     # and ends up with a driver that ignores their GPU.
-    local arch_last="${NVIDIA_ARCH_LAST_BRANCH[${DETECTED_GPU_ARCH:-none}]:-}"
-    if [[ -n "${arch_last}" ]]; then
+    local arch_last="${GPU_BRANCH_CEILING:-}"
+    if [[ -n "${arch_last}" ]] && [[ ${GPU_BRANCH_CONFLICT:-0} -eq 0 ]]; then
         local recommended=""
         recommended="$(nvidia_latest_in_series "${arch_last}" "${sorted[@]}")" || true
         if [[ -n "${recommended}" ]]; then
             local existing="${NVIDIA_VERSION_TAGS[${recommended}]:-}"
-            NVIDIA_VERSION_TAGS["${recommended}"]="★ Recommended for your ${DETECTED_GPU_ARCH} GPU${existing:+ · ${existing}}"
+            NVIDIA_VERSION_TAGS["${recommended}"]="★ Recommended for your ${GPU_CEILING_ARCH} GPU${existing:+ · ${existing}}"
         fi
     fi
 
@@ -1279,33 +1290,82 @@ detect_truenas_version() {
     fi
 }
 
-# Detect NVIDIA GPU model via lspci
+# Detect every NVIDIA GPU via lspci and derive the driver-branch window that
+# satisfies ALL of them: the ceiling is the lowest "last supporting branch"
+# across the cards, the floor the highest "first supporting branch". A single
+# driver serves every card only inside that window — and mixed old/new hardware
+# can make it empty, which is worth saying out loud rather than recommending a
+# branch that leaves one card dead.
 detect_nvidia_gpu() {
     declare -g DETECTED_GPU_MODEL=""
+    declare -ga DETECTED_GPUS=()
+    declare -g GPU_BRANCH_CEILING="" GPU_CEILING_CARD="" GPU_CEILING_ARCH=""
+    declare -g GPU_BRANCH_FLOOR="" GPU_FLOOR_CARD="" GPU_FLOOR_ARCH=""
+    declare -g GPU_BRANCH_CONFLICT=0 GPU_UNIDENTIFIED=0
 
     if ! command -v lspci &>/dev/null; then
         return
     fi
 
-    # Get NVIDIA VGA/3D controller entries
-    DETECTED_GPU_MODEL="$(lspci 2>/dev/null \
+    # Every NVIDIA VGA/3D/Display controller, not just the first one.
+    mapfile -t DETECTED_GPUS < <(lspci 2>/dev/null \
         | grep -iE '(VGA|3D|Display).*NVIDIA' \
-        | sed 's/.*NVIDIA Corporation //' \
-        | head -1)" || true
+        | sed 's/.*NVIDIA Corporation //' || true)
 
-    detect_gpu_architecture "${DETECTED_GPU_MODEL}"
+    [[ ${#DETECTED_GPUS[@]} -gt 0 ]] || return 0
+    DETECTED_GPU_MODEL="${DETECTED_GPUS[0]}"
 
-    if [[ -n "${DETECTED_GPU_MODEL}" ]]; then
-        ok "Detected GPU: NVIDIA ${DETECTED_GPU_MODEL}"
-        if [[ -n "${DETECTED_GPU_ARCH:-}" ]]; then
-            local last="${NVIDIA_ARCH_LAST_BRANCH[${DETECTED_GPU_ARCH}]:-}"
-            if [[ -n "${last}" ]]; then
-                ok "  Architecture: ${DETECTED_GPU_ARCH} — last supporting driver branch: ${last}.xx"
-            else
-                ok "  Architecture: ${DETECTED_GPU_ARCH} — supported by current driver branches"
+    local gpu arch last first
+    for gpu in "${DETECTED_GPUS[@]}"; do
+        detect_gpu_architecture "${gpu}"
+        arch="${DETECTED_GPU_ARCH:-}"
+
+        ok "Detected GPU: NVIDIA ${gpu}"
+
+        if [[ -z "${arch}" ]]; then
+            # A card too new for the local pci.ids database shows up as
+            # "Device 2c05" — no name, no chip codename. Say so and give no
+            # advice for it rather than guessing.
+            warn "  Architecture: unrecognised — no driver recommendation for this card"
+            GPU_UNIDENTIFIED=1
+            continue
+        fi
+
+        last="${NVIDIA_ARCH_LAST_BRANCH[${arch}]:-}"
+        first="${NVIDIA_ARCH_FIRST_BRANCH[${arch}]:-}"
+
+        if [[ -n "${last}" ]]; then
+            ok "  Architecture: ${arch} — last supporting driver branch: ${last}.xx"
+            if [[ -z "${GPU_BRANCH_CEILING}" ]] || (( last < GPU_BRANCH_CEILING )); then
+                GPU_BRANCH_CEILING="${last}"; GPU_CEILING_CARD="${gpu}"; GPU_CEILING_ARCH="${arch}"
+            fi
+        else
+            ok "  Architecture: ${arch} — supported by current driver branches"
+        fi
+
+        if [[ -n "${first}" ]]; then
+            if [[ -z "${GPU_BRANCH_FLOOR}" ]] || (( first > GPU_BRANCH_FLOOR )); then
+                GPU_BRANCH_FLOOR="${first}"; GPU_FLOOR_CARD="${gpu}"; GPU_FLOOR_ARCH="${arch}"
             fi
         fi
+    done
+
+    # Empty window: the oldest card's ceiling sits below the newest card's floor.
+    if [[ -n "${GPU_BRANCH_CEILING}" ]] && [[ -n "${GPU_BRANCH_FLOOR}" ]] \
+        && (( GPU_BRANCH_FLOOR > GPU_BRANCH_CEILING )); then
+        GPU_BRANCH_CONFLICT=1
     fi
+
+    if [[ ${#DETECTED_GPUS[@]} -gt 1 ]]; then
+        if [[ ${GPU_BRANCH_CONFLICT} -eq 1 ]]; then
+            warn "${#DETECTED_GPUS[@]} NVIDIA GPUs — no single driver supports all of them (see below)"
+        elif [[ -n "${GPU_BRANCH_CEILING}" ]]; then
+            ok "${#DETECTED_GPUS[@]} NVIDIA GPUs — a driver must be ${GPU_BRANCH_CEILING}.xx or older to serve all of them"
+        elif [[ -n "${GPU_BRANCH_FLOOR}" ]]; then
+            ok "${#DETECTED_GPUS[@]} NVIDIA GPUs — a driver must be ${GPU_BRANCH_FLOOR}.xx or newer to serve all of them"
+        fi
+    fi
+
 }
 
 # Read existing .env file values for reconfigure mode
@@ -1661,10 +1721,15 @@ main() {
 
     # Show GPU hint if detected
     if [[ -n "${DETECTED_GPU_MODEL}" ]]; then
-        echo -e "  ${GREEN}Detected GPU:${NC} NVIDIA ${DETECTED_GPU_MODEL}"
-        local gpu_last="${NVIDIA_ARCH_LAST_BRANCH[${DETECTED_GPU_ARCH:-none}]:-}"
-        if [[ -n "${gpu_last}" ]]; then
-            echo -e "  ${YELLOW}${DETECTED_GPU_ARCH} card — newer branches dropped it; pick ${gpu_last}.xx (★ Recommended for your GPU).${NC}"
+        local _g
+        for _g in "${DETECTED_GPUS[@]}"; do
+            echo -e "  ${GREEN}Detected GPU:${NC} NVIDIA ${_g}"
+        done
+        local gpu_last="${GPU_BRANCH_CEILING:-}"
+        if [[ ${GPU_BRANCH_CONFLICT:-0} -eq 1 ]]; then
+            echo -e "  ${YELLOW}Installed GPUs need different driver branches — no single driver serves both.${NC}"
+        elif [[ -n "${gpu_last}" ]]; then
+            echo -e "  ${YELLOW}${GPU_CEILING_ARCH} card — newer branches dropped it; pick ${gpu_last}.xx (★ Recommended for your GPU).${NC}"
         else
             echo -e "  ${DIM}Tip: ★ Production Branch is recommended for most users.${NC}"
         fi
