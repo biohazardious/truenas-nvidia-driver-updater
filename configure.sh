@@ -81,6 +81,9 @@ Non-interactive mode (for automation / CI):
     --module TYPE         Kernel module type: open (default) or proprietary
     --embed true|false    Embed nvidia.raw in truenas.update (default: false)
     --patch MODE          Source patches: none, custom, predefined, or auto
+    --run-url URL         Download the installer from this URL instead
+    --custom-run FILE     Use this .run installer as-is (must be inside
+                          the project directory so the build can see it)
                           (default: auto). 'predefined' downloads the curated
                           set for the driver branch (for EOL drivers on new kernels).
 
@@ -113,6 +116,9 @@ CLI_NVIDIA=""
 CLI_MODULE=""
 CLI_EMBED=""
 CLI_PATCH=""
+# Installer overrides — a URL to fetch, or a local .run to use as-is.
+CLI_RUN_URL=""
+CLI_RUN_FILE=""
 CLI_RECONFIGURE=false
 
 # ── parse arguments ──────────────────────────────────────────────────────────
@@ -126,11 +132,15 @@ while [[ $# -gt 0 ]]; do
         --module)         CLI_MODULE="$2"; shift ;;
         --embed)          CLI_EMBED="$2"; shift ;;
         --patch)          CLI_PATCH="$2"; shift ;;
+        --run-url)        CLI_RUN_URL="$2"; shift ;;
+        --custom-run)     CLI_RUN_FILE="$2"; shift ;;
         --truenas=*)      CLI_TRUENAS="${1#*=}" ;;
         --nvidia=*)       CLI_NVIDIA="${1#*=}" ;;
         --module=*)       CLI_MODULE="${1#*=}" ;;
         --embed=*)        CLI_EMBED="${1#*=}" ;;
         --patch=*)        CLI_PATCH="${1#*=}" ;;
+        --run-url=*)      CLI_RUN_URL="${1#*=}" ;;
+        --custom-run=*)   CLI_RUN_FILE="${1#*=}" ;;
         *) warn "Unknown argument: $1" ;;
     esac
     shift
@@ -489,7 +499,7 @@ detect_gpu_architecture() {
     name="$(printf '%s' "${model}" | tr '[:lower:]' '[:upper:]')"
     case "${name}" in
         *RTX\ 50[0-9][0-9]*|*RTX\ PRO\ 6000*)      DETECTED_GPU_ARCH="Blackwell" ;;
-        *RTX\ 40[0-9][0-9]*|*\ L4*|*\ L40*)        DETECTED_GPU_ARCH="Ada" ;;
+        *RTX\ 40[0-9][0-9]*|*\ L4*)               DETECTED_GPU_ARCH="Ada" ;;
         *RTX\ 30[0-9][0-9]*|*\ A[0-9][0-9]*)       DETECTED_GPU_ARCH="Ampere" ;;
         *RTX\ 20[0-9][0-9]*|*GTX\ 16[0-9][0-9]*|*QUADRO\ RTX*|*TESLA\ T4*)
                                                    DETECTED_GPU_ARCH="Turing" ;;
@@ -591,6 +601,31 @@ advise_patches() {
 
 # Repo directory (where configure.sh lives).
 config_repo_dir() { cd "$(dirname "${BASH_SOURCE[0]}")" && pwd; }
+
+# Translate a host path to the path the build container will see. The repo is
+# bind-mounted at /workspace, so a custom .run has to live inside it — anything
+# else simply isn't visible to the build.
+host_path_to_container() {
+    local host_path="$1"
+    local repo_dir="" abs=""
+    repo_dir="$(config_repo_dir)"
+
+    abs="$(readlink -f "${host_path}" 2>/dev/null || printf '%s' "${host_path}")"
+
+    if [[ ! -f "${abs}" ]]; then
+        err "Installer not found: ${host_path}"
+        return 1
+    fi
+    if [[ "${abs}" != "${repo_dir}/"* ]]; then
+        err "The installer must live inside the project directory so the build"
+        err "container can see it (the repo is mounted at /workspace)."
+        err "  given: ${abs}"
+        err "  fix:   cp '${abs}' '${repo_dir}/' and pass the copy instead"
+        return 1
+    fi
+
+    printf '/workspace/%s' "${abs#"${repo_dir}"/}"
+}
 
 # True when the selected driver can't build on the selected TrueNAS kernel unaided
 # (legacy branch + kernel newer than its ceiling) — i.e. patches are needed.
@@ -1264,6 +1299,13 @@ EMBED_NVIDIA_RAW_IN_UPDATE=${embed_update}
 #   predefined  -> curated set in predefined-patches/<driver>/ (see configure.sh)
 #   auto        -> apply patches/<kernel>/ if present (default; backward compatible)
 NVIDIA_PATCH_MODE=${patch_mode}
+
+# ── Installer overrides (optional) ────────────────────────────────────────────
+# Leave both empty to download the official installer for NVIDIA_VERSION.
+#   NVIDIA_RUN_URL  -> fetch the installer from this URL instead
+#   NVIDIA_RUN_FILE -> use this .run as-is (path INSIDE the container)
+NVIDIA_RUN_URL=${CLI_RUN_URL}
+NVIDIA_RUN_FILE=${CLI_RUN_FILE}
 EOF
 }
 
@@ -1377,6 +1419,7 @@ read_existing_config() {
     local env_file="$1"
 
     declare -g EXISTING_TRUENAS="" EXISTING_NVIDIA="" EXISTING_MODULE="" EXISTING_EMBED="" EXISTING_CODENAME="" EXISTING_PATCH_MODE=""
+    declare -g EXISTING_RUN_URL="" EXISTING_RUN_FILE=""
 
     [[ -f "${env_file}" ]] || return 1
 
@@ -1395,6 +1438,8 @@ read_existing_config() {
             EMBED_NVIDIA_RAW_IN_UPDATE) EXISTING_EMBED="${value}" ;;
             TRUENAS_CODENAME)           EXISTING_CODENAME="${value}" ;;
             NVIDIA_PATCH_MODE)          EXISTING_PATCH_MODE="${value}" ;;
+            NVIDIA_RUN_URL)             EXISTING_RUN_URL="${value}" ;;
+            NVIDIA_RUN_FILE)            EXISTING_RUN_FILE="${value}" ;;
         esac
     done < "${env_file}"
 
@@ -1484,6 +1529,23 @@ main() {
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local env_file="${script_dir}/.env"
 
+    # ── Installer overrides ──────────────────────────────────────────────────
+    if [[ -n "${CLI_RUN_URL}" ]] && [[ -n "${CLI_RUN_FILE}" ]]; then
+        err "Use either --run-url or --custom-run, not both."
+        exit 1
+    fi
+    if [[ -n "${CLI_RUN_FILE}" ]]; then
+        CLI_RUN_FILE="$(host_path_to_container "${CLI_RUN_FILE}")" || exit 1
+        warn "Custom installer: ${CLI_RUN_FILE} (inside the container)"
+        warn "NVIDIA_VERSION is only a label in this mode — set it to the version"
+        warn "this .run actually contains, or the compatibility checks will be wrong."
+    fi
+    if [[ -n "${CLI_RUN_URL}" ]]; then
+        warn "Custom installer URL: ${CLI_RUN_URL}"
+        warn "NVIDIA_VERSION is only a label in this mode — set it to the version"
+        warn "that URL actually serves, or the compatibility checks will be wrong."
+    fi
+
     # ── Non-interactive mode ─────────────────────────────────────────────────
     if [[ -n "${CLI_TRUENAS}" ]] && [[ -n "${CLI_NVIDIA}" ]]; then
         info "Running in non-interactive mode"
@@ -1560,6 +1622,14 @@ main() {
         if ! read_existing_config "${env_file}"; then
             err "No .env found. Run without --reconfigure first."
             exit 1
+        fi
+
+        # --reconfigure changes one setting; it must not silently drop an
+        # installer override the user set earlier. CLI flags still win.
+        [[ -z "${CLI_RUN_URL}" ]]  && CLI_RUN_URL="${EXISTING_RUN_URL}"
+        [[ -z "${CLI_RUN_FILE}" ]] && CLI_RUN_FILE="${EXISTING_RUN_FILE}"
+        if [[ -n "${CLI_RUN_URL}${CLI_RUN_FILE}" ]]; then
+            info "Keeping installer override: ${CLI_RUN_URL:-${CLI_RUN_FILE}}"
         fi
 
         echo -e "  ${YELLOW}Current configuration:${NC}"

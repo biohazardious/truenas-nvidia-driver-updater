@@ -590,8 +590,24 @@ ok "Found inner rootfs.squashfs ($(du -h "${INNER_SQUASHFS}" | cut -f1))"
 # =============================================================================
 banner "Phase 2: Extracting kernel source & modules from rootfs"
 
-info "Extracting usr/src and usr/lib/modules from rootfs.squashfs …"
-unsquashfs -f -d "${ROOTFS_DIR}" "${INNER_SQUASHFS}" usr/src usr/lib/modules
+# The sysext-extensions directory comes along for the ride: it holds the stock
+# nvidia.raw this release ships, which is emitted as a rescue image so a user
+# can always get back to the factory driver — even with no backups left. It has
+# to be pulled now, before the intermediate squashfs is deleted below.
+info "Extracting usr/src, usr/lib/modules and the stock sysext from rootfs.squashfs …"
+unsquashfs -f -d "${ROOTFS_DIR}" "${INNER_SQUASHFS}" \
+    usr/src usr/lib/modules usr/share/truenas/sysext-extensions
+
+STOCK_NVIDIA_RAW="$(resolve_embedded_nvidia_raw_path "${ROOTFS_DIR}")" || STOCK_NVIDIA_RAW=""
+if [[ -n "${STOCK_NVIDIA_RAW}" ]]; then
+    # Move it out of ROOTFS_DIR before that tree is used for the build, and so
+    # deleting the squashfs below doesn't take it with us.
+    mv "${STOCK_NVIDIA_RAW}" "${BUILD_DIR}/nvidia.raw.stock"
+    STOCK_NVIDIA_RAW="${BUILD_DIR}/nvidia.raw.stock"
+    ok "Stock driver image kept for rescue: $(du -h "${STOCK_NVIDIA_RAW}" | cut -f1)"
+else
+    warn "No stock nvidia.raw found in this release — the rescue image will be skipped"
+fi
 
 # Free the large intermediate squashfs to reclaim disk inside the container
 rm -f "${INNER_SQUASHFS}"
@@ -760,25 +776,60 @@ banner "Phase 3: Downloading NVIDIA ${NVIDIA_VERSION} driver"
 # CWD, so we keep that ephemeral while the .run itself may live in the cache.
 cd "${BUILD_DIR}"
 
+# The installer normally comes from NVIDIA's published tree, but two overrides
+# exist for drivers that aren't there: a local .run supplied by the user
+# (NVIDIA_RUN_FILE) or an arbitrary URL (NVIDIA_RUN_URL) — betas, archived
+# builds, or a self-patched installer.
+NVIDIA_RUN_FILE="${NVIDIA_RUN_FILE:-}"
+NVIDIA_RUN_URL="${NVIDIA_RUN_URL:-}"
+
 RUN_FILE="NVIDIA-Linux-x86_64-${NVIDIA_VERSION}-no-compat32.run"
 DOWNLOAD_URL="https://us.download.nvidia.com/XFree86/Linux-x86_64/${NVIDIA_VERSION}/${RUN_FILE}"
 
-# Cache the installer across runs when a /cache volume is mounted; otherwise
-# download into the ephemeral BUILD_DIR.
-if [[ -n "${CACHE_DIR}" ]]; then
-    RUN_FILE_PATH="${CACHE_DIR}/${RUN_FILE}"
-else
-    RUN_FILE_PATH="${BUILD_DIR}/${RUN_FILE}"
-fi
+if [[ -n "${NVIDIA_RUN_FILE}" ]]; then
+    # A user-supplied installer. Copy it into the build dir rather than running
+    # it in place: the installer self-extracts next to itself and /workspace is
+    # the user's repo, which we must not litter.
+    [[ -f "${NVIDIA_RUN_FILE}" ]] \
+        || die "NVIDIA_RUN_FILE points at a file that does not exist inside the container: ${NVIDIA_RUN_FILE}"
 
-if [[ -s "${RUN_FILE_PATH}" ]] && [[ -n "${CACHE_DIR}" ]]; then
-    info "Found cached installer: ${RUN_FILE_PATH} — resuming/validating"
+    RUN_FILE="$(basename "${NVIDIA_RUN_FILE}")"
+    RUN_FILE_PATH="${BUILD_DIR}/${RUN_FILE}"
+
+    warn "Using a user-supplied installer: ${NVIDIA_RUN_FILE}"
+    warn "This is not the installer NVIDIA publishes for ${NVIDIA_VERSION}."
+    warn "NVIDIA_VERSION is only used for naming and compatibility checks here —"
+    warn "make sure it matches what this .run actually contains."
+    cp "${NVIDIA_RUN_FILE}" "${RUN_FILE_PATH}" \
+        || die "Could not copy ${NVIDIA_RUN_FILE} into the build directory"
+else
+    if [[ -n "${NVIDIA_RUN_URL}" ]]; then
+        DOWNLOAD_URL="${NVIDIA_RUN_URL}"
+        RUN_FILE="$(basename "${DOWNLOAD_URL%%\?*}")"
+        [[ "${RUN_FILE}" == *.run ]] \
+            || die "NVIDIA_RUN_URL must point at a .run installer (got: ${RUN_FILE})"
+        warn "Using a custom installer URL: ${DOWNLOAD_URL}"
+        warn "NVIDIA_VERSION (${NVIDIA_VERSION}) is only used for naming and"
+        warn "compatibility checks — make sure it matches what this .run contains."
+    fi
+
+    # Cache the installer across runs when a /cache volume is mounted; otherwise
+    # download into the ephemeral BUILD_DIR.
+    if [[ -n "${CACHE_DIR}" ]]; then
+        RUN_FILE_PATH="${CACHE_DIR}/${RUN_FILE}"
+    else
+        RUN_FILE_PATH="${BUILD_DIR}/${RUN_FILE}"
+    fi
+
+    if [[ -s "${RUN_FILE_PATH}" ]] && [[ -n "${CACHE_DIR}" ]]; then
+        info "Found cached installer: ${RUN_FILE_PATH} — resuming/validating"
+    fi
+    info "Downloading from ${DOWNLOAD_URL} … (resumes if partially cached)"
+    wget -q --show-progress -c -O "${RUN_FILE_PATH}" "${DOWNLOAD_URL}" || {
+        report_url_status "${DOWNLOAD_URL}"
+        die "Failed to download ${RUN_FILE} from ${DOWNLOAD_URL}"
+    }
 fi
-info "Downloading from ${DOWNLOAD_URL} … (resumes if partially cached)"
-wget -q --show-progress -c -O "${RUN_FILE_PATH}" "${DOWNLOAD_URL}" || {
-    report_url_status "${DOWNLOAD_URL}"
-    die "Failed to download ${RUN_FILE} from ${DOWNLOAD_URL}"
-}
 
 chmod +x "${RUN_FILE_PATH}"
 ok "NVIDIA installer ready: ${RUN_FILE_PATH}"
@@ -1353,6 +1404,17 @@ build_release_artifact "${STAGING_DIR}" "${OUTPUT_PATH}" "nvidia.raw"
 FINAL_SIZE=$(du -h "${OUTPUT_PATH}" | cut -f1)
 FINAL_BYTES=$(stat -c%s "${OUTPUT_PATH}" 2>/dev/null || echo "unknown")
 ok "${OUTPUT_FILENAME} created successfully"
+
+# ── Rescue image: the driver this TrueNAS release ships with ────────────────
+# Deploying this undoes the swap completely, without needing a backup — useful
+# after backups have rotated away, or on a machine that was never backed up.
+STOCK_OUTPUT_PATH=""
+if [[ -n "${STOCK_NVIDIA_RAW}" ]] && [[ -f "${STOCK_NVIDIA_RAW}" ]]; then
+    STOCK_OUTPUT_PATH="${OUTPUT_DIR}/nvidia.raw.stock"
+    cp "${STOCK_NVIDIA_RAW}" "${STOCK_OUTPUT_PATH}"
+    write_sha256_file "${STOCK_OUTPUT_PATH}"
+    ok "Stock rescue image written: nvidia.raw.stock ($(du -h "${STOCK_OUTPUT_PATH}" | cut -f1))"
+fi
 
 UPDATED_TRUENAS_UPDATE_PATH=""
 UPDATED_TRUENAS_UPDATE_FILENAME=""

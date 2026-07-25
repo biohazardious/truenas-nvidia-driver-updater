@@ -20,7 +20,10 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 - **Backup & rollback** — deployment script preserves previous images with timestamps and restores them on any failure (including `Ctrl-C`)
 - **Reboot-free driver swap** — deploy script pauses TrueNAS's Docker NVIDIA integration and unloads the old kernel modules, so the new driver is live as soon as `nvidia-smi` runs
 - **Auto sysext diagnostics** — deployment script prints host/image metadata when `systemd-sysext merge` rejects the image
-- **Interactive deploy manager** — `deploy-nvidia.sh` with no arguments opens a menu to inspect state, deploy a built image, or roll back to a previous one, with the same whiptail TUI as the wizard
+- **Interactive deploy manager** — `deploy-nvidia.sh` with no arguments opens a menu to inspect state, deploy a built image, roll back, restore the stock driver, or make the driver survive TrueNAS updates
+- **Survives TrueNAS updates** — an opt-in PREINIT script (registered in the middleware database, which updates don't touch) restores the driver after an update wipes `/usr`; it refuses to restore when the update also changed the kernel, telling you to rebuild instead of silently loading modules that can't work
+- **Stock-driver rescue image** — every build also emits `nvidia.raw.stock`, the driver that TrueNAS release shipped, so `--uninstall` gets you back to factory even with no backups left
+- **Bring your own installer** — `--run-url` / `--custom-run` build from an arbitrary `.run` (betas, archived versions, self-patched installers)
 - **End-to-end in one run** — when run on the TrueNAS box, `configure.sh` offers to start the build and then to deploy the result, so configure → build → deploy needs no manual handoff
 - **`--check` and `--dry-run`** — inspect what is installed (driver version, target kernel, activation, middleware state) or rehearse a deployment without touching anything
 
@@ -176,7 +179,9 @@ chmod +x deploy-nvidia.sh
    1) status      Show the current driver / sysext state
    2) deploy      Deploy an nvidia.raw image
    3) rollback    Roll back to a previous image
-   4) quit        Exit
+   4) uninstall   Restore the driver TrueNAS shipped with
+   5) persist     Survive TrueNAS updates (off)
+   6) quit        Exit
 ```
 
 …or name the image directly, exactly as before:
@@ -444,6 +449,23 @@ How it works:
 
 ## Advanced Usage
 
+### Building from a different installer
+
+The build normally downloads the official installer for `NVIDIA_VERSION`. Two overrides cover the cases where that file isn't there — betas, archived releases, or an installer you patched yourself:
+
+```bash
+# Fetch from an arbitrary URL
+./configure.sh --truenas 25.10.5 --nvidia 596.10 \
+    --run-url https://developer.nvidia.com/.../NVIDIA-Linux-x86_64-596.10.run
+
+# Or use a .run you already have (must sit inside the project directory,
+# because that is what gets mounted into the build container)
+cp ~/Downloads/NVIDIA-Linux-x86_64-596.10.run .
+./configure.sh --truenas 25.10.5 --nvidia 596.10 --custom-run ./NVIDIA-Linux-x86_64-596.10.run
+```
+
+In both modes `NVIDIA_VERSION` is only a **label** — it names the output and drives the driver/kernel compatibility checks, but nothing verifies it against the installer. Set it to the version the `.run` actually contains, or those checks will be reasoning about the wrong driver. The build prints a warning either way. `--reconfigure` keeps the override rather than dropping it.
+
 ### Common Build Variants
 
 **Use a pre-downloaded update file** to avoid re-downloading the ~1.8 GB TrueNAS update on every build:
@@ -492,12 +514,37 @@ The script now prints:
 
 ### After a TrueNAS Update
 
-When TrueNAS updates its kernel, you need to rebuild:
+A TrueNAS update replaces the entire `/usr` dataset, so the custom driver is gone and the stock one is back. `/etc` is recreated too (only `hostid` and `machine-id` carry over), so activation symlinks don't survive either.
 
-1. Update `TRUENAS_VERSION` in `docker-compose.yaml`
+**If the update did not change the kernel**, the driver can be put back automatically. Turn it on once:
+
+```bash
+./deploy-nvidia.sh --persist        # or the manager's "persist" entry
+```
+
+This copies the running image to `/mnt/<pool>/.config/truenas-nvidia-driver-updater/` and registers a **PREINIT** init script through `midclt`. The registration lives in the middleware database, which updates don't touch, and the copy lives on a data pool rather than the boot pool — so both sides survive. On every boot the script waits for middleware, compares the installed image with the saved one, and restores it if they differ.
+
+> **It deliberately refuses to restore when the kernel changed.** The modules inside the image are built for one exact kernel release; restoring them onto a new kernel produces a `vermagic` mismatch and they simply won't load — an opaque failure. Instead the script logs what happened and stops. Check it with `journalctl -t nvidia-persist`, and `./deploy-nvidia.sh --check` will also flag a saved copy that has gone stale.
+
+**When the update did change the kernel**, rebuild:
+
+1. Re-run `./configure.sh` (it auto-detects the new version) or update `TRUENAS_VERSION` in `.env`
 2. Remove any cached `truenas.update` file
 3. Run `docker compose build && docker compose run --rm nvidia-builder`
 4. Deploy the new `nvidia.raw`
+5. Re-run `./deploy-nvidia.sh --persist` so the saved copy matches the new kernel
+
+Turn it all off again with `./deploy-nvidia.sh --unpersist` (the saved copy is left in place for you to delete).
+
+### Back to the driver TrueNAS shipped
+
+Every build writes `output/<TRUENAS_VERSION>/nvidia.raw.stock` — the driver that release originally shipped, lifted straight out of the official update file. Deploying it undoes the swap completely, and unlike a rollback it doesn't depend on a backup still existing:
+
+```bash
+./deploy-nvidia.sh --uninstall
+```
+
+It's an ordinary deployment, so the image it replaces is backed up first and you can go back again.
 
 ### Rollback to Previous Driver
 

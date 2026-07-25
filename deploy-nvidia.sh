@@ -6,6 +6,7 @@
 #         ./deploy-nvidia.sh <path-to-nvidia.raw>   deploy an image
 #         ./deploy-nvidia.sh --check                report the current state only
 #         ./deploy-nvidia.sh --dry-run <image>      show every step, change nothing
+#         ./deploy-nvidia.sh --uninstall            restore the stock driver
 #
 # Run with no arguments it offers a menu to inspect the current state, deploy
 # an image, or roll back to a previous one; the menu re-invokes this script to
@@ -57,6 +58,8 @@ DEPLOY_COMPLETE=0       # 1 once everything succeeded
 # ── Modes ───────────────────────────────────────────────────────────────────
 DRY_RUN=0               # 1 = log every mutating command instead of running it
 CHECK_ONLY=0            # 1 = report the current state and exit
+UNINSTALL=0             # 1 = deploy the stock image instead of a given one
+PERSIST_ACTION=""       # "on"/"off" = set up / remove update-persistence
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -67,6 +70,9 @@ Usage:
   $0 <path-to-nvidia.raw>    Deploy the image
   $0 --dry-run <image>       Walk the whole flow, change nothing
   $0 --check                 Report the current driver/sysext state and exit
+  $0 --uninstall             Restore the driver this TrueNAS release shipped
+  $0 --persist               Keep the driver across TrueNAS updates (PREINIT)
+  $0 --unpersist             Stop restoring it after updates
   $0 --no-whiptail           Force plain menus instead of TUI dialogs
   $0 --help                  Show this help
 
@@ -196,7 +202,9 @@ ui_textbox() {
     fi
 
     echo ""
-    printf '%s\n' "${body}"
+    # echo -e, not printf '%s': callers write "\n" escapes for whiptail, which
+    # would otherwise be printed literally in plain-text mode.
+    echo -e "${body}"
     echo ""
     read -r -p "  Press Enter to continue … " _ || true
 }
@@ -546,6 +554,30 @@ report_state() {
     fi
 
     echo ""
+    echo -e "${BOLD}── Update persistence ──────────────────────────────────────${NC}"
+    local persist_cmd=""
+    if persist_cmd="$(persist_status)"; then
+        echo "  PREINIT script:  ${persist_cmd}"
+        local saved="$(dirname "${persist_cmd}")/nvidia.raw"
+        if [[ -f "${saved}" ]]; then
+            local saved_kernel
+            saved_kernel="$(image_target_kernel "${saved}")"
+            echo "  saved copy:      ${saved} ($(du -h "${saved}" 2>/dev/null | cut -f1))"
+            echo "  saved built for: ${saved_kernel:-<could not read>}"
+            if [[ -n "${saved_kernel}" ]] && [[ "${saved_kernel}" != "${host_kernel}" ]]; then
+                problems=$((problems + 1))
+                PERSIST_STALE="${saved_kernel}"
+            fi
+        else
+            echo "  saved copy:      MISSING at ${saved}"
+            problems=$((problems + 1))
+            PERSIST_BROKEN=1
+        fi
+    else
+        echo "  not configured — a TrueNAS update will restore the stock driver"
+    fi
+
+    echo ""
     echo -e "${BOLD}── Backups ─────────────────────────────────────────────────${NC}"
     if [[ -d "${BACKUP_DIR}" ]]; then
         local list
@@ -578,6 +610,13 @@ report_state() {
     fi
     [[ -n "${NOT_ACTIVATED:-}" ]] && \
         warn "The image is not activated: no symlink in /etc/extensions or /run/extensions."
+    if [[ -n "${PERSIST_STALE:-}" ]]; then
+        warn "The copy saved for update-persistence was built for kernel ${PERSIST_STALE},"
+        warn "not the running ${host_kernel} — it will be refused at boot rather than"
+        warn "restored. Rebuild, redeploy, then re-run the persistence setup."
+    fi
+    [[ -n "${PERSIST_BROKEN:-}" ]] && \
+        warn "A PREINIT entry is registered but its saved image is missing — it will do nothing."
     echo ""
     return 1
 }
@@ -626,6 +665,19 @@ cleanup() {
 # =============================================================================
 
 human_size() { du -h "$1" 2>/dev/null | cut -f1; }
+
+# The driver the running TrueNAS release originally shipped. The build writes it
+# next to each built image as nvidia.raw.stock, so restoring the factory driver
+# needs no backup — handy once backups have rotated away.
+find_stock_image() {
+    local f
+    for f in "${SCRIPT_DIR}"/output/*/nvidia.raw.stock \
+             "${SCRIPT_DIR}"/nvidia.raw.stock \
+             "${PWD}"/nvidia.raw.stock; do
+        [[ -f "${f}" ]] && { printf '%s' "${f}"; return 0; }
+    done
+    return 1
+}
 
 # Candidate images near the script: build outputs first, then loose files.
 # Prints "<path>\t<label>" rows.
@@ -758,6 +810,290 @@ action_rollback() {
     read -r -p "  Press Enter to return to the menu … " _ || true
 }
 
+# =============================================================================
+# Surviving TrueNAS updates
+#
+# An update replaces the whole /usr dataset, so the custom nvidia.raw is gone
+# and the stock driver is back. /etc is recreated too, so nothing there can be
+# relied on either. What does survive is (a) the data pools and (b) middleware's
+# own database — so a copy of the image lives on a pool and a PREINIT init
+# script, registered through midclt, puts it back on every boot.
+#
+# The important subtlety: a TrueNAS update usually changes the KERNEL too, and
+# the modules inside the image are built for one exact kernel release. Blindly
+# restoring would merge modules with the wrong vermagic — they simply refuse to
+# load, and the failure is opaque. So the boot script compares kernels first and
+# refuses to restore on a mismatch, logging that a rebuild is needed instead.
+# =============================================================================
+
+PERSIST_MARKER="truenas-nvidia-driver-updater"
+PERSIST_SUBDIR=".config/${PERSIST_MARKER}"
+
+# Datasets mounted directly under /mnt are the pools available to store on.
+list_data_pools() {
+    zfs list -H -o name,mountpoint 2>/dev/null \
+        | awk -F'\t' '$2 ~ /^\/mnt\/[^\/]+$/ { print $2 }' \
+        | sed 's|^/mnt/||' | sort -u
+}
+
+# Query middleware for our registered PREINIT entry; prints "<id>\t<command>".
+# The script comes in on a quoted heredoc and the data through argv: inside a
+# single-quoted `python3 -c '…'` the shell keeps backslashes literal, so any
+# \" escape reaches Python verbatim and it dies on a syntax error.
+find_persist_entry() {
+    command -v midclt >/dev/null 2>&1 || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+
+    # Named entry_json, not rows: `rows` is an array in action_deploy and the
+    # shadowing reads as a bug even though the locals are independent.
+    local entry_json=""
+    entry_json="$( { midclt call initshutdownscript.query 2>/dev/null || true; } )" || true
+    [[ -n "${entry_json}" ]] || return 1
+
+    local found=""
+    found="$(python3 - "${entry_json}" "${PERSIST_MARKER}" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    rows = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+marker = sys.argv[2]
+for r in rows if isinstance(rows, list) else []:
+    haystack = "{} {}".format(r.get("comment", ""), r.get("command", ""))
+    if marker in haystack:
+        print("{}\t{}".format(r.get("id"), r.get("command", "")))
+PY
+)"
+
+    [[ -n "${found}" ]] || return 1
+    printf '%s' "${found}"
+}
+
+persist_status() {
+    local entry=""
+    entry="$(find_persist_entry)" || true
+    [[ -n "${entry}" ]] || { printf 'not configured'; return 1; }
+    printf '%s' "${entry#*$'\t'}"
+}
+
+# Write the boot script. It is standalone on purpose: after an update the only
+# thing guaranteed to still exist is this directory on the pool.
+write_preinit_script() {
+    local dir="$1" target_kernel="$2" driver="$3"
+
+    cat > "${dir}/preinit.sh" <<PREINIT
+#!/bin/bash
+# Generated by deploy-nvidia.sh — restores the custom NVIDIA driver after a
+# TrueNAS update wipes /usr. Registered as a PREINIT init script; the entry
+# lives in the middleware database, which survives updates.
+#
+# Driver:        ${driver}
+# Built for:     ${target_kernel}
+set -uo pipefail
+
+CONFIG_DIR="${dir}"
+IMAGE="\${CONFIG_DIR}/nvidia.raw"
+TARGET_KERNEL="${target_kernel}"
+SYSEXT_DIR="/usr/share/truenas/sysext-extensions"
+SYSEXT="\${SYSEXT_DIR}/nvidia.raw"
+
+log() { logger -t nvidia-persist -- "\$*" 2>/dev/null; echo "nvidia-persist: \$*"; }
+
+# PREINIT runs after the pools are mounted, so a missing image means the pool
+# is gone or the copy was deleted — nothing to do either way.
+[[ -f "\${IMAGE}" ]] || { log "no image at \${IMAGE} — nothing to restore"; exit 0; }
+
+# Refuse to install anything that isn't a squashfs. A truncated or corrupted
+# copy would otherwise be merged at boot, which fails in confusing ways.
+if [[ "\$(head -c 4 "\${IMAGE}" 2>/dev/null)" != "hsqs" ]]; then
+    log "\${IMAGE} is not a squashfs image (bad magic) — refusing to restore it"
+    exit 1
+fi
+
+RUNNING_KERNEL="\$(uname -r)"
+if [[ "\${RUNNING_KERNEL}" != "\${TARGET_KERNEL}" ]]; then
+    log "kernel is now \${RUNNING_KERNEL} but the saved driver was built for \${TARGET_KERNEL}."
+    log "NOT restoring: the modules would not load. Rebuild the driver for \${RUNNING_KERNEL}"
+    log "and redeploy, then re-run 'deploy-nvidia.sh --persist'."
+    exit 0
+fi
+
+# Size first: these images are a few hundred MB, and after an update the stock
+# driver that replaced ours almost never matches in size — so the common case
+# costs a stat instead of reading both files end to end.
+NEEDS_RESTORE=1
+if [[ -f "\${SYSEXT}" ]]; then
+    if [[ "\$(stat -c%s "\${IMAGE}" 2>/dev/null)" == "\$(stat -c%s "\${SYSEXT}" 2>/dev/null)" ]] \\
+        && cmp -s "\${IMAGE}" "\${SYSEXT}"; then
+        NEEDS_RESTORE=0
+    fi
+fi
+
+if [[ \${NEEDS_RESTORE} -eq 0 ]]; then
+    log "custom driver already in place"
+else
+    log "restoring custom driver into \${SYSEXT}"
+    USR_DATASET="\$(zfs list -H -o name /usr 2>/dev/null)"
+    [[ -n "\${USR_DATASET}" ]] || { log "could not resolve the /usr dataset — aborting"; exit 1; }
+
+    systemd-sysext unmerge 2>/dev/null || true
+    if ! zfs set readonly=off "\${USR_DATASET}"; then
+        log "could not unlock \${USR_DATASET} — aborting"
+        systemd-sysext merge 2>/dev/null || true
+        exit 1
+    fi
+    mkdir -p "\${SYSEXT_DIR}"
+    cp "\${IMAGE}" "\${SYSEXT}" && chmod 644 "\${SYSEXT}" || log "copy failed"
+    zfs set readonly=on "\${USR_DATASET}" || log "failed to re-lock \${USR_DATASET}"
+fi
+
+# /usr/share/truenas/sysext-extensions is storage only — activation is a symlink
+# in a search path. /etc is recreated by an update, so re-create it if missing.
+if [[ ! -e /etc/extensions/nvidia.raw ]] && [[ ! -e /run/extensions/nvidia.raw ]]; then
+    mkdir -p /run/extensions && ln -sf "\${SYSEXT}" /run/extensions/nvidia.raw
+    log "created activation symlink in /run/extensions"
+fi
+
+systemd-sysext merge 2>/dev/null || systemd-sysext refresh 2>/dev/null || log "merge/refresh failed"
+ldconfig 2>/dev/null || true
+modprobe nvidia 2>/dev/null || true
+log "done"
+PREINIT
+
+    chmod +x "${dir}/preinit.sh"
+}
+
+action_persist() {
+    command -v midclt >/dev/null 2>&1 || {
+        ui_textbox "Not available" "midclt isn't present — this only works on a TrueNAS system."
+        return 0
+    }
+    [[ $(id -u) -eq 0 ]] || {
+        ui_textbox "Root required" "Setting this up needs root. Re-run this script with sudo."
+        return 0
+    }
+    [[ -f "${NVIDIA_RAW}" ]] || {
+        ui_textbox "Nothing installed" "There is no ${NVIDIA_RAW} to protect. Deploy an image first."
+        return 0
+    }
+
+    local target_kernel driver
+    target_kernel="$(image_target_kernel "${NVIDIA_RAW}")"
+    driver="$(image_driver_version "${NVIDIA_RAW}")"
+    if [[ -z "${target_kernel}" ]]; then
+        ui_textbox "Cannot read the image" \
+            "Couldn't determine which kernel ${NVIDIA_RAW} was built for, so the boot script would have no way to tell a rebuild is needed. Refusing to set this up."
+        return 0
+    fi
+
+    # ── Pick a pool ─────────────────────────────────────────────────────────
+    local -a pools=()
+    mapfile -t pools < <(list_data_pools)
+    if [[ ${#pools[@]} -eq 0 ]]; then
+        ui_textbox "No data pool" \
+            "No ZFS pool is mounted under /mnt. The image has to live on a data pool to survive an update — the boot pool is replaced."
+        return 0
+    fi
+
+    local pool=""
+    if [[ ${#pools[@]} -eq 1 ]]; then
+        pool="${pools[0]}"
+    else
+        local -a menu=() p
+        for p in "${pools[@]}"; do menu+=("${p}" "/mnt/${p}"); done
+        ui_menu pool "Where to store it" \
+            "Which pool should hold the rescue copy?" "${menu[@]}" || return 0
+    fi
+    [[ -n "${pool}" ]] || return 0
+
+    local dir="/mnt/${pool}/${PERSIST_SUBDIR}"
+
+    ui_yesno "Survive TrueNAS updates" \
+        "A copy of the running driver will be kept at:\n  ${dir}\n\nand a PREINIT script registered with middleware to put it back after an update wipes /usr.\n\nDriver ${driver:-unknown}, built for ${target_kernel}.\n\nIf an update also changes the kernel, the script deliberately does NOT restore — it logs that a rebuild is needed instead." \
+        || return 0
+
+    mkdir -p "${dir}" || { ui_textbox "Failed" "Could not create ${dir}"; return 0; }
+    cp "${NVIDIA_RAW}" "${dir}/nvidia.raw" \
+        || { ui_textbox "Failed" "Could not copy the image to ${dir}"; return 0; }
+    write_preinit_script "${dir}" "${target_kernel}" "${driver:-unknown}"
+
+    # Replace any entry we registered before, so re-running just updates it.
+    local existing=""
+    existing="$(find_persist_entry)" || true
+    if [[ -n "${existing}" ]]; then
+        local old_id="${existing%%$'\t'*}"
+        midclt call initshutdownscript.delete "${old_id}" >/dev/null 2>&1 || true
+    fi
+
+    local payload
+    payload="$(python3 -c '
+import json, sys
+print(json.dumps({
+    "type": "COMMAND",
+    "command": sys.argv[1],
+    "when": "PREINIT",
+    "enabled": True,
+    "timeout": 300,
+    "comment": sys.argv[2],
+}))' "${dir}/preinit.sh" "Restore custom NVIDIA driver (${PERSIST_MARKER})")"
+
+    if midclt call -j initshutdownscript.create "${payload}" >/dev/null 2>&1; then
+        ui_textbox "Set up" \
+            "The driver will be restored automatically after a TrueNAS update.\n\n  copy:   ${dir}/nvidia.raw\n  script: ${dir}/preinit.sh\n  driver: ${driver:-unknown} (kernel ${target_kernel})\n\nAfter an update that changes the kernel, rebuild for the new kernel, redeploy, then run this again to refresh the saved copy.\n\nBoot messages appear under: journalctl -t nvidia-persist"
+    else
+        ui_textbox "Registration failed" \
+            "The files were written to ${dir} but registering the PREINIT script with middleware failed.\n\nRegister it by hand in the UI: System → Advanced → Init/Shutdown Scripts, type Command, when PREINIT:\n  ${dir}/preinit.sh"
+    fi
+}
+
+action_unpersist() {
+    local entry=""
+    entry="$(find_persist_entry)" || true
+
+    if [[ -z "${entry}" ]]; then
+        ui_textbox "Not configured" "No update-persistence entry is registered."
+        return 0
+    fi
+    [[ $(id -u) -eq 0 ]] || {
+        ui_textbox "Root required" "Removing this needs root. Re-run this script with sudo."
+        return 0
+    }
+
+    # entry_cmd, not cmd: launch_deployment uses `cmd` as an array.
+    local id="${entry%%$'\t'*}" entry_cmd="${entry#*$'\t'}"
+    ui_yesno "Stop surviving updates" \
+        "Remove the PREINIT entry so the driver is NOT restored after a TrueNAS update?\n\n  ${entry_cmd}\n\nThe saved copy on the pool is left in place." \
+        || return 0
+
+    if midclt call initshutdownscript.delete "${id}" >/dev/null 2>&1; then
+        ui_textbox "Removed" "The PREINIT entry is gone. The saved copy is still at:\n  $(dirname "${entry_cmd}")\n\nDelete that directory yourself if you don't want it."
+    else
+        ui_textbox "Failed" "Could not remove the entry (id ${id}). Remove it in System → Advanced → Init/Shutdown Scripts."
+    fi
+}
+
+action_uninstall() {
+    local stock=""
+    if ! stock="$(find_stock_image)"; then
+        ui_textbox "No stock image" \
+            "Couldn't find a nvidia.raw.stock next to this script or under output/.\n\nIt is written by the build, alongside the image it produces. Run a build for this TrueNAS version to obtain one, or roll back to a backup instead."
+        return 0
+    fi
+
+    [[ $(id -u) -eq 0 ]] || {
+        ui_textbox "Root required" "Restoring the stock driver needs root. Re-run this script with sudo."
+        return 0
+    }
+
+    ui_yesno "Restore the stock driver" \
+        "Put the driver this TrueNAS release originally shipped back in place?\n\n  ${stock}\n\nThe image currently installed is backed up first, so this is reversible." \
+        || return 0
+
+    launch_deployment "${stock}" "apply" || true
+    echo ""
+    read -r -p "  Press Enter to return to the menu … " _ || true
+}
+
 run_manager() {
     detect_ui_mode
 
@@ -769,20 +1105,35 @@ run_manager() {
     fi
 
     while true; do
+        # Re-read each pass: the label has to follow what the last action did.
+        local persist_state="off" persist_label="Survive TrueNAS updates (off)"
+        if persist_status >/dev/null 2>&1; then
+            persist_state="on"
+            persist_label="Survive TrueNAS updates (ON — select to turn off)"
+        fi
+
         local action=""
         ui_menu action "TrueNAS NVIDIA Driver Manager" \
             "What would you like to do?" \
-            "status"   "Show the current driver / sysext state" \
-            "deploy"   "Deploy an nvidia.raw image" \
-            "rollback" "Roll back to a previous image" \
-            "quit"     "Exit" \
+            "status"    "Show the current driver / sysext state" \
+            "deploy"    "Deploy an nvidia.raw image" \
+            "rollback"  "Roll back to a previous image" \
+            "uninstall" "Restore the driver TrueNAS shipped with" \
+            "persist"   "${persist_label}" \
+            "quit"      "Exit" \
             || return 0
 
         case "${action}" in
-            status)   action_status || true ;;
-            deploy)   action_deploy ;;
-            rollback) action_rollback ;;
-            quit|"")  return 0 ;;
+            status)    action_status || true ;;
+            deploy)    action_deploy ;;
+            rollback)  action_rollback ;;
+            uninstall) action_uninstall ;;
+            persist)   if [[ "${persist_state}" == "on" ]]; then
+                           action_unpersist
+                       else
+                           action_persist
+                       fi ;;
+            quit|"")   return 0 ;;
         esac
     done
 }
@@ -793,6 +1144,9 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)      usage; exit 0 ;;
         --check)        CHECK_ONLY=1; shift ;;
+        --uninstall)    UNINSTALL=1; shift ;;
+        --persist)      PERSIST_ACTION="on"; shift ;;
+        --unpersist)    PERSIST_ACTION="off"; shift ;;
         --dry-run)      DRY_RUN=1; shift ;;
         --no-whiptail)  FORCE_BASH=true; shift ;;
         -*)             die "Unknown option: $1 (see --help)" ;;
@@ -802,12 +1156,42 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# The mode flags each own the whole run, so combining them is always a mistake —
+# say so instead of silently honouring whichever is checked first.
+MODE_COUNT=$(( CHECK_ONLY + UNINSTALL ))
+[[ -n "${PERSIST_ACTION}" ]] && MODE_COUNT=$(( MODE_COUNT + 1 ))
+[[ ${MODE_COUNT} -le 1 ]] || die "Use only one of --check, --uninstall, --persist, --unpersist"
+
 # --check mutates nothing, so it does not demand root — it just reports less.
 if [[ ${CHECK_ONLY} -eq 1 ]]; then
     [[ -z "${NEW_RAW}" ]] || die "--check takes no image argument"
     [[ $(id -u) -eq 0 ]] || warn "Not running as root — some values may be unavailable"
     report_state
     exit $?
+fi
+
+# Persistence setup mutates nothing about the installed driver, so it runs on
+# its own and exits — the same code the menu entry uses.
+if [[ -n "${PERSIST_ACTION}" ]]; then
+    [[ -z "${NEW_RAW}" ]] || die "--persist/--unpersist take no image argument"
+    detect_ui_mode
+    if [[ "${PERSIST_ACTION}" == "on" ]]; then
+        action_persist
+    else
+        action_unpersist
+    fi
+    exit 0
+fi
+
+# --uninstall is an ordinary deployment of the stock image, so it inherits the
+# backup, rollback and trap behaviour rather than being a separate code path.
+if [[ ${UNINSTALL} -eq 1 ]]; then
+    [[ -z "${NEW_RAW}" ]] || die "--uninstall takes no image argument"
+    NEW_RAW="$(find_stock_image)" || die \
+"No nvidia.raw.stock found next to this script or under output/.
+It is written by the build alongside the image it produces — run a build for
+this TrueNAS version to obtain one, or roll back to a backup instead."
+    info "Restoring the driver this TrueNAS release shipped: ${NEW_RAW}"
 fi
 
 # No image and nothing else to do → interactive manager.

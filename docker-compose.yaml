@@ -32,6 +32,14 @@ services:
       # 'predefined' applies the curated set in ./predefined-patches/<driver>/;
       # 'custom' uses ./patches/<kernel>/. See ./configure.sh and the README.
       - NVIDIA_PATCH_MODE=${NVIDIA_PATCH_MODE:-auto}
+      # Optional installer overrides for drivers NVIDIA doesn't publish in the
+      # usual place (betas, archives, self-patched .run files). Leave empty to
+      # download the official installer for NVIDIA_VERSION.
+      #   NVIDIA_RUN_URL  — download this URL instead
+      #   NVIDIA_RUN_FILE — path INSIDE the container; the repo is at /workspace,
+      #                     so ./my.run on the host is /workspace/my.run here
+      - NVIDIA_RUN_URL=${NVIDIA_RUN_URL:-}
+      - NVIDIA_RUN_FILE=${NVIDIA_RUN_FILE:-}
     # Force standard runtime — TrueNAS may default to nvidia-container-runtime,
     # which fails when the driver is being rebuilt (chicken-and-egg).
     runtime: runc
