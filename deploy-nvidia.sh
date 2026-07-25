@@ -194,10 +194,23 @@ ui_textbox() {
 
     if [[ "${UI_MODE}" == "whiptail" ]]; then
         wt_size
-        # Strip ANSI colours: whiptail renders the escapes literally.
-        printf '%s' "${body}" | sed 's/\x1b\[[0-9;]*m//g' \
-            | whiptail --title "${title}" --scrolltext \
-                --textbox /dev/stdin "${WT_HEIGHT}" "${WT_WIDTH}" 3>&1 1>&2 2>&3
+
+        # The body goes through a real file, never a pipe. `--textbox /dev/stdin`
+        # renders an empty box: whiptail reads the content from stdin and then
+        # has no stdin left to take keypresses from, so the dialog never draws.
+        local tmp=""
+        tmp="$(mktemp 2>/dev/null)" || { echo -e "${body}"; return 0; }
+        # Also cleaned on the way out of the function, so quitting the dialog
+        # early doesn't leave the file behind.
+        trap 'rm -f "${tmp}"' RETURN
+
+        # %b expands the \n escapes callers write (whiptail's --msgbox
+        # interprets them, but --textbox shows file content verbatim), and the
+        # sed drops ANSI colours, which would otherwise appear as raw escapes.
+        printf '%b\n' "${body}" | sed 's/\x1b\[[0-9;]*m//g' > "${tmp}"
+        whiptail --title "${title}" --scrolltext \
+            --textbox "${tmp}" "${WT_HEIGHT}" "${WT_WIDTH}"
+        rm -f "${tmp}"
         return 0
     fi
 
