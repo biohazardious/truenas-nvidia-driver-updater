@@ -1402,6 +1402,68 @@ read_existing_config() {
 }
 
 # =============================================================================
+# Hand off to the deployer
+# =============================================================================
+
+# True when this machine is the TrueNAS box the image is for. The build can just
+# as easily run on a separate Docker host, in which case the image has to be
+# copied to the NAS and offering to deploy here would be wrong.
+running_on_truenas() {
+    [[ -d /usr/share/truenas/sysext-extensions ]] || command -v midclt &>/dev/null
+}
+
+# After a successful build, offer to install what was just built. Declining is
+# free — the command is printed either way.
+offer_deployment() {
+    local truenas_version="$1"
+    local repo_dir=""
+    repo_dir="$(config_repo_dir)"
+
+    local image="${repo_dir}/output/${truenas_version}/nvidia.raw"
+    local deployer="${repo_dir}/deploy-nvidia.sh"
+
+    [[ -f "${image}" ]]    || return 0
+    [[ -x "${deployer}" ]] || [[ -f "${deployer}" ]] || return 0
+
+    if ! running_on_truenas; then
+        echo ""
+        info "Image ready: ${image}"
+        info "This host isn't the TrueNAS system — copy it there together with"
+        info "deploy-nvidia.sh, then run:  ./deploy-nvidia.sh nvidia.raw"
+        echo ""
+        return 0
+    fi
+
+    # Wording stays neutral: this is also reached when the build was skipped and
+    # an image from an earlier run is already sitting in output/.
+    if ! ui_yesno "Deploy Now?" \
+        "Install this image as the system NVIDIA driver?\n\n  ${image}\n\nThe current driver is backed up first and restored automatically if anything fails."
+    then
+        echo ""
+        info "Not deploying. When you're ready:"
+        echo -e "    ${CYAN}./deploy-nvidia.sh output/${truenas_version}/nvidia.raw${NC}"
+        echo -e "  or ${CYAN}./deploy-nvidia.sh${NC} for the deployment menu."
+        echo ""
+        return 0
+    fi
+
+    if [[ $(id -u) -ne 0 ]]; then
+        echo ""
+        warn "Deploying needs root. Run:"
+        echo -e "    ${CYAN}sudo ./deploy-nvidia.sh output/${truenas_version}/nvidia.raw${NC}"
+        echo ""
+        return 0
+    fi
+
+    echo ""
+    info "Handing over to deploy-nvidia.sh …"
+    echo ""
+    # exec: the deployer owns the terminal from here, keeps its own traps, and
+    # its exit status becomes ours.
+    exec bash "${deployer}" "${image}"
+}
+
+# =============================================================================
 # Main Wizard
 # =============================================================================
 
@@ -1921,10 +1983,24 @@ main() {
         echo ""
         info "Starting build …"
         echo ""
-        exec bash -c 'docker compose build && docker compose run --rm nvidia-builder'
+        # Not exec'd any more: control has to come back so the deployer can be
+        # offered once the image exists.
+        if docker compose build && docker compose run --rm nvidia-builder; then
+            echo ""
+            ok "Build finished."
+            offer_deployment "${selected_truenas}"
+            exit 0
+        fi
+
+        echo ""
+        err "Build failed — see the output above. Nothing was deployed."
+        exit 1
     else
         echo ""
         info "Ready when you are. Run the commands above to build."
+        # An image for this version may already be sitting in output/ from an
+        # earlier run — deploying that is still worth offering.
+        offer_deployment "${selected_truenas}"
         echo ""
         exit 0
     fi

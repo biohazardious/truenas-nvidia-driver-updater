@@ -20,6 +20,8 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 - **Backup & rollback** — deployment script preserves previous images with timestamps and restores them on any failure (including `Ctrl-C`)
 - **Reboot-free driver swap** — deploy script pauses TrueNAS's Docker NVIDIA integration and unloads the old kernel modules, so the new driver is live as soon as `nvidia-smi` runs
 - **Auto sysext diagnostics** — deployment script prints host/image metadata when `systemd-sysext merge` rejects the image
+- **Interactive deploy manager** — `deploy-nvidia.sh` with no arguments opens a menu to inspect state, deploy a built image, or roll back to a previous one, with the same whiptail TUI as the wizard
+- **End-to-end in one run** — when run on the TrueNAS box, `configure.sh` offers to start the build and then to deploy the result, so configure → build → deploy needs no manual handoff
 - **`--check` and `--dry-run`** — inspect what is installed (driver version, target kernel, activation, middleware state) or rehearse a deployment without touching anything
 
 ## Quick Start
@@ -56,6 +58,8 @@ The wizard auto-detects your TrueNAS version and GPU, then walks you through 4 s
   Step 3: Select Kernel Module Type      →  open / proprietary
   Step 4: Embed nvidia.raw in .update?   →  yes / no
 ```
+
+The wizard offers to start the build when it's done, and — if you're running it **on the TrueNAS box itself** — offers to deploy the finished image straight away, so configure → build → deploy is one uninterrupted run. Both prompts are opt-in; decline and it prints the commands instead. On a separate build host it skips the deploy offer and reminds you to copy the image over.
 
 After the last step, `.env` is generated — Docker Compose reads it automatically. `docker-compose.yaml` is a git-tracked template and never modified.
 
@@ -159,12 +163,31 @@ Set `NVIDIA_INSTALL_DRM=false` only if your target TrueNAS kernel cannot load `n
 
 ### 3. Deploy to TrueNAS
 
-Copy the generated `output/<TRUENAS_VERSION>/nvidia.raw` and `deploy-nvidia.sh` to your TrueNAS system, then:
+Copy the generated `output/<TRUENAS_VERSION>/nvidia.raw` and `deploy-nvidia.sh` to your TrueNAS system, then either run the **manager** and pick from a menu:
 
 ```bash
 chmod +x deploy-nvidia.sh
+./deploy-nvidia.sh
+```
+
+```
+  TrueNAS NVIDIA Driver Manager
+
+   1) status      Show the current driver / sysext state
+   2) deploy      Deploy an nvidia.raw image
+   3) rollback    Roll back to a previous image
+   4) quit        Exit
+```
+
+…or name the image directly, exactly as before:
+
+```bash
 ./deploy-nvidia.sh nvidia.raw
 ```
+
+The manager finds built images under `output/*/nvidia.raw` (newest TrueNAS release first) and lists rollback points from `backups/` with the timestamp each was taken. It uses the same whiptail TUI as `configure.sh` when available, with plain numbered menus as fallback (`--no-whiptail` forces those). Picking an image offers **Deploy** or **Dry run**, and deployment asks for confirmation first.
+
+> The menu never deploys inline — it re-invokes this same script with the image you chose, so a menu-driven deployment runs the identical code path, EXIT trap and rollback as the command-line one.
 
 The deploy script handles everything:
 - Turns off TrueNAS's own Docker NVIDIA integration for the duration of the swap (`midclt call -j docker.update '{"nvidia": false}'`) and turns it back on afterwards, so middleware never points at driver files that are being replaced
@@ -480,7 +503,13 @@ When TrueNAS updates its kernel, you need to rebuild:
 
 If `systemd-sysext merge` rejects a freshly deployed image, the deploy script automatically restores the previous `nvidia.raw` (or removes it on a fresh install) and re-merges, so the system is left in its prior working state rather than broken.
 
-To roll back manually, the deploy script saves backups in a `backups/` directory alongside itself (keeps the 5 most recent):
+To roll back manually, the deploy script saves backups in a `backups/` directory alongside itself (keeps the 5 most recent). Easiest is the manager's **rollback** entry, which lists them with the date each was taken:
+
+```bash
+./deploy-nvidia.sh          # → 3) rollback
+```
+
+Or name one directly:
 
 ```bash
 # List available backups
@@ -489,6 +518,8 @@ ls -la backups/
 # Rollback
 ./deploy-nvidia.sh backups/nvidia.raw.backup_20260422_160428
 ```
+
+Rolling back is an ordinary deployment, so the image being replaced is itself backed up first — you can always go back the other way.
 
 ---
 

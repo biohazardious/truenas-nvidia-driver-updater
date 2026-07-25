@@ -2,11 +2,16 @@
 # =============================================================================
 # deploy-nvidia.sh — Deploy nvidia.raw sysext to TrueNAS
 #
-# Usage:  ./deploy-nvidia.sh <path-to-nvidia.raw>   deploy an image
+# Usage:  ./deploy-nvidia.sh                        interactive manager (menu)
+#         ./deploy-nvidia.sh <path-to-nvidia.raw>   deploy an image
 #         ./deploy-nvidia.sh --check                report the current state only
 #         ./deploy-nvidia.sh --dry-run <image>      show every step, change nothing
 #
-# This script:
+# Run with no arguments it offers a menu to inspect the current state, deploy
+# an image, or roll back to a previous one; the menu re-invokes this script to
+# do the actual work, so every path below is shared.
+#
+# Deploying an image:
 #   1. Turns off TrueNAS's own Docker NVIDIA integration while the swap runs
 #   2. Unmerges any active sysext extensions
 #   3. Unlocks the read-only /usr ZFS dataset
@@ -37,6 +42,8 @@ NVIDIA_RAW="${SYSEXT_DIR}/nvidia.raw"
 # Backup directory — same directory as this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKUP_DIR="${SCRIPT_DIR}/backups"
+# Absolute path to this script; the manager re-invokes it to deploy.
+SELF="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 
 # ── Deployment state (read by the EXIT trap) ────────────────────────────────
 USR_DATASET=""          # set once /usr has been unlocked; empty = never touched
@@ -56,14 +63,142 @@ CHECK_ONLY=0            # 1 = report the current state and exit
 usage() {
     cat <<EOF
 Usage:
+  $0                         Interactive manager (menu)
   $0 <path-to-nvidia.raw>    Deploy the image
   $0 --dry-run <image>       Walk the whole flow, change nothing
   $0 --check                 Report the current driver/sysext state and exit
+  $0 --no-whiptail           Force plain menus instead of TUI dialogs
   $0 --help                  Show this help
+
+With no arguments it opens a menu to inspect the current state, deploy an
+image, or roll back to a previous one.
 
 --check is read-only and also works without root, reporting less where a call
 needs privileges. It exits non-zero when it finds a problem.
 EOF
+}
+
+# =============================================================================
+# Minimal UI layer
+#
+# Deliberately duplicated rather than shared with configure.sh: this script is
+# copied to the TrueNAS box on its own, so it has to stay a single file. Only
+# the four dialogs this script actually needs are implemented.
+# =============================================================================
+UI_MODE="bash"
+FORCE_BASH=false
+
+detect_ui_mode() {
+    if [[ "${FORCE_BASH}" == true ]]; then
+        UI_MODE="bash"
+    elif command -v whiptail &>/dev/null && [[ -t 0 ]]; then
+        UI_MODE="whiptail"
+    else
+        UI_MODE="bash"
+    fi
+}
+
+# Size dialogs from the terminal, clamped to something readable.
+wt_size() {
+    local rows cols
+    rows=$(tput lines 2>/dev/null || echo 24)
+    cols=$(tput cols 2>/dev/null || echo 80)
+
+    WT_HEIGHT=$((rows - 4))
+    WT_WIDTH=$((cols - 8))
+    [[ ${WT_HEIGHT} -gt 30 ]] && WT_HEIGHT=30
+    [[ ${WT_HEIGHT} -lt 12 ]] && WT_HEIGHT=12
+    [[ ${WT_WIDTH} -gt 100 ]] && WT_WIDTH=100
+    [[ ${WT_WIDTH} -lt 60 ]] && WT_WIDTH=60
+    WT_MENU_HEIGHT=$((WT_HEIGHT - 9))
+    [[ ${WT_MENU_HEIGHT} -lt 3 ]] && WT_MENU_HEIGHT=3
+}
+
+# ui_menu RESULT_VAR "title" "prompt" tag1 desc1 tag2 desc2 …
+# Returns non-zero when the user cancels.
+ui_menu() {
+    local -n _menu_result=$1; shift
+    local title="$1"; shift
+    local prompt="$1"; shift
+    local -a items=("$@")
+
+    if [[ "${UI_MODE}" == "whiptail" ]]; then
+        wt_size
+        _menu_result="$(whiptail --title "${title}" --menu "${prompt}" \
+            "${WT_HEIGHT}" "${WT_WIDTH}" "${WT_MENU_HEIGHT}" \
+            "${items[@]}" 3>&1 1>&2 2>&3)" || { _menu_result=""; return 1; }
+        return 0
+    fi
+
+    echo ""
+    echo -e "${BOLD}${title}${NC}"
+    echo -e "${prompt}"
+    echo ""
+    local i=1 idx
+    for ((idx = 0; idx < ${#items[@]}; idx += 2)); do
+        if [[ "${items[idx]}" == /* ]]; then
+            # A path would blow the column alignment — describe it, then show
+            # the path underneath.
+            printf "   %2d) %s\n       %s\n" "${i}" "${items[idx + 1]}" "${items[idx]}"
+        else
+            printf "   %2d) %-22s %s\n" "${i}" "${items[idx]}" "${items[idx + 1]}"
+        fi
+        i=$((i + 1))
+    done
+    echo ""
+
+    local count=$(( ${#items[@]} / 2 )) reply=""
+    read -r -p "  Select [1-${count}] (empty to cancel): " reply
+    [[ -n "${reply}" ]] || { _menu_result=""; return 1; }
+    [[ "${reply}" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= count )) || {
+        warn "Invalid selection: ${reply}"; _menu_result=""; return 1
+    }
+    _menu_result="${items[$(( (reply - 1) * 2 ))]}"
+    return 0
+}
+
+# ui_yesno "title" "prompt" [default_yes]
+ui_yesno() {
+    local title="$1" prompt="$2" default_yes="${3:-false}"
+
+    if [[ "${UI_MODE}" == "whiptail" ]]; then
+        wt_size
+        local -a extra=()
+        [[ "${default_yes}" != "true" ]] && extra+=(--defaultno)
+        whiptail --title "${title}" --yesno "${prompt}" \
+            $((WT_HEIGHT / 2)) "${WT_WIDTH}" "${extra[@]}" 3>&1 1>&2 2>&3
+        return $?
+    fi
+
+    echo ""
+    echo -e "${prompt}"
+    local suffix="[y/N]" reply=""
+    [[ "${default_yes}" == "true" ]] && suffix="[Y/n]"
+    read -r -p "  Continue? ${suffix} " reply
+    if [[ "${default_yes}" == "true" ]]; then
+        [[ ! "${reply}" =~ ^[Nn] ]]
+    else
+        [[ "${reply}" =~ ^[Yy] ]]
+    fi
+}
+
+# ui_textbox "title" "body" — shows a scrollable report.
+ui_textbox() {
+    local title="$1" body="$2"
+
+    if [[ "${UI_MODE}" == "whiptail" ]]; then
+        wt_size
+        # Strip ANSI colours: whiptail renders the escapes literally.
+        printf '%s' "${body}" | sed 's/\x1b\[[0-9;]*m//g' \
+            | whiptail --title "${title}" --scrolltext \
+                --textbox /dev/stdin "${WT_HEIGHT}" "${WT_WIDTH}" 3>&1 1>&2 2>&3
+        return 0
+    fi
+
+    echo ""
+    printf '%s\n' "${body}"
+    echo ""
+    read -r -p "  Press Enter to continue … " _ || true
 }
 
 # Every mutating command goes through this. In --dry-run it is only printed, so
@@ -414,7 +549,7 @@ report_state() {
     echo -e "${BOLD}── Backups ─────────────────────────────────────────────────${NC}"
     if [[ -d "${BACKUP_DIR}" ]]; then
         local list
-        list="$(ls -1t "${BACKUP_DIR}"/nvidia.raw.backup_* 2>/dev/null || true)"
+        list="$(ls -1 "${BACKUP_DIR}"/nvidia.raw.backup_* 2>/dev/null | sort -r || true)"
         if [[ -n "${list}" ]]; then
             echo "${list}" | while read -r b; do
                 echo "  $(basename "${b}")  ($(du -h "${b}" 2>/dev/null | cut -f1))"
@@ -481,14 +616,186 @@ cleanup() {
     exit "${rc}"
 }
 
+# =============================================================================
+# Interactive manager (shown when the script is run with no arguments)
+#
+# The menu never deploys inline: it re-invokes this same script with the chosen
+# image, so a menu-driven deployment runs the exact same code path — and the
+# same EXIT trap and rollback — as the command-line one. Nothing about the
+# deployment is duplicated here.
+# =============================================================================
+
+human_size() { du -h "$1" 2>/dev/null | cut -f1; }
+
+# Candidate images near the script: build outputs first, then loose files.
+# Prints "<path>\t<label>" rows.
+discover_images() {
+    # Both loops must feed the same sort — piping only the second one would
+    # leave the build outputs in raw glob order.
+    {
+        local f
+        for f in "${SCRIPT_DIR}"/output/*/nvidia.raw; do
+            [[ -f "${f}" ]] || continue
+            local version
+            version="$(basename "$(dirname "${f}")")"
+            printf '%s\t%s\n' "${f}" "TrueNAS ${version} · $(human_size "${f}")"
+        done
+        for f in "${SCRIPT_DIR}"/nvidia.raw "${PWD}"/nvidia.raw; do
+            [[ -f "${f}" ]] || continue
+            printf '%s\t%s\n' "${f}" "loose file · $(human_size "${f}")"
+        done
+    } | sort -Vru   # version sort, reversed: newest TrueNAS release first
+}
+
+action_status() {
+    local body="" rc=0
+    body="$(report_state 2>&1)" || rc=$?
+    ui_textbox "Current state" "${body}"
+    return "${rc}"
+}
+
+# Hand an image to a fresh run of this script. Keeping this as a child process
+# means the deployment keeps its own traps, so an interrupted deploy still rolls
+# itself back without the menu having to know anything about it.
+launch_deployment() {
+    local image="$1" mode="${2:-apply}"
+    local -a cmd=("${SELF}")
+    [[ "${mode}" == "dry" ]] && cmd+=(--dry-run)
+    cmd+=("${image}")
+
+    echo ""
+    "${cmd[@]}" && return 0 || return $?
+}
+
+action_deploy() {
+    local -a rows=() menu=()
+    mapfile -t rows < <(discover_images)
+
+    local row path label
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r path label <<< "${row}"
+        menu+=("${path}" "${label}")
+    done
+    menu+=("MANUAL" "Enter a path manually")
+
+    local choice=""
+    ui_menu choice "Deploy an image" \
+        "Select the nvidia.raw to install:" "${menu[@]}" || return 0
+
+    if [[ "${choice}" == "MANUAL" ]]; then
+        if [[ "${UI_MODE}" == "whiptail" ]]; then
+            wt_size
+            choice="$(whiptail --title "Deploy an image" --inputbox \
+                "Full path to nvidia.raw:" $((WT_HEIGHT / 2)) "${WT_WIDTH}" "" \
+                3>&1 1>&2 2>&3)" || return 0
+        else
+            read -r -p "  Full path to nvidia.raw: " choice
+        fi
+    fi
+
+    [[ -n "${choice}" ]] || return 0
+    [[ -f "${choice}" ]] || { ui_textbox "Not found" "No such file:\n  ${choice}"; return 0; }
+
+    # Show the full path: every candidate is called nvidia.raw, so the basename
+    # alone would not say which one is about to be installed.
+    local mode=""
+    ui_menu mode "Deploy an image" \
+        "${choice}  ($(human_size "${choice}"))\n\nWhat should happen?" \
+        "apply" "Deploy it now" \
+        "dry"   "Dry run — show every step, change nothing" || return 0
+
+    if [[ "${mode}" == "apply" ]]; then
+        [[ $(id -u) -eq 0 ]] || {
+            ui_textbox "Root required" "Deploying needs root. Re-run this script with sudo."
+            return 0
+        }
+        ui_yesno "Confirm deployment" \
+            "Install this image as the system NVIDIA driver?\n\n  ${choice}\n\nThe current image is backed up first and restored automatically if anything fails." \
+            || return 0
+    fi
+
+    launch_deployment "${choice}" "${mode}" || true
+    echo ""
+    read -r -p "  Press Enter to return to the menu … " _ || true
+}
+
+action_rollback() {
+    local -a backups=()
+    # Sorted by the timestamp in the filename, not mtime: copying a backup
+    # around changes its mtime but not when it was actually taken.
+    mapfile -t backups < <(ls -1 "${BACKUP_DIR}"/nvidia.raw.backup_* 2>/dev/null | sort -r || true)
+
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        ui_textbox "No backups" \
+            "No backups in:\n  ${BACKUP_DIR}\n\nA backup of the current image is taken automatically on every deployment."
+        return 0
+    fi
+
+    local -a menu=()
+    local b stamp
+    for b in "${backups[@]}"; do
+        # nvidia.raw.backup_20260724_160428 → 2026-07-24 16:04:28
+        stamp="$(basename "${b}" | sed -E 's/^nvidia\.raw\.backup_([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})$/\1-\2-\3 \4:\5:\6/')"
+        menu+=("${b}" "${stamp} · $(human_size "${b}")")
+    done
+
+    local choice=""
+    ui_menu choice "Roll back" \
+        "Backups are listed newest first:" "${menu[@]}" || return 0
+    [[ -n "${choice}" ]] || return 0
+
+    [[ $(id -u) -eq 0 ]] || {
+        ui_textbox "Root required" "Rolling back needs root. Re-run this script with sudo."
+        return 0
+    }
+
+    ui_yesno "Confirm rollback" \
+        "Restore this backup as the system NVIDIA driver?\n\n  $(basename "${choice}")\n\nThe image currently installed is backed up first." \
+        || return 0
+
+    launch_deployment "${choice}" "apply" || true
+    echo ""
+    read -r -p "  Press Enter to return to the menu … " _ || true
+}
+
+run_manager() {
+    detect_ui_mode
+
+    if [[ "${UI_MODE}" != "whiptail" ]]; then
+        echo ""
+        echo -e "${BOLD}════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}  TrueNAS NVIDIA Driver Manager${NC}"
+        echo -e "${BOLD}════════════════════════════════════════════════════════════${NC}"
+    fi
+
+    while true; do
+        local action=""
+        ui_menu action "TrueNAS NVIDIA Driver Manager" \
+            "What would you like to do?" \
+            "status"   "Show the current driver / sysext state" \
+            "deploy"   "Deploy an nvidia.raw image" \
+            "rollback" "Roll back to a previous image" \
+            "quit"     "Exit" \
+            || return 0
+
+        case "${action}" in
+            status)   action_status || true ;;
+            deploy)   action_deploy ;;
+            rollback) action_rollback ;;
+            quit|"")  return 0 ;;
+        esac
+    done
+}
+
 # ── Parse arguments ─────────────────────────────────────────────────────────
 NEW_RAW=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -h|--help) usage; exit 0 ;;
-        --check)   CHECK_ONLY=1; shift ;;
-        --dry-run) DRY_RUN=1; shift ;;
-        -*)        die "Unknown option: $1 (see --help)" ;;
+        -h|--help)      usage; exit 0 ;;
+        --check)        CHECK_ONLY=1; shift ;;
+        --dry-run)      DRY_RUN=1; shift ;;
+        --no-whiptail)  FORCE_BASH=true; shift ;;
+        -*)             die "Unknown option: $1 (see --help)" ;;
         *)
             [[ -z "${NEW_RAW}" ]] || die "Only one image can be given (got '${NEW_RAW}' and '$1')"
             NEW_RAW="$1"; shift ;;
@@ -503,8 +810,15 @@ if [[ ${CHECK_ONLY} -eq 1 ]]; then
     exit $?
 fi
 
+# No image and nothing else to do → interactive manager.
+if [[ -z "${NEW_RAW}" ]] && [[ ${DRY_RUN} -eq 0 ]]; then
+    [[ $(id -u) -eq 0 ]] || warn "Not running as root — the menu can inspect, but not deploy"
+    run_manager
+    exit 0
+fi
+
 # ── Validate input ──────────────────────────────────────────────────────────
-[[ -n "${NEW_RAW}" ]] || { usage >&2; die "No image given"; }
+[[ -n "${NEW_RAW}" ]] || { usage >&2; die "--dry-run needs an image path"; }
 [[ $(id -u) -eq 0 ]] || die "This script must be run as root."
 [[ -f "${NEW_RAW}" ]] || die "File not found: ${NEW_RAW}"
 
@@ -544,6 +858,20 @@ if [[ -f "${NVIDIA_RAW}" ]]; then
     run_cmd mkdir -p "${BACKUP_DIR}"
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     BACKUP="${BACKUP_DIR}/nvidia.raw.backup_${TIMESTAMP}"
+
+    # The timestamp only has second resolution, so two deployments in the same
+    # second would land on the same filename. That silently destroys the older
+    # backup — and when rolling back, the file being restored lives in this very
+    # directory, so the backup step could overwrite its own source before the
+    # copy reads it. Never reuse an existing name.
+    if [[ -e "${BACKUP}" ]]; then
+        BACKUP_SEQ=2
+        while [[ -e "${BACKUP}_${BACKUP_SEQ}" ]]; do
+            BACKUP_SEQ=$((BACKUP_SEQ + 1))
+        done
+        BACKUP="${BACKUP}_${BACKUP_SEQ}"
+    fi
+
     info "Backing up existing nvidia.raw → ${BACKUP}"
     run_cmd cp "${NVIDIA_RAW}" "${BACKUP}"
     if [[ ${DRY_RUN} -eq 1 ]]; then
@@ -558,7 +886,7 @@ if [[ -f "${NVIDIA_RAW}" ]]; then
     BACKUP_COUNT=$(ls -1 "${BACKUP_DIR}"/nvidia.raw.backup_* 2>/dev/null | wc -l || true)
     if [[ ${BACKUP_COUNT} -gt 5 ]]; then
         info "Cleaning old backups (keeping 5 most recent) …"
-        ls -1t "${BACKUP_DIR}"/nvidia.raw.backup_* | tail -n +6 | while read -r old; do
+        ls -1 "${BACKUP_DIR}"/nvidia.raw.backup_* | sort -r | tail -n +6 | while read -r old; do
             info "  Removing: $(basename "${old}")"
             run_cmd rm -f "${old}"
         done
@@ -628,7 +956,7 @@ fi
 echo ""
 
 # List current backups
-BACKUP_LIST=$(ls -1t "${BACKUP_DIR}"/nvidia.raw.backup_* 2>/dev/null || true)
+BACKUP_LIST=$(ls -1 "${BACKUP_DIR}"/nvidia.raw.backup_* 2>/dev/null | sort -r || true)
 if [[ -n "${BACKUP_LIST}" ]]; then
     echo -e "  ${BOLD}Available rollback backups:${NC}"
     echo "${BACKUP_LIST}" | while read -r b; do
