@@ -118,6 +118,11 @@ wt_size() {
     [[ ${WT_WIDTH} -lt 60 ]] && WT_WIDTH=60
     WT_MENU_HEIGHT=$((WT_HEIGHT - 9))
     [[ ${WT_MENU_HEIGHT} -lt 3 ]] && WT_MENU_HEIGHT=3
+
+    # Explicit: the clamp above is an `[[ ]] && …` list, so when the condition
+    # is false — the normal case — it leaves $? at 1. That becomes the function's
+    # exit status and `set -e` then kills whichever dialog called us.
+    return 0
 }
 
 # ui_menu RESULT_VAR "title" "prompt" tag1 desc1 tag2 desc2 …
@@ -198,11 +203,13 @@ ui_textbox() {
         # The body goes through a real file, never a pipe. `--textbox /dev/stdin`
         # renders an empty box: whiptail reads the content from stdin and then
         # has no stdin left to take keypresses from, so the dialog never draws.
+        # No RETURN trap to clean this up: a RETURN trap set inside a function
+        # is not scoped to it, so it fires again when the *caller* returns —
+        # by which point ${tmp} is out of scope and `set -u` aborts the script.
+        # The explicit rm below covers every path except the shell being killed
+        # mid-dialog, which leaves one empty file in /tmp.
         local tmp=""
         tmp="$(mktemp 2>/dev/null)" || { echo -e "${body}"; return 0; }
-        # Also cleaned on the way out of the function, so quitting the dialog
-        # early doesn't leave the file behind.
-        trap 'rm -f "${tmp}"' RETURN
 
         # %b expands the \n escapes callers write (whiptail's --msgbox
         # interprets them, but --textbox shows file content verbatim), and the
