@@ -6,7 +6,7 @@
 #
 # Required environment variables:
 #   NVIDIA_VERSION     — NVIDIA driver version (e.g. 595.58.03)
-#   TRUENAS_VERSION    — TrueNAS version (e.g. 25.10.3 or 26.0.0-BETA.1)
+#   TRUENAS_VERSION    — TrueNAS version (e.g. 25.10.6 or 26.0.0-BETA.1)
 #
 # Optional:
 #   NVIDIA_KERNEL_MODULE_TYPE

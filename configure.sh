@@ -72,12 +72,12 @@ Usage:
   ./configure.sh --help       Show this help message
 
 Non-interactive mode (for automation / CI):
-  ./configure.sh --truenas 25.10.3.1 --nvidia 595.80
-  ./configure.sh --truenas 25.10.3.1 --nvidia 595.80 --module open --embed false
+  ./configure.sh --truenas 25.10.6 --nvidia 595.91.07
+  ./configure.sh --truenas 25.10.6 --nvidia 595.91.07 --module open --embed false
 
   All flags:
-    --truenas VERSION     TrueNAS version (e.g. 25.10.3.1)
-    --nvidia VERSION      NVIDIA driver version (e.g. 595.80)
+    --truenas VERSION     TrueNAS version (e.g. 25.10.6)
+    --nvidia VERSION      NVIDIA driver version (e.g. 595.91.07)
     --module TYPE         Kernel module type: open (default) or proprietary
     --embed true|false    Embed nvidia.raw in truenas.update (default: false)
     --patch MODE          Source patches: none, custom, predefined, or auto
@@ -1831,7 +1831,7 @@ main() {
             warn "Failed to fetch version list. Please enter manually."
             ui_inputbox selected_truenas \
                 "TrueNAS Version" \
-                "Enter TrueNAS version (e.g. 25.10.3.1):"
+                "Enter TrueNAS version (e.g. 25.10.6):"
             local major_minor=""
             major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
             selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
@@ -1894,7 +1894,7 @@ main() {
         warn "Failed to fetch version list. Please enter manually."
         ui_inputbox selected_nvidia \
             "NVIDIA Driver" \
-            "Enter NVIDIA driver version (e.g. 595.80):"
+            "Enter NVIDIA driver version (e.g. 595.91.07):"
     fi
 
     [[ -n "${selected_nvidia}" ]] || { err "No NVIDIA version selected. Aborting."; exit 1; }

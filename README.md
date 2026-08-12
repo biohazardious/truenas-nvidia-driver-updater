@@ -4,6 +4,15 @@ Build and deploy **any** NVIDIA driver as a `systemd-sysext` image (`nvidia.raw`
 
 TrueNAS ships with a specific NVIDIA driver version baked into its immutable root filesystem. This tool lets you compile and package a different driver version (newer or older) without modifying the base OS, using the `systemd-sysext` overlay mechanism that TrueNAS natively supports.
 
+> **Current landscape (August 2026)** — examples throughout this README use the versions that are current today. Nothing is hardcoded: `configure.sh` fetches the live TrueNAS and NVIDIA version lists every run, so newer releases show up on their own.
+>
+> | | Version | Notes |
+> |---|---|---|
+> | TrueNAS | **25.10.6** (Goldeye) | kernel 6.12; 26.x update URLs supported too |
+> | NVIDIA — New Feature Branch | **610.57.04** | newest, Turing and newer |
+> | NVIDIA — Production Branch | **595.91.07** | the safe default for most users |
+> | NVIDIA — Legacy | **470.256.02** | Kepler only; needs [patches](#building-eol-drivers-on-newer-kernels-patches) on kernel 6.10+ |
+
 ---
 
 ## Features
@@ -41,7 +50,7 @@ chmod +x configure.sh
 The wizard auto-detects your TrueNAS version and GPU, then walks you through 4 steps. Key versions are tagged so you don't need to look anything up:
 
 ```
-[OK]    Detected TrueNAS version: 25.10.3.1
+[OK]    Detected TrueNAS version: 25.10.6
 [OK]    Detected GPU: NVIDIA AD102 [GeForce RTX 4090] (rev a1)
 [OK]      Architecture: Ada — supported by current driver branches
 
@@ -49,10 +58,10 @@ The wizard auto-detects your TrueNAS version and GPU, then walks you through 4 s
 
   Step 2: Select NVIDIA Driver Version
    GPU: NVIDIA GeForce RTX 4090
-   1) 595.80  ★ Production Branch
-   2) 610.43.02  ★ New Feature Branch
+   1) 595.91.07  ★ Production Branch
+   2) 610.57.04  ★ New Feature Branch
    3) 470.256.02  ★ Legacy GPU (470.xx)
-   4) 595.44.01
+   4) 595.80
    ...
    95) 🔍 Filter versions          ← type to search (e.g. "595" or "production")
    96) ✎ Enter manually
@@ -74,8 +83,8 @@ After the last step, `.env` is generated — Docker Compose reads it automatical
 Skip the wizard entirely by passing CLI flags:
 
 ```bash
-./configure.sh --truenas 25.10.3.1 --nvidia 595.80
-./configure.sh --truenas 25.10.3.1 --nvidia 595.80 --module open --embed false
+./configure.sh --truenas 25.10.6 --nvidia 595.91.07
+./configure.sh --truenas 25.10.6 --nvidia 595.91.07 --module open --embed false
 ```
 
 | Flag | Default | Description |
@@ -109,8 +118,8 @@ cp .env.example .env
 
 ```ini
 # .env
-NVIDIA_VERSION=595.80
-TRUENAS_VERSION=25.10.3.1
+NVIDIA_VERSION=595.91.07
+TRUENAS_VERSION=25.10.6
 NVIDIA_KERNEL_MODULE_TYPE=open
 TRUENAS_CODENAME=Goldeye
 NVIDIA_BUILD_CC=
@@ -144,7 +153,7 @@ Output naming follows the TrueNAS version:
 | TrueNAS version | Output directory | Update filename |
 |---|---|---|
 | `26.0.0-BETA.1` | `output/26.0.0-BETA.1/` | `TrueNAS-26.0.0-BETA.1.update` |
-| `25.10.3` | `output/25.10.3/` | `TrueNAS-SCALE-25.10.3.update` |
+| `25.10.6` | `output/25.10.6/` | `TrueNAS-SCALE-25.10.6.update` |
 
 `NVIDIA_KERNEL_MODULE_TYPE` is passed through to the NVIDIA installer as `--kernel-module-type=<value>`.
 
@@ -223,7 +232,7 @@ The deploy script handles everything:
   path            /usr/share/truenas/sysext-extensions/nvidia.raw
   size            412M
   modified        2026-07-24 17:22:16
-  driver version  595.80
+  driver version  595.91.07
   built for       6.12.15-production+truenas
 
 ── Host ────────────────────────────────────────────────────
@@ -321,8 +330,8 @@ TrueNAS 25/26 uses an immutable root filesystem. `systemd-sysext` provides a sup
 
 `nvidia-installer` rejects unknown options (aborting the whole build), and the option set has grown over time — so the same flag list does **not** work across all driver branches. The build handles this automatically by probing each installer for the options it actually supports and passing only those; the table below documents which flags are gated and when they appeared (verified against the [`NVIDIA/nvidia-installer`](https://github.com/NVIDIA/nvidia-installer) option tables).
 
-| Installer flag | First available | 470 | 535 LTS | 550 LTS | 555 | 560+ |
-|----------------|-----------------|:---:|:------:|:------:|:---:|:----:|
+| Installer flag | First available | 470 | 535 LTS | 550 LTS | 555 | 560 – 610 |
+|----------------|-----------------|:---:|:------:|:------:|:---:|:---------:|
 | `--silent`, `--kernel-source-path`, `--kernel-name`, `--no-x-check`, `--no-nouveau-check`, `--no-systemd`, `--no-backup`, `--install-libglvnd`, `--no-drm` | always (≤470) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `--allow-installation-with-running-driver` | R545 | ❌ | ❌¹ | ✅ | ✅ | ✅ |
 | `--skip-module-load` | R550 | ❌ | ❌ | ✅ | ✅ | ✅ |
@@ -347,11 +356,11 @@ Legacy/EOL NVIDIA branches only build against kernels up to a certain point — 
 |--------|------------------------------|------------------|
 | `390`  | ~5.15 | none current |
 | `470`  | **6.9** | ✅ 23.10 / 24.04 / 24.10 (≤6.6); ❌ 25.x (6.12) — needs patches |
-| 535 / 550 / 560+ | current kernels (no fixed ceiling) | all |
+| 535 / 550 / 580 / 595 / 610 | current kernels (no fixed ceiling) | all |
 
 If the target kernel is newer than the branch supports, the build **aborts immediately** with an explanation. The interactive wizard also shows an early heads-up when you select a legacy branch. To build anyway, either supply [source patches](#building-eol-drivers-on-newer-kernels-patches) (which also relaxes this check) or set `SKIP_KERNEL_COMPAT_CHECK=true`.
 
-> **Kepler note:** if your GPU is *only* supported by the 470 branch (Kepler — GeForce 600/700 series), it works out of the box up to TrueNAS 24.10. For TrueNAS 25.x (kernel 6.12) you'll need community kernel patches (see below). Newer GPUs (Maxwell/Pascal/Turing/Ampere/Ada+) should use a current branch (535/550/560+), which builds cleanly everywhere.
+> **Kepler note:** if your GPU is *only* supported by the 470 branch (Kepler — GeForce 600/700 series), it works out of the box up to TrueNAS 24.10. For TrueNAS 25.x (kernel 6.12) you'll need community kernel patches (see below). Newer GPUs (Maxwell/Pascal/Turing/Ampere/Ada+) should use a current branch (580 for Maxwell–Volta, 595/610 for Turing and newer), which builds cleanly everywhere.
 
 ### Does the driver actually support your GPU?
 
@@ -370,9 +379,9 @@ Newer cards have a floor too: Blackwell (RTX 50-series) needs 570.xx or newer, A
 [OK]    Detected GPU: NVIDIA GP102 [GeForce GTX 1080 Ti] (rev a1)
 [OK]      Architecture: Pascal — last supporting driver branch: 580.xx
 
-   1) 580.142  ★ Recommended for your Pascal GPU
-   2) 610.43.02  ★ New Feature Branch
-   3) 595.80  ★ Production Branch
+   1) 580.95.05  ★ Recommended for your Pascal GPU
+   2) 610.57.04  ★ New Feature Branch
+   3) 595.91.07  ★ Production Branch
 ```
 
 **More than one GPU?** Every NVIDIA card is read, not just the first, and the wizard works out the branch window that serves *all* of them — the lowest ceiling and the highest floor:
@@ -412,7 +421,7 @@ When a legacy driver needs source fixes to build on a newer kernel (e.g. 470 on 
 **Easiest path — predefined (NVIDIA 470 on TrueNAS 25.x):** run `./configure.sh`, pick the 470 driver and a 25.x TrueNAS version, and when prompted choose **"Download curated community patches."** It downloads the curated set into `predefined-patches/470/` and sets `NVIDIA_PATCH_MODE=predefined`. Non-interactively:
 
 ```bash
-./configure.sh --truenas 25.10.3.1 --nvidia 470.256.02 --patch predefined
+./configure.sh --truenas 25.10.6 --nvidia 470.256.02 --patch predefined
 docker compose run --rm nvidia-builder
 ```
 
@@ -455,13 +464,13 @@ The build normally downloads the official installer for `NVIDIA_VERSION`. Two ov
 
 ```bash
 # Fetch from an arbitrary URL
-./configure.sh --truenas 25.10.5 --nvidia 596.10 \
-    --run-url https://developer.nvidia.com/.../NVIDIA-Linux-x86_64-596.10.run
+./configure.sh --truenas 25.10.6 --nvidia 611.10 \
+    --run-url https://developer.nvidia.com/.../NVIDIA-Linux-x86_64-611.10.run
 
 # Or use a .run you already have (must sit inside the project directory,
 # because that is what gets mounted into the build container)
-cp ~/Downloads/NVIDIA-Linux-x86_64-596.10.run .
-./configure.sh --truenas 25.10.5 --nvidia 596.10 --custom-run ./NVIDIA-Linux-x86_64-596.10.run
+cp ~/Downloads/NVIDIA-Linux-x86_64-611.10.run .
+./configure.sh --truenas 25.10.6 --nvidia 611.10 --custom-run ./NVIDIA-Linux-x86_64-611.10.run
 ```
 
 In both modes `NVIDIA_VERSION` is only a **label** — it names the output and drives the driver/kernel compatibility checks, but nothing verifies it against the installer. Set it to the version the `.run` actually contains, or those checks will be reasoning about the wrong driver. The build prints a warning either way. `--reconfigure` keeps the override rather than dropping it.
