@@ -60,6 +60,7 @@ DRY_RUN=0               # 1 = log every mutating command instead of running it
 CHECK_ONLY=0            # 1 = report the current state and exit
 UNINSTALL=0             # 1 = deploy the stock image instead of a given one
 PERSIST_ACTION=""       # "on"/"off" = set up / remove update-persistence
+UVM_ACTION=""           # "on"/"off" = register / remove the boot-time uvm load
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -73,6 +74,8 @@ Usage:
   $0 --uninstall             Restore the driver this TrueNAS release shipped
   $0 --persist               Keep the driver across TrueNAS updates (PREINIT)
   $0 --unpersist             Stop restoring it after updates
+  $0 --persist-uvm           Load nvidia_uvm at boot so CUDA works (POSTINIT)
+  $0 --unpersist-uvm         Stop loading nvidia_uvm at boot
   $0 --no-whiptail           Force plain menus instead of TUI dialogs
   $0 --help                  Show this help
 
@@ -353,6 +356,33 @@ unload_nvidia_modules() {
     fi
 }
 
+# Put /dev/nvidia-uvm back after the swap.
+#
+# TrueNAS loads only nvidia, nvidia_drm and nvidia_modeset at boot — middleware's
+# docker.configure_nvidia runs `modprobe -a nvidia nvidia_drm nvidia_modeset` and
+# nothing else — and neither the stock image nor ours ships a udev rule that
+# would create the UVM node. Upstream expects the setuid nvidia-modprobe helper
+# to be called on demand by the CUDA runtime or by nvidia-container-cli. We just
+# unloaded nvidia_uvm, so without this every CUDA workload on the box stays
+# broken until something happens to trigger that helper. Best effort: a host with
+# no GPU, or an image built for another kernel, simply has nothing to load.
+restore_uvm_device_nodes() {
+    command -v nvidia-modprobe >/dev/null 2>&1 || {
+        info "nvidia-modprobe not present — skipping the /dev/nvidia-uvm setup"
+        return 0
+    }
+
+    info "Recreating the CUDA device nodes (nvidia-modprobe -u -c 0) …"
+    if run_cmd_quiet nvidia-modprobe -u -c 0; then
+        ok "/dev/nvidia-uvm is ready"
+    else
+        warn "Could not create /dev/nvidia-uvm — CUDA apps will fail until"
+        warn "  nvidia-modprobe -u -c 0"
+        warn "succeeds. This is expected when the modules could not be reloaded yet."
+    fi
+    return 0
+}
+
 # /usr/share/truenas/sysext-extensions/ is only a storage location — it is NOT
 # a systemd-sysext search path. An extension is activated by a symlink in
 # /etc/extensions (persistent dataset) or /run/extensions (tmpfs). TrueNAS's
@@ -533,6 +563,16 @@ report_state() {
     loaded="$(lsmod 2>/dev/null | awk '{print $1}' | grep -E '^nvidia' | tr '\n' ' ' || true)"
     echo "  loaded modules  ${loaded:-<none>}"
 
+    # /dev/nvidia-uvm is the node CUDA opens, and nothing on TrueNAS creates it
+    # at boot (see restore_uvm_device_nodes). Its absence is invisible until an
+    # app fails, which is exactly the kind of thing --check exists to name.
+    if [[ -e /dev/nvidia-uvm ]]; then
+        echo "  CUDA nodes      /dev/nvidia-uvm present"
+    else
+        echo "  CUDA nodes      /dev/nvidia-uvm MISSING (nvidia_uvm not loaded)"
+        UVM_MISSING=1
+    fi
+
     if command -v nvidia-smi >/dev/null 2>&1; then
         local smi
         smi="$(nvidia-smi --query-gpu=driver_version,name --format=csv,noheader 2>/dev/null | head -2 | tr '\n' ';' || true)"
@@ -597,6 +637,12 @@ report_state() {
         echo "  not configured — a TrueNAS update will restore the stock driver"
     fi
 
+    if uvm_status >/dev/null 2>&1; then
+        echo "  nvidia_uvm at boot: registered (POSTINIT)"
+    else
+        echo "  nvidia_uvm at boot: not registered"
+    fi
+
     echo ""
     echo -e "${BOLD}── Backups ─────────────────────────────────────────────────${NC}"
     if [[ -d "${BACKUP_DIR}" ]]; then
@@ -611,6 +657,16 @@ report_state() {
         fi
     else
         echo "  none (${BACKUP_DIR} does not exist)"
+    fi
+
+    # Not counted as a problem: a box that only transcodes never needs the UVM
+    # node, and --check's exit status is meant to be usable in a health check.
+    if [[ -n "${UVM_MISSING:-}" ]]; then
+        echo ""
+        echo -e "${YELLOW}  Note:${NC} /dev/nvidia-uvm is not present. nvidia-smi and transcoding work"
+        echo    "        without it; CUDA (PyTorch, whisper, ollama, …) does not. Create it now"
+        echo    "        with:  nvidia-modprobe -u -c 0"
+        echo    "        On every boot:  $0 --persist-uvm"
     fi
 
     echo ""
@@ -847,6 +903,15 @@ action_rollback() {
 # =============================================================================
 
 PERSIST_MARKER="truenas-nvidia-driver-updater"
+# Its own marker, and the persistence lookup excludes it — the UVM marker
+# contains the persistence one as a substring, so a plain match would find the
+# wrong entry and "unpersist" would delete the UVM one.
+UVM_MARKER="truenas-nvidia-driver-updater-uvm"
+# Registered as a POSTINIT COMMAND; middleware runs it as `sh -c "<command>"`
+# (initshutdownscript.execute_task). Retried because POSTINIT can start before
+# middleware has merged the sysext, and a silent no-op is precisely the failure
+# this entry exists to prevent. First success exits immediately.
+UVM_BOOT_COMMAND='for i in 1 2 3 4 5 6; do /usr/bin/nvidia-modprobe -u -c 0 && exit 0; sleep 5; done; logger -t nvidia-uvm "nvidia-modprobe -u -c 0 failed - /dev/nvidia-uvm is missing"; exit 0'
 PERSIST_SUBDIR=".config/${PERSIST_MARKER}"
 
 # Datasets mounted directly under /mnt are the pools available to store on.
@@ -856,11 +921,14 @@ list_data_pools() {
         | sed 's|^/mnt/||' | sort -u
 }
 
-# Query middleware for our registered PREINIT entry; prints "<id>\t<command>".
+# Query middleware for one of our registered init entries; prints "<id>\t<command>".
+#   $1  marker the entry must carry
+#   $2  marker that disqualifies it (optional)
 # The script comes in on a quoted heredoc and the data through argv: inside a
 # single-quoted `python3 -c '…'` the shell keeps backslashes literal, so any
 # \" escape reaches Python verbatim and it dies on a syntax error.
-find_persist_entry() {
+find_init_entry() {
+    local marker="$1" exclude="${2:-}"
     command -v midclt >/dev/null 2>&1 || return 1
     command -v python3 >/dev/null 2>&1 || return 1
 
@@ -871,16 +939,16 @@ find_persist_entry() {
     [[ -n "${entry_json}" ]] || return 1
 
     local found=""
-    found="$(python3 - "${entry_json}" "${PERSIST_MARKER}" <<'PY' 2>/dev/null || true
+    found="$(python3 - "${entry_json}" "${marker}" "${exclude}" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     rows = json.loads(sys.argv[1])
 except Exception:
     sys.exit(0)
-marker = sys.argv[2]
+marker, exclude = sys.argv[2], sys.argv[3]
 for r in rows if isinstance(rows, list) else []:
     haystack = "{} {}".format(r.get("comment", ""), r.get("command", ""))
-    if marker in haystack:
+    if marker in haystack and not (exclude and exclude in haystack):
         print("{}\t{}".format(r.get("id"), r.get("command", "")))
 PY
 )"
@@ -889,9 +957,19 @@ PY
     printf '%s' "${found}"
 }
 
+find_persist_entry() { find_init_entry "${PERSIST_MARKER}" "${UVM_MARKER}"; }
+find_uvm_entry()     { find_init_entry "${UVM_MARKER}"; }
+
 persist_status() {
     local entry=""
     entry="$(find_persist_entry)" || true
+    [[ -n "${entry}" ]] || { printf 'not configured'; return 1; }
+    printf '%s' "${entry#*$'\t'}"
+}
+
+uvm_status() {
+    local entry=""
+    entry="$(find_uvm_entry)" || true
     [[ -n "${entry}" ]] || { printf 'not configured'; return 1; }
     printf '%s' "${entry#*$'\t'}"
 }
@@ -977,6 +1055,9 @@ fi
 systemd-sysext merge 2>/dev/null || systemd-sysext refresh 2>/dev/null || log "merge/refresh failed"
 ldconfig 2>/dev/null || true
 modprobe nvidia 2>/dev/null || true
+# TrueNAS itself never loads nvidia_uvm, so CUDA has no /dev/nvidia-uvm unless
+# someone calls the setuid helper. Harmless when there is nothing to load.
+/usr/bin/nvidia-modprobe -u -c 0 2>/dev/null || true
 log "done"
 PREINIT
 
@@ -1092,6 +1173,87 @@ action_unpersist() {
     fi
 }
 
+# Opt-in: load nvidia_uvm on every boot.
+#
+# TrueNAS's own boot path never does (see restore_uvm_device_nodes), so a CUDA
+# workload is always one reboot away from breaking. The registration lives in
+# the middleware database and calls a binary the driver image provides, so it
+# survives a TrueNAS update and stays correct whichever nvidia.raw is installed
+# — ours or the stock one.
+action_uvm_on() {
+    command -v midclt >/dev/null 2>&1 || {
+        ui_textbox "Not available" "midclt isn't present — this only works on a TrueNAS system."
+        return 0
+    }
+    [[ $(id -u) -eq 0 ]] || {
+        ui_textbox "Root required" "Registering the boot entry needs root. Re-run this script with sudo."
+        return 0
+    }
+
+    ui_yesno "Load nvidia_uvm at boot" \
+        "TrueNAS loads nvidia, nvidia_drm and nvidia_modeset at boot but never nvidia_uvm, so /dev/nvidia-uvm — the device CUDA opens — is missing until something asks for it. Anything CUDA-based (PyTorch, whisper, ollama, …) fails until then.\n\nRegister a POSTINIT command with middleware to create it on every boot?\n\n  nvidia-modprobe -u -c 0\n\nThe entry lives in the middleware database, so it survives TrueNAS updates, and it works with the stock driver too." \
+        || return 0
+
+    # Replace our own entry if one is already there, so re-running refreshes it.
+    local existing=""
+    existing="$(find_uvm_entry)" || true
+    if [[ -n "${existing}" ]]; then
+        midclt call initshutdownscript.delete "${existing%%$'\t'*}" >/dev/null 2>&1 || true
+    fi
+
+    local payload
+    payload="$(python3 -c '
+import json, sys
+print(json.dumps({
+    "type": "COMMAND",
+    "command": sys.argv[1],
+    "when": "POSTINIT",
+    "enabled": True,
+    "timeout": 120,
+    "comment": sys.argv[2],
+}))' "${UVM_BOOT_COMMAND}" "Load nvidia_uvm for CUDA (${UVM_MARKER})")"
+
+    if ! midclt call -j initshutdownscript.create "${payload}" >/dev/null 2>&1; then
+        ui_textbox "Registration failed" \
+            "Registering the POSTINIT command with middleware failed.\n\nAdd it by hand in the UI: System → Advanced → Init/Shutdown Scripts, type Command, when POST INIT:\n\n  nvidia-modprobe -u -c 0"
+        return 0
+    fi
+
+    # The point is a working /dev/nvidia-uvm, not one after the next reboot.
+    nvidia-modprobe -u -c 0 >/dev/null 2>&1 || true
+    local now="It could not be created right now — check that the driver is loaded (nvidia-smi)."
+    [[ -e /dev/nvidia-uvm ]] && now="/dev/nvidia-uvm exists now as well, so nothing needs a reboot."
+
+    ui_textbox "Set up" \
+        "nvidia_uvm will be loaded on every boot.\n\n${now}\n\nBoot messages, if it ever fails:  journalctl -t nvidia-uvm"
+    return 0
+}
+
+action_uvm_off() {
+    local entry=""
+    entry="$(find_uvm_entry)" || true
+
+    if [[ -z "${entry}" ]]; then
+        ui_textbox "Not configured" "No boot-time nvidia_uvm entry is registered."
+        return 0
+    fi
+    [[ $(id -u) -eq 0 ]] || {
+        ui_textbox "Root required" "Removing the entry needs root. Re-run this script with sudo."
+        return 0
+    }
+
+    ui_yesno "Stop loading nvidia_uvm at boot" \
+        "Remove the POSTINIT entry?\n\nCUDA applications will stop working after the next reboot unless something else creates /dev/nvidia-uvm.\n\nThe module stays loaded for this boot." \
+        || return 0
+
+    if midclt call initshutdownscript.delete "${entry%%$'\t'*}" >/dev/null 2>&1; then
+        ui_textbox "Removed" "The POSTINIT entry is gone. nvidia_uvm stays loaded until the next reboot."
+    else
+        ui_textbox "Failed" "Could not remove the entry. Remove it in System → Advanced → Init/Shutdown Scripts."
+    fi
+    return 0
+}
+
 action_uninstall() {
     local stock=""
     if ! stock="$(find_stock_image)"; then
@@ -1132,6 +1294,12 @@ run_manager() {
             persist_label="Survive TrueNAS updates (ON — select to turn off)"
         fi
 
+        local uvm_state="off" uvm_label="Load nvidia_uvm at boot for CUDA (off)"
+        if uvm_status >/dev/null 2>&1; then
+            uvm_state="on"
+            uvm_label="Load nvidia_uvm at boot for CUDA (ON — select to turn off)"
+        fi
+
         local action=""
         ui_menu action "TrueNAS NVIDIA Driver Manager" \
             "What would you like to do?" \
@@ -1140,6 +1308,7 @@ run_manager() {
             "rollback"  "Roll back to a previous image" \
             "uninstall" "Restore the driver TrueNAS shipped with" \
             "persist"   "${persist_label}" \
+            "uvm"       "${uvm_label}" \
             "quit"      "Exit" \
             || return 0
 
@@ -1152,6 +1321,11 @@ run_manager() {
                            action_unpersist
                        else
                            action_persist
+                       fi ;;
+            uvm)       if [[ "${uvm_state}" == "on" ]]; then
+                           action_uvm_off
+                       else
+                           action_uvm_on
                        fi ;;
             quit|"")   return 0 ;;
         esac
@@ -1167,6 +1341,8 @@ while [[ $# -gt 0 ]]; do
         --uninstall)    UNINSTALL=1; shift ;;
         --persist)      PERSIST_ACTION="on"; shift ;;
         --unpersist)    PERSIST_ACTION="off"; shift ;;
+        --persist-uvm)   UVM_ACTION="on"; shift ;;
+        --unpersist-uvm) UVM_ACTION="off"; shift ;;
         --dry-run)      DRY_RUN=1; shift ;;
         --no-whiptail)  FORCE_BASH=true; shift ;;
         -*)             die "Unknown option: $1 (see --help)" ;;
@@ -1180,7 +1356,9 @@ done
 # say so instead of silently honouring whichever is checked first.
 MODE_COUNT=$(( CHECK_ONLY + UNINSTALL ))
 [[ -n "${PERSIST_ACTION}" ]] && MODE_COUNT=$(( MODE_COUNT + 1 ))
-[[ ${MODE_COUNT} -le 1 ]] || die "Use only one of --check, --uninstall, --persist, --unpersist"
+[[ -n "${UVM_ACTION}" ]] && MODE_COUNT=$(( MODE_COUNT + 1 ))
+[[ ${MODE_COUNT} -le 1 ]] || die \
+    "Use only one of --check, --uninstall, --persist, --unpersist, --persist-uvm, --unpersist-uvm"
 
 # --check mutates nothing, so it does not demand root — it just reports less.
 if [[ ${CHECK_ONLY} -eq 1 ]]; then
@@ -1199,6 +1377,19 @@ if [[ -n "${PERSIST_ACTION}" ]]; then
         action_persist
     else
         action_unpersist
+    fi
+    exit 0
+fi
+
+# Same shape as the persistence flags: register or remove the boot entry and
+# exit, leaving the installed driver untouched.
+if [[ -n "${UVM_ACTION}" ]]; then
+    [[ -z "${NEW_RAW}" ]] || die "--persist-uvm/--unpersist-uvm take no image argument"
+    detect_ui_mode
+    if [[ "${UVM_ACTION}" == "on" ]]; then
+        action_uvm_on
+    else
+        action_uvm_off
     fi
     exit 0
 fi
@@ -1338,6 +1529,9 @@ refresh_linker_cache
 
 # ── Step 9: Unload the old driver's kernel modules ──────────────────────────
 unload_nvidia_modules
+
+# ── Step 10: Recreate the CUDA device nodes ─────────────────────────────────
+restore_uvm_device_nodes
 
 DEPLOY_COMPLETE=1
 

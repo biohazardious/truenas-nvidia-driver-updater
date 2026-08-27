@@ -29,7 +29,8 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 - **Backup & rollback** — deployment script preserves previous images with timestamps and restores them on any failure (including `Ctrl-C`)
 - **Reboot-free driver swap** — deploy script pauses TrueNAS's Docker NVIDIA integration and unloads the old kernel modules, so the new driver is live as soon as `nvidia-smi` runs
 - **Auto sysext diagnostics** — deployment script prints host/image metadata when `systemd-sysext merge` rejects the image
-- **Interactive deploy manager** — `deploy-nvidia.sh` with no arguments opens a menu to inspect state, deploy a built image, roll back, restore the stock driver, or make the driver survive TrueNAS updates
+- **Interactive deploy manager** — `deploy-nvidia.sh` with no arguments opens a menu to inspect state, deploy a built image, roll back, restore the stock driver, make the driver survive TrueNAS updates, or keep CUDA working across reboots
+- **CUDA actually works after a reboot** — TrueNAS loads `nvidia`, `nvidia_drm` and `nvidia_modeset` at boot but never `nvidia_uvm`, so `/dev/nvidia-uvm` is missing and every CUDA workload fails until something creates it. The deploy script puts the node back after a swap, `--check` reports when it's absent, and `--persist-uvm` registers a boot-time entry that fixes it for good
 - **Survives TrueNAS updates** — an opt-in PREINIT script (registered in the middleware database, which updates don't touch) restores the driver after an update wipes `/usr`; it refuses to restore when the update also changed the kernel, telling you to rebuild instead of silently loading modules that can't work
 - **Stock-driver rescue image** — every build also emits `nvidia.raw.stock`, the driver that TrueNAS release shipped, so `--uninstall` gets you back to factory even with no backups left
 - **Bring your own installer** — `--run-url` / `--custom-run` build from an arbitrary `.run` (betas, archived versions, self-patched installers)
@@ -190,7 +191,8 @@ chmod +x deploy-nvidia.sh
    3) rollback    Roll back to a previous image
    4) uninstall   Restore the driver TrueNAS shipped with
    5) persist     Survive TrueNAS updates (off)
-   6) quit        Exit
+   6) uvm         Load nvidia_uvm at boot for CUDA (off)
+   7) quit        Exit
 ```
 
 …or name the image directly, exactly as before:
@@ -213,6 +215,7 @@ The deploy script handles everything:
 - Verifies the extension is actually **activated** — `/usr/share/truenas/sysext-extensions/` is only a storage location, not a `systemd-sysext` search path; activation is a symlink in `/etc/extensions` (persistent) or `/run/extensions` (tmpfs). TrueNAS middleware manages that symlink; if none exists, the script creates a transient one in `/run/extensions` and tells you to enable NVIDIA support properly
 - Refreshes the dynamic linker cache (`ldconfig`) so the newly merged `libnvidia-*.so` / `libcuda.so` are resolvable
 - Unloads the old driver's kernel modules (`nvidia_drm` → `nvidia_modeset` → `nvidia_uvm` → `nvidia`) so `nvidia-smi` loads the new ones **without a reboot**. If a module is still in use (running container, VM passthrough), it says so and asks for a reboot instead
+- Recreates the CUDA device nodes (`nvidia-modprobe -u -c 0`). Nothing on TrueNAS does this by itself, so without it the swap would leave `/dev/nvidia-uvm` gone and every CUDA workload broken until the node happened to be recreated — see [CUDA / `/dev/nvidia-uvm`](#cuda-apps-fail-devnvidia-uvm-is-missing) below
 - If the merge fails, prints `systemd-sysext` compatibility diagnostics automatically
 - Restores the previous state on **any** failure — including `Ctrl-C` mid-run — via an `EXIT` trap, so `/usr` is never left writable and the Docker NVIDIA integration is never left disabled
 
@@ -238,6 +241,7 @@ The deploy script handles everything:
 ── Host ────────────────────────────────────────────────────
   kernel          6.14.2-production+truenas
   loaded modules  nvidia_drm nvidia
+  CUDA nodes      /dev/nvidia-uvm MISSING (nvidia_uvm not loaded)
   nvidia-smi      <no devices / driver not responding>
 
 ── Problems ────────────────────────────────────────────────
@@ -246,7 +250,7 @@ The deploy script handles everything:
 [WARN]  what a TrueNAS update does. Rebuild against 6.14.2-production+truenas and redeploy.
 ```
 
-It reads the driver version and target kernel out of the image itself (from the squashfs listing — nothing is extracted), reports the activation symlinks, `systemd-sysext status`, the middleware integration state and available backups, and **exits non-zero when it finds a problem** so it can be used in a health check.
+It reads the driver version and target kernel out of the image itself (from the squashfs listing — nothing is extracted), reports the activation symlinks, `systemd-sysext status`, the middleware integration state and available backups, and **exits non-zero when it finds a problem** so it can be used in a health check. A missing `/dev/nvidia-uvm` is reported with a note rather than counted as a problem — a box that only transcodes never needs it, so it must not flip the exit status of a health check.
 
 `--dry-run` prints every mutating command it would run — `[DRY] zfs set readonly=off …`, `[DRY] cp …`, `[DRY] systemd-sysext merge` — in the real order, with all the same guards, and touches nothing.
 
@@ -620,6 +624,26 @@ The sysext's `modules.dep` is overriding the system's module database. This was 
 ### A systemd unit shipped inside the sysext never starts
 
 Units merged from a sysext that rely on `[Install] WantedBy=multi-user.target` are silently skipped at boot on TrueNAS — no journal entry, no error. Start them explicitly (`systemctl start <unit>`) or from a PREINIT init/shutdown script instead of relying on `enable`.
+
+### CUDA apps fail, `/dev/nvidia-uvm` is missing
+
+Transcoding works, `nvidia-smi` works, but anything CUDA-based (PyTorch, whisper, ollama, …) fails — and `sudo nvidia-modprobe -u -c 0` fixes it until the next reboot.
+
+This is TrueNAS behavior, not something the custom driver causes. Middleware loads the driver at boot in `docker.configure_nvidia`:
+
+```python
+subprocess.run(['modprobe', '-a', 'nvidia', 'nvidia_drm', 'nvidia_modeset'], ...)
+```
+
+`nvidia_uvm` is deliberately not in that list — upstream expects the setuid `nvidia-modprobe` helper to be called on demand by the CUDA runtime, or by `nvidia-container-cli --load-kmods` when Docker starts a container with a GPU allocated. Neither the stock `nvidia.raw` nor this project's ships the Debian `71-nvidia.rules` udev rule that would otherwise create the node, so when nothing triggers that helper, `/dev/nvidia-uvm` never appears.
+
+Fix it for good:
+
+```bash
+./deploy-nvidia.sh --persist-uvm      # or the manager's "uvm" entry
+```
+
+That registers a POSTINIT command with middleware — the registration lives in the middleware database and calls a binary the driver image provides, so it survives TrueNAS updates and works with the stock driver too. `--unpersist-uvm` removes it again. The command is retried for half a minute at boot, because POSTINIT can start before middleware has merged the sysext; if it ever gives up it says so in `journalctl -t nvidia-uvm`.
 
 ### Docker warns "nvidia-container-runtime: no such file or directory"
 
