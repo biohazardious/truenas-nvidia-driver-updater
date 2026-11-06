@@ -108,6 +108,8 @@ kernel="$(grep -oP 'KERNEL=\K\S+' "$2" || echo 6.12.1-test)"
 driver="$(grep -oP 'DRIVER=\K\S+' "$2" || echo 595.1)"
 echo "squashfs-root/usr/lib/modules/${kernel}/video/nvidia.ko"
 echo "squashfs-root/usr/lib/x86_64-linux-gnu/libcuda.so.${driver}"
+# Real listings outrun the pipe buffer, so a reader that stops early kills this.
+seq 1 200000 | sed 's#^#squashfs-root/usr/share/filler/#'
 STUB
 
     cat > "${bin}/rmmod" <<'STUB'
@@ -119,7 +121,7 @@ STUB
 
     printf '#!/bin/bash\necho 0\n' > "${bin}/id"
     printf '#!/bin/bash\necho "ldconfig" >> "${SB}/events"\n' > "${bin}/ldconfig"
-    printf '#!/bin/bash\ncat "${SB}/modules"\n' > "${bin}/lsmod"
+    printf '#!/bin/bash\ncat "${SB}/modules"\nseq 1 200000 | sed "s/^/filler_/"\n' > "${bin}/lsmod"
     printf '#!/bin/bash\necho 6.12.1-test\n' > "${bin}/uname"
     printf '#!/bin/bash\nexit 0\n' > "${bin}/nvidia-modprobe"
     printf '#!/bin/bash\ncat "${SB}/smi" 2>/dev/null\n' > "${bin}/nvidia-smi"

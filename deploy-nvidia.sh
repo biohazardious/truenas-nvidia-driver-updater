@@ -332,10 +332,13 @@ restore_nvidia_integration() {
 unload_nvidia_modules() {
     # Dependency order: consumers first, core module last.
     local candidates=(nvidia_drm nvidia_modeset nvidia_uvm nvidia)
-    local loaded=() m
+    local loaded=() m module_names
+
+    # Not piped into grep -q directly, for the reason given at image_has_kernel.
+    module_names="$(lsmod 2>/dev/null | awk '{print $1}')"
 
     for m in "${candidates[@]}"; do
-        if lsmod 2>/dev/null | awk '{print $1}' | grep -qx "${m}"; then
+        if grep -qx "${m}" <<< "${module_names}"; then
             loaded+=("${m}")
         fi
     done
@@ -567,9 +570,13 @@ host_truenas_version() {
     printf '%s' "${version#"${version%%[0-9]*}"}"
 }
 
-# Whether an image ships modules for the given kernel.
+# Whether an image ships modules for the given kernel. The listing goes through a
+# variable because grep -q stops at the first match: piped, that kills unsquashfs
+# with SIGPIPE, and pipefail then reads the match as a failure.
 image_has_kernel() {
-    unsquashfs -l "$1" 2>/dev/null | grep -qF "usr/lib/modules/$2/"
+    local listing
+    listing="$(unsquashfs -l "$1" 2>/dev/null)" || return 1
+    grep -qF "usr/lib/modules/$2/" <<< "${listing}"
 }
 
 # Modules only load on the exact kernel they were built for. The image would

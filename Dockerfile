@@ -5,8 +5,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 # The entrypoint builds NVIDIA modules with the SAME GCC major the target kernel
 # was compiled with (entrypoint.sh: select_nvidia_build_cc) — a much newer GCC
 # breaks NVIDIA's conftest API detection (GCC 14 makes implicit-declaration a
-# hard error). Bookworm provides gcc-12; pull gcc-13 and gcc-14 from trixie so we
-# can match the common TrueNAS toolchains (e.g. 6.1/6.6 → gcc-12/13, 6.12 → gcc-14).
+# hard error). Bookworm provides gcc-12, which is what TrueNAS 24.10 to 25.10 use;
+# gcc-13 and gcc-14 come from trixie for newer toolchains. The base has to stay
+# bookworm: libvulkan1 is copied into the image, and trixie's needs glibc 2.38
+# while those TrueNAS releases have 2.36.
 RUN printf 'deb http://deb.debian.org/debian trixie main\n' > /etc/apt/sources.list.d/trixie.list \
     && printf 'Package: *\nPin: release n=trixie\nPin-Priority: 50\n' > /etc/apt/preferences.d/trixie
 
