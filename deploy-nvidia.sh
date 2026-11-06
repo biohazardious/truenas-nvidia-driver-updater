@@ -7,6 +7,7 @@
 #         ./deploy-nvidia.sh --check                report the current state only
 #         ./deploy-nvidia.sh --dry-run <image>      show every step, change nothing
 #         ./deploy-nvidia.sh --uninstall            restore the stock driver
+#         ./deploy-nvidia.sh --force-kernel <image> deploy for another kernel
 #
 # Run with no arguments it offers a menu to inspect the current state, deploy
 # an image, or roll back to a previous one; the menu re-invokes this script to
@@ -18,10 +19,11 @@
 #   3. Unlocks the read-only /usr ZFS dataset
 #   4. Backs up the existing nvidia.raw alongside this script
 #   5. Copies the new nvidia.raw into place
-#   6. Re-locks /usr and merges extensions
-#   7. Re-enables the Docker NVIDIA integration
-#   8. Verifies the activation symlink and refreshes the linker cache
-#   9. Unloads the running NVIDIA kernel modules so the new ones can load
+#   6. Re-locks /usr, makes sure the activation symlink exists, merges, checks
+#      that the image really merged, and refreshes the linker cache
+#   7. Unloads the running NVIDIA kernel modules while Docker is still down
+#   8. Re-enables the Docker NVIDIA integration, which loads the new modules
+#   9. Recreates the CUDA device nodes
 #
 # On any failure — including Ctrl-C mid-way — the EXIT trap restores the
 # previous nvidia.raw, re-locks /usr, re-merges, and turns the Docker NVIDIA
@@ -51,6 +53,8 @@ USR_DATASET=""          # set once /usr has been unlocked; empty = never touched
 BACKUP=""               # previous nvidia.raw, empty on a fresh install
 UNMERGED=0              # 1 once sysext extensions have been unmerged
 ROLLED_BACK=0           # 1 once a rollback has already run (don't repeat it)
+ACTIVATION_LINK=""      # activation symlink this run created; empty = none
+IMAGE_REPLACED=0        # 1 once the installed nvidia.raw has been touched
 NVIDIA_INTEGRATION_OFF=0  # 1 while TrueNAS's Docker NVIDIA support is disabled
 REBOOT_REQUIRED=0       # 1 when old modules could not be unloaded
 DEPLOY_COMPLETE=0       # 1 once everything succeeded
@@ -58,6 +62,7 @@ DEPLOY_COMPLETE=0       # 1 once everything succeeded
 # ── Modes ───────────────────────────────────────────────────────────────────
 DRY_RUN=0               # 1 = log every mutating command instead of running it
 CHECK_ONLY=0            # 1 = report the current state and exit
+FORCE_KERNEL=0          # 1 = deploy an image built for another kernel anyway
 UNINSTALL=0             # 1 = deploy the stock image instead of a given one
 PERSIST_ACTION=""       # "on"/"off" = set up / remove update-persistence
 UVM_ACTION=""           # "on"/"off" = register / remove the boot-time uvm load
@@ -70,6 +75,7 @@ Usage:
   $0                         Interactive manager (menu)
   $0 <path-to-nvidia.raw>    Deploy the image
   $0 --dry-run <image>       Walk the whole flow, change nothing
+  $0 --force-kernel <image>  Deploy an image built for another kernel
   $0 --check                 Report the current driver/sysext state and exit
   $0 --uninstall             Restore the driver this TrueNAS release shipped
   $0 --persist               Keep the driver across TrueNAS updates (PREINIT)
@@ -385,10 +391,14 @@ restore_uvm_device_nodes() {
 
 # /usr/share/truenas/sysext-extensions/ is only a storage location — it is NOT
 # a systemd-sysext search path. An extension is activated by a symlink in
-# /etc/extensions (persistent dataset) or /run/extensions (tmpfs). TrueNAS's
-# middleware creates that symlink for its own nvidia.raw, so replacing the file
-# in place is normally enough — but if NVIDIA support has never been enabled,
-# the image would sit there merged into nothing.
+# /etc/extensions (persistent dataset) or /run/extensions (tmpfs).
+#
+# TrueNAS's middleware owns /run/extensions/nvidia.raw, and turning the Docker
+# NVIDIA integration off in Step 1 removes it. Without a link, the merge finds
+# nothing, says "No extensions found" and still exits 0, so the new image would
+# not be tested until after the point of no return. Put the link back first, at
+# the path middleware uses: when the integration comes back on it sees the link
+# and leaves the merged image alone.
 ensure_extension_activated() {
     local dir
     for dir in /etc/extensions /run/extensions; do
@@ -398,17 +408,22 @@ ensure_extension_activated() {
         fi
     done
 
-    warn "nvidia.raw is installed but not activated — no symlink in /etc/extensions or /run/extensions"
-    info "Creating a transient activation symlink in /run/extensions …"
+    info "Creating the activation symlink in /run/extensions …"
+    run_cmd mkdir -p /run/extensions
+    run_cmd ln -sf "${NVIDIA_RAW}" /run/extensions/nvidia.raw
+    ACTIVATION_LINK=/run/extensions/nvidia.raw
 
-    if run_cmd mkdir -p /run/extensions && run_cmd ln -sf "${NVIDIA_RAW}" /run/extensions/nvidia.raw; then
-        run_cmd systemd-sysext refresh || warn "systemd-sysext refresh failed"
-        ok "Extension activated for this boot"
+    if [[ ${NVIDIA_INTEGRATION_OFF} -eq 0 ]]; then
         warn "/run is a tmpfs — this symlink is gone after a reboot. Enable NVIDIA support"
         warn "in the TrueNAS UI (Apps → Settings) so middleware manages the symlink persistently."
-    else
-        warn "Could not create /run/extensions/nvidia.raw — the driver will not be active"
     fi
+}
+
+# `systemd-sysext merge` exits 0 even when it merged nothing, so its exit status
+# alone proves nothing. Every sysext must ship this file, and it only appears
+# under /usr while the image is merged.
+extension_is_merged() {
+    [[ ${DRY_RUN} -eq 1 ]] || [[ -e /usr/lib/extension-release.d/extension-release.nvidia ]]
 }
 
 # Merging a sysext adds new shared libraries (libnvidia-*.so, libcuda.so …) to
@@ -466,12 +481,19 @@ rollback_to_previous_state() {
 
     ROLLED_BACK=1
 
+    # A second Ctrl-C here would leave /usr writable and the extensions unmerged.
+    trap '' INT TERM
+
     echo ""
     warn "Rolling back to the previous working state …"
 
     run_cmd systemd-sysext unmerge 2>/dev/null || true
 
-    if run_cmd run_cmd zfs set readonly=off "${USR_DATASET}" 2>/dev/null; then
+    # Before the copy starts the installed image is still the good one, and the
+    # backup may be missing or half-written, so there is nothing to put back.
+    if [[ ${IMAGE_REPLACED} -eq 0 ]]; then
+        info "The installed nvidia.raw was not changed — nothing to restore"
+    elif run_cmd run_cmd zfs set readonly=off "${USR_DATASET}" 2>/dev/null; then
         if [[ -n "${backup}" ]] && [[ -f "${backup}" ]]; then
             info "Restoring previous nvidia.raw from $(basename "${backup}")"
             if run_cmd cp "${backup}" "${NVIDIA_RAW}" && run_cmd chmod 644 "${NVIDIA_RAW}"; then
@@ -491,6 +513,13 @@ rollback_to_previous_state() {
 
     run_cmd run_cmd zfs set readonly=on "${USR_DATASET}" 2>/dev/null \
         || { warn "Failed to re-lock ${USR_DATASET}"; failed=1; }
+
+    # Middleware recreates its own link when the integration is restored, so a
+    # link this run added only has to go, or it would outlive the rollback.
+    if [[ -n "${ACTIVATION_LINK}" ]]; then
+        run_cmd rm -f "${ACTIVATION_LINK}" || { warn "Could not remove ${ACTIVATION_LINK}"; failed=1; }
+        ACTIVATION_LINK=""
+    fi
 
     run_cmd systemd-sysext merge || { warn "Rollback merge failed"; failed=1; }
 
@@ -520,6 +549,52 @@ image_target_kernel() {
         | grep -m1 -oP 'usr/lib/modules/\K[^/]+' || true
 }
 
+# TrueNAS only ships the driver as a sysext from 24.10 on; before that it is
+# ordinary packages, with no nvidia.raw for this project to replace.
+truenas_version_supported() {
+    local major="${1%%.*}" rest="${1#*.}"
+    local minor="${rest%%.*}"
+    [[ "${major}" =~ ^[0-9]+$ ]] && [[ "${minor}" =~ ^[0-9]+$ ]] || return 1
+    (( 10#${major} * 100 + 10#${minor} >= 2410 ))
+}
+
+# The version this host runs, without a product prefix. Empty when it can't be read.
+host_truenas_version() {
+    local version=""
+    version="$(cat /etc/version 2>/dev/null || true)"
+    [[ -n "${version}" ]] || version="$(midclt call system.version 2>/dev/null || true)"
+    version="$(tr -d '"[:space:]' <<< "${version}")"
+    printf '%s' "${version#"${version%%[0-9]*}"}"
+}
+
+# Whether an image ships modules for the given kernel.
+image_has_kernel() {
+    unsquashfs -l "$1" 2>/dev/null | grep -qF "usr/lib/modules/$2/"
+}
+
+# Modules only load on the exact kernel they were built for. The image would
+# merge cleanly and nvidia-smi would just stop working, which is easy to walk
+# into when rolling back to a backup taken before a TrueNAS update.
+check_image_kernel() {
+    local host_kernel target_kernel
+    host_kernel="$(uname -r)"
+    target_kernel="$(image_target_kernel "${NEW_RAW}")"
+
+    if [[ -z "${target_kernel}" ]]; then
+        warn "Could not read which kernel ${NEW_RAW} was built for — skipping the kernel check"
+        return 0
+    fi
+    image_has_kernel "${NEW_RAW}" "${host_kernel}" && return 0
+
+    if [[ ${FORCE_KERNEL} -eq 1 ]]; then
+        warn "Deploying an image built for ${target_kernel} on ${host_kernel} — its modules will not load"
+        return 0
+    fi
+    die "This image was built for kernel ${target_kernel}, but this host runs ${host_kernel}.
+Its modules would not load. Rebuild for this TrueNAS version, or pass --force-kernel
+if you really want to install it."
+}
+
 # The driver version an image ships, taken from the versioned library name.
 image_driver_version() {
     local raw="$1"
@@ -532,14 +607,15 @@ report_state() {
     local problems=0
     local host_kernel; host_kernel="$(uname -r)"
 
+    local img_driver="" img_kernel=""
+
     echo ""
     echo -e "${BOLD}── Installed image ─────────────────────────────────────────${NC}"
     if [[ -f "${NVIDIA_RAW}" ]]; then
         echo "  path            ${NVIDIA_RAW}"
-        echo "  size            $(du -h "${NVIDIA_RAW}" 2>/dev/null | cut -f1)"
+        echo "  size            $(human_size "${NVIDIA_RAW}")"
         echo "  modified        $(date -r "${NVIDIA_RAW}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)"
 
-        local img_driver img_kernel
         img_driver="$(image_driver_version "${NVIDIA_RAW}")"
         img_kernel="$(image_target_kernel "${NVIDIA_RAW}")"
         echo "  driver version  ${img_driver:-<could not read>}"
@@ -559,9 +635,30 @@ report_state() {
     echo -e "${BOLD}── Host ────────────────────────────────────────────────────${NC}"
     echo "  kernel          ${host_kernel}"
 
+    local host_version
+    host_version="$(host_truenas_version)"
+    echo "  TrueNAS         ${host_version:-<could not read>}"
+    if [[ -n "${host_version}" ]] && ! truenas_version_supported "${host_version}"; then
+        problems=$((problems + 1))
+        UNSUPPORTED_HOST="${host_version}"
+    fi
+
     local loaded
     loaded="$(lsmod 2>/dev/null | awk '{print $1}' | grep -E '^nvidia' | tr '\n' ' ' || true)"
     echo "  loaded modules  ${loaded:-<none>}"
+
+    # The old module stays in memory when it could not be unloaded, until the
+    # next reboot. That clears by itself, unless the kernel changed too: then
+    # the image has no modules to load and only a rebuild helps.
+    local loaded_driver
+    loaded_driver="$(cat /sys/module/nvidia/version 2>/dev/null || true)"
+    if [[ -n "${loaded_driver}" ]]; then
+        echo "  loaded driver   ${loaded_driver}"
+        if [[ -n "${img_driver}" ]] && [[ "${img_driver}" != "${loaded_driver}" ]] \
+                && [[ -z "${IMAGE_KERNEL_MISMATCH:-}" ]]; then
+            REBOOT_PENDING=1
+        fi
+    fi
 
     # /dev/nvidia-uvm is the node CUDA opens, and nothing on TrueNAS creates it
     # at boot (see restore_uvm_device_nodes). Its absence is invisible until an
@@ -576,8 +673,10 @@ report_state() {
     if command -v nvidia-smi >/dev/null 2>&1; then
         local smi
         smi="$(nvidia-smi --query-gpu=driver_version,name --format=csv,noheader 2>/dev/null | head -2 | tr '\n' ';' || true)"
+        # nvidia-smi prints its errors on stdout too, so only a version counts.
+        [[ "${smi}" =~ ^[0-9]+\.[0-9] ]] || smi=""
         echo "  nvidia-smi      ${smi:-<no devices / driver not responding>}"
-        [[ -z "${smi}" ]] && problems=$((problems + 1))
+        [[ -z "${smi}" ]] && [[ -z "${REBOOT_PENDING:-}" ]] && problems=$((problems + 1))
     else
         echo "  nvidia-smi      <not present>"
     fi
@@ -622,7 +721,7 @@ report_state() {
         if [[ -f "${saved}" ]]; then
             local saved_kernel
             saved_kernel="$(image_target_kernel "${saved}")"
-            echo "  saved copy:      ${saved} ($(du -h "${saved}" 2>/dev/null | cut -f1))"
+            echo "  saved copy:      ${saved} ($(human_size "${saved}"))"
             echo "  saved built for: ${saved_kernel:-<could not read>}"
             if [[ -n "${saved_kernel}" ]] && [[ "${saved_kernel}" != "${host_kernel}" ]]; then
                 problems=$((problems + 1))
@@ -650,7 +749,7 @@ report_state() {
         list="$(ls -1 "${BACKUP_DIR}"/nvidia.raw.backup_* 2>/dev/null | sort -r || true)"
         if [[ -n "${list}" ]]; then
             echo "${list}" | while read -r b; do
-                echo "  $(basename "${b}")  ($(du -h "${b}" 2>/dev/null | cut -f1))"
+                echo "  $(basename "${b}")  ($(human_size "${b}"))"
             done
         else
             echo "  none in ${BACKUP_DIR}"
@@ -669,6 +768,13 @@ report_state() {
         echo    "        On every boot:  $0 --persist-uvm"
     fi
 
+    # Not counted as a problem either: it goes away with the reboot.
+    if [[ -n "${REBOOT_PENDING:-}" ]]; then
+        echo ""
+        echo -e "${YELLOW}  Note:${NC} Reboot pending. The image ships driver ${img_driver}, but the loaded"
+        echo    "        kernel module is still ${loaded_driver}. nvidia-smi can fail until the reboot."
+    fi
+
     echo ""
     if [[ ${problems} -eq 0 ]]; then
         echo -e "${GREEN}${BOLD}  ✓ No problems detected${NC}"
@@ -677,6 +783,8 @@ report_state() {
     fi
 
     echo -e "${YELLOW}${BOLD}── Problems ────────────────────────────────────────────────${NC}"
+    [[ -n "${UNSUPPORTED_HOST:-}" ]] && \
+        warn "TrueNAS ${UNSUPPORTED_HOST} is not supported. The minimum is 24.10."
     [[ -n "${NO_IMAGE:-}" ]] && \
         warn "No nvidia.raw installed — TrueNAS is running its stock driver (or none)."
     if [[ -n "${IMAGE_KERNEL_MISMATCH:-}" ]]; then
@@ -715,6 +823,9 @@ cleanup() {
         exit "${rc}"
     fi
 
+    # Whatever got us here, the restore below has to run to the end.
+    trap '' INT TERM
+
     echo ""
     warn "Deployment did not complete (exit code ${rc}) — restoring previous state …"
 
@@ -740,7 +851,9 @@ cleanup() {
 # deployment is duplicated here.
 # =============================================================================
 
-human_size() { du -h "$1" 2>/dev/null | cut -f1; }
+# File length, not du: on ZFS du counts allocated blocks, which lag far behind a
+# file that was just written.
+human_size() { stat -c%s "$1" 2>/dev/null | LC_ALL=C numfmt --to=si --round=nearest --suffix=B; }
 
 # The driver the running TrueNAS release originally shipped. The build writes it
 # next to each built image as nvidia.raw.stock, so restoring the factory driver
@@ -860,11 +973,17 @@ action_rollback() {
     fi
 
     local -a menu=()
-    local b stamp
+    local b stamp target note host_kernel
+    host_kernel="$(uname -r)"
     for b in "${backups[@]}"; do
         # nvidia.raw.backup_20260724_160428 → 2026-07-24 16:04:28
         stamp="$(basename "${b}" | sed -E 's/^nvidia\.raw\.backup_([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})$/\1-\2-\3 \4:\5:\6/')"
-        menu+=("${b}" "${stamp} · $(human_size "${b}")")
+        target="$(image_target_kernel "${b}")"
+        note=""
+        if [[ -n "${target}" ]] && [[ "${target}" != "${host_kernel}" ]]; then
+            note=" · built for ${target}, will not load here"
+        fi
+        menu+=("${b}" "${stamp} · $(human_size "${b}")${note}")
     done
 
     local choice=""
@@ -1344,6 +1463,7 @@ while [[ $# -gt 0 ]]; do
         --persist-uvm)   UVM_ACTION="on"; shift ;;
         --unpersist-uvm) UVM_ACTION="off"; shift ;;
         --dry-run)      DRY_RUN=1; shift ;;
+        --force-kernel) FORCE_KERNEL=1; shift ;;
         --no-whiptail)  FORCE_BASH=true; shift ;;
         -*)             die "Unknown option: $1 (see --help)" ;;
         *)
@@ -1366,6 +1486,13 @@ if [[ ${CHECK_ONLY} -eq 1 ]]; then
     [[ $(id -u) -eq 0 ]] || warn "Not running as root — some values may be unavailable"
     report_state
     exit $?
+fi
+
+# Everything below changes the system, so it needs a release this project supports.
+HOST_VERSION="$(host_truenas_version)"
+if [[ -n "${HOST_VERSION}" ]] && ! truenas_version_supported "${HOST_VERSION}"; then
+    die "TrueNAS ${HOST_VERSION} is not supported. The minimum is 24.10: older releases ship the
+driver as ordinary packages, so there is no nvidia.raw to replace."
 fi
 
 # Persistence setup mutates nothing about the installed driver, so it runs on
@@ -1416,6 +1543,7 @@ fi
 [[ -n "${NEW_RAW}" ]] || { usage >&2; die "--dry-run needs an image path"; }
 [[ $(id -u) -eq 0 ]] || die "This script must be run as root."
 [[ -f "${NEW_RAW}" ]] || die "File not found: ${NEW_RAW}"
+check_image_kernel
 
 if [[ ${DRY_RUN} -eq 1 ]]; then
     echo ""
@@ -1472,7 +1600,7 @@ if [[ -f "${NVIDIA_RAW}" ]]; then
     if [[ ${DRY_RUN} -eq 1 ]]; then
         ok "Backup would be saved: ${BACKUP}"
     else
-        ok "Backup saved: ${BACKUP} ($(du -h "${BACKUP}" | cut -f1))"
+        ok "Backup saved: ${BACKUP} ($(human_size "${BACKUP}"))"
     fi
 
     # Keep only the 5 most recent backups
@@ -1492,6 +1620,7 @@ fi
 
 # ── Step 5: Copy new nvidia.raw ────────────────────────────────────────────
 info "Installing new nvidia.raw …"
+IMAGE_REPLACED=1
 run_cmd cp "${NEW_RAW}" "${NVIDIA_RAW}"
 run_cmd chmod 644 "${NVIDIA_RAW}"
 if [[ ${DRY_RUN} -eq 1 ]]; then
@@ -1505,32 +1634,36 @@ info "Locking ZFS dataset: ${USR_DATASET}"
 run_cmd zfs set readonly=on "${USR_DATASET}"
 ok "Dataset locked (readonly=on)"
 
+ensure_extension_activated
+
 info "Merging sysext extensions …"
-if ! run_cmd systemd-sysext merge; then
+if ! run_cmd systemd-sysext merge || ! extension_is_merged; then
     print_sysext_diagnostics "${NVIDIA_RAW}"
     rollback_to_previous_state "${BACKUP}"
-    die "systemd-sysext merge failed — the new nvidia.raw was rejected. The previous state has been restored; see diagnostics above."
+    die "The new nvidia.raw did not merge. The previous state has been restored; see diagnostics above."
 fi
 ok "Extensions merged"
+
+# Middleware skips its own ldconfig when the link already exists, and Docker
+# starts in the next step, so the new libraries have to be visible by now.
+refresh_linker_cache
 
 # The image is in place, so /usr is consistent again — from here on a failure
 # must not roll the new driver back out.
 USR_DATASET=""
 UNMERGED=0
 
-# ── Step 7: Re-enable TrueNAS's Docker NVIDIA integration ───────────────────
-# Done before the activation check: middleware recreates its own /etc/extensions
-# symlink here, so only a genuinely unmanaged system needs the /run fallback.
-restore_nvidia_integration
-
-# ── Step 8: Make sure the extension is activated and its libraries visible ──
-ensure_extension_activated
-refresh_linker_cache
-
-# ── Step 9: Unload the old driver's kernel modules ──────────────────────────
+# ── Step 7: Unload the old driver's kernel modules ──────────────────────────
+# Docker is still down, so no container holds them. Bringing it back with the
+# old module loaded pairs it with the new libraries, which can stop Apps from
+# starting at all.
 unload_nvidia_modules
 
-# ── Step 10: Recreate the CUDA device nodes ─────────────────────────────────
+# ── Step 8: Re-enable TrueNAS's Docker NVIDIA integration ───────────────────
+# Middleware's modprobe here is what loads the new modules.
+restore_nvidia_integration
+
+# ── Step 9: Recreate the CUDA device nodes ──────────────────────────────────
 restore_uvm_device_nodes
 
 DEPLOY_COMPLETE=1
@@ -1558,7 +1691,7 @@ BACKUP_LIST=$(ls -1 "${BACKUP_DIR}"/nvidia.raw.backup_* 2>/dev/null | sort -r ||
 if [[ -n "${BACKUP_LIST}" ]]; then
     echo -e "  ${BOLD}Available rollback backups:${NC}"
     echo "${BACKUP_LIST}" | while read -r b; do
-        SIZE=$(du -h "${b}" | cut -f1)
+        SIZE=$(human_size "${b}")
         echo -e "    $(basename "${b}")  (${SIZE})"
     done
     echo ""

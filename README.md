@@ -1,16 +1,18 @@
 # TrueNAS NVIDIA Driver Updater
 
-Build and deploy **any** NVIDIA driver as a `systemd-sysext` image (`nvidia.raw`) for **TrueNAS 23/24/25/26** — fully automated via Docker.
+Build and deploy **any** NVIDIA driver as a `systemd-sysext` image (`nvidia.raw`) for **TrueNAS 24.10 and newer** — fully automated via Docker.
 
 TrueNAS ships with a specific NVIDIA driver version baked into its immutable root filesystem. This tool lets you compile and package a different driver version (newer or older) without modifying the base OS, using the `systemd-sysext` overlay mechanism that TrueNAS natively supports.
 
-> **Current landscape (August 2026)** — examples throughout this README use the versions that are current today. Nothing is hardcoded: `configure.sh` fetches the live TrueNAS and NVIDIA version lists every run, so newer releases show up on their own.
+> **Current landscape (November 2026)** — examples throughout this README use the versions that are current today. Nothing is hardcoded: `configure.sh` fetches the live TrueNAS and NVIDIA version lists every run, so newer releases show up on their own.
 >
 > | | Version | Notes |
 > |---|---|---|
-> | TrueNAS | **25.10.6** (Goldeye) | kernel 6.12; 26.x update URLs supported too |
-> | NVIDIA — New Feature Branch | **610.57.04** | newest, Turing and newer |
-> | NVIDIA — Production Branch | **595.91.07** | the safe default for most users |
+> | TrueNAS | **25.10.8** (Goldeye) | kernel 6.12.113 |
+> | TrueNAS pre-release | **27.0.0-RC.1** | kernel 6.18.52; 26 was renamed 27 at RC.1. Downloads work, building against it is untested |
+> | NVIDIA — New Feature Branch | **620.70.06** | newest, Turing and newer |
+> | NVIDIA — Production Branch | **595.112.07** | the safe default for most users |
+> | NVIDIA — Maxwell to Volta | **580.196.07** | last branch for these cards |
 > | NVIDIA — Legacy | **470.256.02** | Kepler only; needs [patches](#building-eol-drivers-on-newer-kernels-patches) on kernel 6.10+ |
 
 ---
@@ -20,14 +22,17 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 - **Interactive wizard** — `configure.sh` fetches real version lists with smart tagging (★ Latest Stable, ★ Production Branch, etc.) and guides you through setup. Uses whiptail TUI dialogs when available (TrueNAS has it), with bash `select` menus as fallback
 - **GPU-aware driver recommendation** — detects the GPU architecture from the chip codename and points Kepler/Maxwell/Pascal/Volta owners at the last branch that still supports their card, warning before a build that would install cleanly and then not drive the GPU
 - **Fully automated** — downloads TrueNAS update file, extracts kernel headers, compiles the driver, packages everything
-- **TrueNAS 23/24/25/26 aware** — supports 23.x, 24.x, 25.x codename-based downloads and TrueNAS 26 update URLs
+- **TrueNAS 24.10 and newer** — supports 24.10 and 25.x codename-based downloads and the BETA and RC update URLs of TrueNAS 26 and later (26 was renamed 27 at RC.1). A 27 stable release has no known URL yet, so supply `truenas.update` yourself; building against 27 has not been tested
+- **Verified downloads** — the TrueNAS update and NVIDIA installer are checked against the SHA256 published next to them, including cached copies. A mismatch stops the build and deletes the file
+- **Build logs that outlive the container** — each build leaves its console output and `nvidia-installer` log in `./output/logs/`, on failure as well as success (newest 3 of each are kept)
 - **Production-kernel aware** — correctly selects the production kernel over debug variants
 - **Complete module database** — ships a combined `modules.dep` covering all system + NVIDIA modules (no `depmod -a` needed on read-only target)
 - **nvidia-container-toolkit included** — Docker GPU passthrough works out of the box
 - **Optional update repack** — can also emit a rebuilt `truenas.update` with the new `nvidia.raw` embedded
 - **Before/after filesystem diff** — captures 100% of NVIDIA installer output, no fragile glob patterns
-- **Backup & rollback** — deployment script preserves previous images with timestamps and restores them on any failure (including `Ctrl-C`)
-- **Reboot-free driver swap** — deploy script pauses TrueNAS's Docker NVIDIA integration and unloads the old kernel modules, so the new driver is live as soon as `nvidia-smi` runs
+- **Backup & rollback** — deployment script preserves previous images with timestamps and restores them on any failure, including `Ctrl-C`. A second `Ctrl-C` can't interrupt the restore
+- **Reboot-free driver swap** — deploy script pauses TrueNAS's Docker NVIDIA integration and unloads the old kernel modules while Docker is down, so the new driver is live without a reboot
+- **Deploy checks that mean something** — refuses an image built for a different kernel, and confirms the image really merged instead of trusting `systemd-sysext merge`, which exits 0 even when it merged nothing
 - **Auto sysext diagnostics** — deployment script prints host/image metadata when `systemd-sysext merge` rejects the image
 - **Interactive deploy manager** — `deploy-nvidia.sh` with no arguments opens a menu to inspect state, deploy a built image, roll back, restore the stock driver, make the driver survive TrueNAS updates, or keep CUDA working across reboots
 - **CUDA actually works after a reboot** — TrueNAS loads `nvidia`, `nvidia_drm` and `nvidia_modeset` at boot but never `nvidia_uvm`, so `/dev/nvidia-uvm` is missing and every CUDA workload fails until something creates it. The deploy script puts the node back after a swap, `--check` reports when it's absent, and `--persist-uvm` registers a boot-time entry that fixes it for good
@@ -35,7 +40,7 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 - **Stock-driver rescue image** — every build also emits `nvidia.raw.stock`, the driver that TrueNAS release shipped, so `--uninstall` gets you back to factory even with no backups left
 - **Bring your own installer** — `--run-url` / `--custom-run` build from an arbitrary `.run` (betas, archived versions, self-patched installers)
 - **End-to-end in one run** — when run on the TrueNAS box, `configure.sh` offers to start the build and then to deploy the result, so configure → build → deploy needs no manual handoff
-- **`--check` and `--dry-run`** — inspect what is installed (driver version, target kernel, activation, middleware state) or rehearse a deployment without touching anything
+- **`--check` and `--dry-run`** — inspect what is installed (driver version, target kernel, activation, middleware state, pending reboot) or rehearse a deployment without touching anything
 
 ## Quick Start
 
@@ -51,7 +56,7 @@ chmod +x configure.sh
 The wizard auto-detects your TrueNAS version and GPU, then walks you through 4 steps. Key versions are tagged so you don't need to look anything up:
 
 ```
-[OK]    Detected TrueNAS version: 25.10.6
+[OK]    Detected TrueNAS version: 25.10.8
 [OK]    Detected GPU: NVIDIA AD102 [GeForce RTX 4090] (rev a1)
 [OK]      Architecture: Ada — supported by current driver branches
 
@@ -59,10 +64,10 @@ The wizard auto-detects your TrueNAS version and GPU, then walks you through 4 s
 
   Step 2: Select NVIDIA Driver Version
    GPU: NVIDIA GeForce RTX 4090
-   1) 595.91.07  ★ Production Branch
-   2) 610.57.04  ★ New Feature Branch
+   1) 595.112.07  ★ Production Branch
+   2) 620.70.06  ★ New Feature Branch
    3) 470.256.02  ★ Legacy GPU (470.xx)
-   4) 595.80
+   4) 595.99.02
    ...
    95) 🔍 Filter versions          ← type to search (e.g. "595" or "production")
    96) ✎ Enter manually
@@ -84,8 +89,8 @@ After the last step, `.env` is generated — Docker Compose reads it automatical
 Skip the wizard entirely by passing CLI flags:
 
 ```bash
-./configure.sh --truenas 25.10.6 --nvidia 595.91.07
-./configure.sh --truenas 25.10.6 --nvidia 595.91.07 --module open --embed false
+./configure.sh --truenas 25.10.8 --nvidia 595.112.07
+./configure.sh --truenas 25.10.8 --nvidia 595.112.07 --module open --embed false
 ```
 
 | Flag | Default | Description |
@@ -94,6 +99,9 @@ Skip the wizard entirely by passing CLI flags:
 | `--nvidia VERSION` | (required) | NVIDIA driver version |
 | `--module TYPE` | `open` | `open` or `proprietary` |
 | `--embed true\|false` | `false` | Embed nvidia.raw in truenas.update |
+| `--patch MODE` | `auto` | Source-patch mode: `none`, `custom`, `predefined` or `auto` |
+| `--run-url URL` | | Build from a `.run` at this URL |
+| `--custom-run PATH` | | Build from a `.run` inside the project directory |
 </details>
 
 <details>
@@ -119,13 +127,15 @@ cp .env.example .env
 
 ```ini
 # .env
-NVIDIA_VERSION=595.91.07
-TRUENAS_VERSION=25.10.6
+NVIDIA_VERSION=595.112.07
+TRUENAS_VERSION=25.10.8
 NVIDIA_KERNEL_MODULE_TYPE=open
 TRUENAS_CODENAME=Goldeye
 NVIDIA_BUILD_CC=
 NVIDIA_INSTALL_DRM=true
 EMBED_NVIDIA_RAW_IN_UPDATE=false
+SKIP_KERNEL_COMPAT_CHECK=false
+NVIDIA_PATCH_MODE=auto
 ```
 
 `docker-compose.yaml` is a git-tracked template — it reads values from `.env` automatically. Never edit `docker-compose.yaml` directly.
@@ -140,21 +150,29 @@ docker compose run --rm nvidia-builder
 
 The build takes ~10-15 minutes (mostly kernel module compilation). By default artifacts are grouped under `./output/<TRUENAS_VERSION>/`.
 
-The large downloads — the TrueNAS update (~1.8 GB) and the NVIDIA `.run` (~300 MB) — are cached in `./cache/` (mounted at `/cache`) and reused across runs. Delete a file there to force a fresh download.
+Run `docker compose build` again after pulling changes: `entrypoint.sh` is copied into the image, so the container otherwise keeps running the old script.
+
+The large downloads — the TrueNAS update (~2 GB) and the NVIDIA `.run` (~300 MB) — are cached in `./cache/` (mounted at `/cache`) and reused across runs. Delete a file there to force a fresh download.
+
+Every download is checked against the SHA256 its server publishes, and so is a cached copy on the next run. On a mismatch the build deletes the file and stops; run it again to download a fresh copy. If the server publishes no checksum, which happens with some older NVIDIA releases, the build warns and continues. Files you supply yourself (`truenas.update`, `--custom-run`) are not checked.
+
+Each run also leaves two logs in `./output/logs/`, whether it worked or not: `build-<timestamp>.log` with the console output, and `nvidia-installer-<timestamp>.log`. The newest 3 of each are kept.
 
 If `EMBED_NVIDIA_RAW_IN_UPDATE=true`, the build will also unpack the source `truenas.update`, replace the bundled `/usr/share/truenas/sysext-extensions/nvidia.raw`, and write a new `.update` image to `./output/`.
 
 For each generated artifact, the script also writes a sibling `.sha256` file containing the raw SHA256 hash only:
 
 - `./output/<TRUENAS_VERSION>/nvidia.raw.sha256`
+- `./output/<TRUENAS_VERSION>/nvidia.raw.stock.sha256`
 - `./output/<TRUENAS_VERSION>/<official update filename>.sha256` (when repack is enabled)
 
 Output naming follows the TrueNAS version:
 
 | TrueNAS version | Output directory | Update filename |
 |---|---|---|
+| `27.0.0-RC.1` | `output/27.0.0-RC.1/` | `TrueNAS-27.0.0-RC.1.update` |
 | `26.0.0-BETA.1` | `output/26.0.0-BETA.1/` | `TrueNAS-26.0.0-BETA.1.update` |
-| `25.10.6` | `output/25.10.6/` | `TrueNAS-SCALE-25.10.6.update` |
+| `25.10.8` | `output/25.10.8/` | `TrueNAS-SCALE-25.10.8.update` |
 
 `NVIDIA_KERNEL_MODULE_TYPE` is passed through to the NVIDIA installer as `--kernel-module-type=<value>`.
 
@@ -195,37 +213,38 @@ chmod +x deploy-nvidia.sh
    7) quit        Exit
 ```
 
-…or name the image directly, exactly as before:
+…or name the image directly:
 
 ```bash
 ./deploy-nvidia.sh nvidia.raw
 ```
 
-The manager finds built images under `output/*/nvidia.raw` (newest TrueNAS release first) and lists rollback points from `backups/` with the timestamp each was taken. It uses the same whiptail TUI as `configure.sh` when available, with plain numbered menus as fallback (`--no-whiptail` forces those). Picking an image offers **Deploy** or **Dry run**, and deployment asks for confirmation first.
+The manager finds built images under `output/*/nvidia.raw` (newest TrueNAS release first) and lists rollback points from `backups/` with the timestamp each was taken, marking any built for a different kernel. It uses the same whiptail TUI as `configure.sh` when available, with plain numbered menus as fallback (`--no-whiptail` forces those). Picking an image offers **Deploy** or **Dry run**, and deployment asks for confirmation first.
 
 > The menu never deploys inline — it re-invokes this same script with the image you chose, so a menu-driven deployment runs the identical code path, EXIT trap and rollback as the command-line one.
 
 The deploy script handles everything:
+- Refuses an image built for a different kernel than the running one, because it would merge and then fail to load. `--force-kernel` overrides this
 - Turns off TrueNAS's own Docker NVIDIA integration for the duration of the swap (`midclt call -j docker.update '{"nvidia": false}'`) and turns it back on afterwards, so middleware never points at driver files that are being replaced
 - Unmerges active sysext extensions
 - Unlocks the read-only `/usr` ZFS dataset
 - Backs up the existing `nvidia.raw` (timestamped)
 - Installs the new image
-- Re-locks the dataset and merges extensions
-- Verifies the extension is actually **activated** — `/usr/share/truenas/sysext-extensions/` is only a storage location, not a `systemd-sysext` search path; activation is a symlink in `/etc/extensions` (persistent) or `/run/extensions` (tmpfs). TrueNAS middleware manages that symlink; if none exists, the script creates a transient one in `/run/extensions` and tells you to enable NVIDIA support properly
+- Re-locks the dataset and makes sure the extension is **activated** — `/usr/share/truenas/sysext-extensions/` is only a storage location, not a `systemd-sysext` search path; activation is a symlink in `/etc/extensions` (persistent) or `/run/extensions` (tmpfs). Turning the integration off removes TrueNAS's own link, so the script puts one back at the same path before merging. If the integration was already off, that link is transient and the script tells you to enable NVIDIA support properly
+- Merges extensions and confirms the image really merged, because `systemd-sysext merge` exits 0 even when it finds nothing. A rejected image is rolled back here, before the integration comes back
 - Refreshes the dynamic linker cache (`ldconfig`) so the newly merged `libnvidia-*.so` / `libcuda.so` are resolvable
-- Unloads the old driver's kernel modules (`nvidia_drm` → `nvidia_modeset` → `nvidia_uvm` → `nvidia`) so `nvidia-smi` loads the new ones **without a reboot**. If a module is still in use (running container, VM passthrough), it says so and asks for a reboot instead
+- Unloads the old driver's kernel modules while Docker is still down (`nvidia_drm` → `nvidia_modeset` → `nvidia_uvm` → `nvidia`) so `nvidia-smi` loads the new ones **without a reboot**. If a module is still in use (running container, VM passthrough), it says so and asks for a reboot instead
+- Re-enables TrueNAS's Docker NVIDIA integration, which loads the new modules. Doing this after the unload keeps Apps from starting on the old module with the new libraries, unless a module was too busy to unload
 - Recreates the CUDA device nodes (`nvidia-modprobe -u -c 0`). Nothing on TrueNAS does this by itself, so without it the swap would leave `/dev/nvidia-uvm` gone and every CUDA workload broken until the node happened to be recreated — see [CUDA / `/dev/nvidia-uvm`](#cuda-apps-fail-devnvidia-uvm-is-missing) below
 - If the merge fails, prints `systemd-sysext` compatibility diagnostics automatically
-- Restores the previous state on **any** failure — including `Ctrl-C` mid-run — via an `EXIT` trap, so `/usr` is never left writable and the Docker NVIDIA integration is never left disabled
-
-> Releases older than Electric Eel have no `docker.config` middleware namespace; the script detects that and skips the integration step instead of failing.
+- Restores the previous state on **any** failure — including `Ctrl-C` mid-run — via an `EXIT` trap, so `/usr` is never left writable and the Docker NVIDIA integration is never left disabled. Signals are ignored while the restore runs, so it always finishes
 
 #### Inspecting before (and after) deploying
 
 ```bash
 ./deploy-nvidia.sh --check              # read-only state report, no root needed
 ./deploy-nvidia.sh --dry-run nvidia.raw # walk the whole flow, change nothing
+./deploy-nvidia.sh --force-kernel nvidia.raw # deploy for another kernel anyway
 ```
 
 `--check` answers the two questions that fail silently — *is the installed image built for the kernel I'm running*, and *is it actually activated* — instead of leaving you to piece it together from `nvidia-smi` errors:
@@ -233,30 +252,34 @@ The deploy script handles everything:
 ```
 ── Installed image ─────────────────────────────────────────
   path            /usr/share/truenas/sysext-extensions/nvidia.raw
-  size            412M
-  modified        2026-07-24 17:22:16
-  driver version  595.91.07
-  built for       6.12.15-production+truenas
+  size            439MB
+  modified        2026-11-06 15:48:33
+  driver version  595.112.07
+  built for       6.12.113-production+truenas
 
 ── Host ────────────────────────────────────────────────────
-  kernel          6.14.2-production+truenas
-  loaded modules  nvidia_drm nvidia
+  kernel          6.18.52-production+truenas
+  TrueNAS         27.0.0-RC.1
+  loaded modules  <none>
   CUDA nodes      /dev/nvidia-uvm MISSING (nvidia_uvm not loaded)
   nvidia-smi      <no devices / driver not responding>
 
 ── Problems ────────────────────────────────────────────────
-[WARN]  The installed image was built for kernel 6.12.15-production+truenas,
-[WARN]  but this host runs 6.14.2-production+truenas. The modules will not load — this is
-[WARN]  what a TrueNAS update does. Rebuild against 6.14.2-production+truenas and redeploy.
+[WARN]  The installed image was built for kernel 6.12.113-production+truenas,
+[WARN]  but this host runs 6.18.52-production+truenas. The modules will not load — this is
+[WARN]  what a TrueNAS update does. Rebuild against 6.18.52-production+truenas and redeploy.
 ```
 
 It reads the driver version and target kernel out of the image itself (from the squashfs listing — nothing is extracted), reports the activation symlinks, `systemd-sysext status`, the middleware integration state and available backups, and **exits non-zero when it finds a problem** so it can be used in a health check. A missing `/dev/nvidia-uvm` is reported with a note rather than counted as a problem — a box that only transcodes never needs it, so it must not flip the exit status of a health check.
+
+A pending reboot gets a note too. If the loaded kernel module differs from the driver in the image, `--check` names both versions and doesn't count it as a problem, because it clears by itself. It stays quiet when the image was built for a different kernel, since a reboot wouldn't help there.
 
 `--dry-run` prints every mutating command it would run — `[DRY] zfs set readonly=off …`, `[DRY] cp …`, `[DRY] systemd-sysext merge` — in the real order, with all the same guards, and touches nothing.
 
 ### 4. Verify
 
 ```bash
+./deploy-nvidia.sh --check
 nvidia-smi
 modinfo nvidia_drm
 modprobe nvidia_drm modeset=1
@@ -269,14 +292,13 @@ ls -la /dev/dri
 
 | TrueNAS Version | Codename     |
 |------------------------|--------------|
+| 27.x (26 until RC.1)   | not used     |
 | 26.x                   | not used     |
 | 25.10.x                | Goldeye      |
 | 25.04.x                | Fangtooth    |
 | 24.10.x                | Electric Eel |
-| 24.04.x                | Dragonfish   |
-| 23.10.x                | Cobia        |
 
-> `TRUENAS_CODENAME` is only needed for 25.x and earlier download URLs. For TrueNAS 26+, leave it empty.
+> `TRUENAS_CODENAME` is only needed for 25.x and earlier download URLs. For TrueNAS 26+, leave it empty. BETA and RC builds of 26+ download automatically. A stable 27 release has no known URL yet, so put its update file in the project directory as `truenas.update`.
 
 ---
 
@@ -286,10 +308,10 @@ ls -la /dev/dri
 ┌─────────────────────────────────────────────────────────┐
 │                   Docker Build Container                │
 │                                                         │
-│  1. Load local truenas.update or download one           │
+│  1. Load local truenas.update or download and verify    │
 │  2. Extract nested rootfs → kernel headers + modules    │
 │  3. Detect the production kernel and matching headers   │
-│  4. Download the NVIDIA .run installer                  │
+│  4. Download and verify the NVIDIA .run installer       │
 │  5. Take a BEFORE snapshot of /usr and /etc             │
 │  6. Install toolkit deps + compile NVIDIA modules       │
 │  7. Take an AFTER snapshot and diff new files           │
@@ -300,6 +322,7 @@ ls -la /dev/dri
 │ 12. Optional: replace bundled nvidia.raw in             │
 │      truenas.update, rebuild MANIFEST, and emit         │
 │      a new .update plus .update.sha256                  │
+│ 13. Save the build and installer logs to output/logs/   │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -327,14 +350,19 @@ TrueNAS 25/26 uses an immutable root filesystem. `systemd-sysext` provides a sup
 | Rebuild `MANIFEST` checksums when repacking `truenas.update` | Replacing the bundled `nvidia.raw` changes `rootfs.squashfs`; the update manifest must be rewritten or TrueNAS rejects the repacked `.update` |
 | gzip compression | Matches TrueNAS's own squashfs convention for consistent image sizes |
 | Pause the Docker NVIDIA integration during deployment | TrueNAS middleware manages the NVIDIA container runtime itself; swapping `nvidia.raw` underneath it leaves the runtime configured against files that no longer exist. Disabling it for the swap and restoring it afterwards keeps middleware and the image in sync |
-| Unload the old kernel modules after merging | The previous driver stays resident in the kernel until unloaded, so `nvidia-smi` would keep reporting the old version (or a module/driver mismatch) until the next reboot |
-| `EXIT` trap around the whole deployment | The window between `zfs set readonly=off` and the final merge leaves `/usr` writable and the extensions unmerged. A trap guarantees that state is undone on error, `die`, or `Ctrl-C` — not only on a failed merge |
+| Unload the old kernel modules before Docker comes back | The previous driver stays resident in the kernel until unloaded, so `nvidia-smi` would keep reporting the old version (or a module/driver mismatch) until the next reboot. Doing it while Docker is down means no container holds the modules, and Apps don't start on the old module with the new libraries |
+| Recreate the activation link before merging | Turning the integration off removes `/run/extensions/nvidia.raw`. Without a link the merge finds nothing, so a bad image would only surface after the point where rollback is still possible. The link uses middleware's own path, so middleware leaves it alone when the integration comes back |
+| Confirm the merge through `extension-release.nvidia` | `systemd-sysext merge` exits 0 with "No extensions found", so its exit status proves nothing. This file has to be in every sysext and only appears under `/usr` while the image is merged |
+| Refuse an image built for another kernel | It merges without complaint and then the modules won't load, which is easy to walk into when restoring a backup taken before a TrueNAS update |
+| `EXIT` trap around the whole deployment | The window between `zfs set readonly=off` and the final merge leaves `/usr` writable and the extensions unmerged. A trap guarantees that state is undone on error, `die`, or `Ctrl-C` — not only on a failed merge. The rollback ignores further signals, and leaves the installed image alone if the copy never started |
+| Delete a download that fails its checksum | `wget -c` would otherwise treat the bad file as complete on every later run |
+| Report sizes with `stat`, not `du` | `du` counts allocated blocks, and on ZFS those lag far behind a file that was just written. A finished 439 MB image could show as `151M`, and a fresh copy as `512` |
 
 ### Driver-version flag support
 
 `nvidia-installer` rejects unknown options (aborting the whole build), and the option set has grown over time — so the same flag list does **not** work across all driver branches. The build handles this automatically by probing each installer for the options it actually supports and passing only those; the table below documents which flags are gated and when they appeared (verified against the [`NVIDIA/nvidia-installer`](https://github.com/NVIDIA/nvidia-installer) option tables).
 
-| Installer flag | First available | 470 | 535 LTS | 550 LTS | 555 | 560 – 610 |
+| Installer flag | First available | 470 | 535 LTS | 550 LTS | 555 | 560 – 620 |
 |----------------|-----------------|:---:|:------:|:------:|:---:|:---------:|
 | `--silent`, `--kernel-source-path`, `--kernel-name`, `--no-x-check`, `--no-nouveau-check`, `--no-systemd`, `--no-backup`, `--install-libglvnd`, `--no-drm` | always (≤470) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `--allow-installation-with-running-driver` | R545 | ❌ | ❌¹ | ✅ | ✅ | ✅ |
@@ -354,17 +382,17 @@ TrueNAS 25/26 uses an immutable root filesystem. `systemd-sysext` provides a sup
 
 ### Driver / kernel compatibility check
 
-Legacy/EOL NVIDIA branches only build against kernels up to a certain point — e.g. the stock **470 `.run` breaks at kernel 6.10** (when `follow_pfn` was removed). Built with the kernel's own GCC, it compiles cleanly through **6.9** (verified on TrueNAS 24.04/24.10, kernel 6.6), but TrueNAS 25.x (kernel 6.12) needs source patches. To avoid a ~10-minute build that's doomed to fail at the compile step, the builder checks the **real kernel version** (read from the downloaded TrueNAS image) against a small table of known branch ceilings **before** downloading or compiling:
+Legacy/EOL NVIDIA branches only build against kernels up to a certain point — e.g. the stock **470 `.run` breaks at kernel 6.10** (when `follow_pfn` was removed). Built with the kernel's own GCC, it compiles cleanly through **6.9** (verified on TrueNAS 24.10, kernel 6.6), but TrueNAS 25.x (kernel 6.12) needs source patches. To avoid a ~10-minute build that's doomed to fail at the compile step, the builder checks the **real kernel version** (read from the downloaded TrueNAS image) against a small table of known branch ceilings **before** downloading or compiling:
 
 | Branch | Builds against kernels up to | TrueNAS coverage |
 |--------|------------------------------|------------------|
 | `390`  | ~5.15 | none current |
-| `470`  | **6.9** | ✅ 23.10 / 24.04 / 24.10 (≤6.6); ❌ 25.x (6.12) — needs patches |
-| 535 / 550 / 580 / 595 / 610 | current kernels (no fixed ceiling) | all |
+| `470`  | **6.9** | ✅ 24.10 (6.6); ❌ 25.x (6.12) — needs patches |
+| 535 / 550 / 580 / 595 / 620 | current kernels (no fixed ceiling) | all |
 
 If the target kernel is newer than the branch supports, the build **aborts immediately** with an explanation. The interactive wizard also shows an early heads-up when you select a legacy branch. To build anyway, either supply [source patches](#building-eol-drivers-on-newer-kernels-patches) (which also relaxes this check) or set `SKIP_KERNEL_COMPAT_CHECK=true`.
 
-> **Kepler note:** if your GPU is *only* supported by the 470 branch (Kepler — GeForce 600/700 series), it works out of the box up to TrueNAS 24.10. For TrueNAS 25.x (kernel 6.12) you'll need community kernel patches (see below). Newer GPUs (Maxwell/Pascal/Turing/Ampere/Ada+) should use a current branch (580 for Maxwell–Volta, 595/610 for Turing and newer), which builds cleanly everywhere.
+> **Kepler note:** if your GPU is *only* supported by the 470 branch (Kepler — GeForce 600/700 series), it works out of the box up to TrueNAS 24.10. For TrueNAS 25.x (kernel 6.12) you'll need community kernel patches (see below). Newer GPUs (Maxwell/Pascal/Turing/Ampere/Ada+) should use a current branch (580 for Maxwell–Volta, 595/620 for Turing and newer), which builds cleanly everywhere.
 
 ### Does the driver actually support your GPU?
 
@@ -383,9 +411,9 @@ Newer cards have a floor too: Blackwell (RTX 50-series) needs 570.xx or newer, A
 [OK]    Detected GPU: NVIDIA GP102 [GeForce GTX 1080 Ti] (rev a1)
 [OK]      Architecture: Pascal — last supporting driver branch: 580.xx
 
-   1) 580.95.05  ★ Recommended for your Pascal GPU
-   2) 610.57.04  ★ New Feature Branch
-   3) 595.91.07  ★ Production Branch
+   1) 580.196.07  ★ Recommended for your Pascal GPU
+   2) 620.70.06  ★ New Feature Branch
+   3) 595.112.07  ★ Production Branch
 ```
 
 **More than one GPU?** Every NVIDIA card is read, not just the first, and the wizard works out the branch window that serves *all* of them — the lowest ceiling and the highest floor:
@@ -425,7 +453,7 @@ When a legacy driver needs source fixes to build on a newer kernel (e.g. 470 on 
 **Easiest path — predefined (NVIDIA 470 on TrueNAS 25.x):** run `./configure.sh`, pick the 470 driver and a 25.x TrueNAS version, and when prompted choose **"Download curated community patches."** It downloads the curated set into `predefined-patches/470/` and sets `NVIDIA_PATCH_MODE=predefined`. Non-interactively:
 
 ```bash
-./configure.sh --truenas 25.10.6 --nvidia 470.256.02 --patch predefined
+./configure.sh --truenas 25.10.8 --nvidia 470.256.02 --patch predefined
 docker compose run --rm nvidia-builder
 ```
 
@@ -468,24 +496,24 @@ The build normally downloads the official installer for `NVIDIA_VERSION`. Two ov
 
 ```bash
 # Fetch from an arbitrary URL
-./configure.sh --truenas 25.10.6 --nvidia 611.10 \
-    --run-url https://developer.nvidia.com/.../NVIDIA-Linux-x86_64-611.10.run
+./configure.sh --truenas 25.10.8 --nvidia 621.10 \
+    --run-url https://developer.nvidia.com/.../NVIDIA-Linux-x86_64-621.10.run
 
 # Or use a .run you already have (must sit inside the project directory,
 # because that is what gets mounted into the build container)
-cp ~/Downloads/NVIDIA-Linux-x86_64-611.10.run .
-./configure.sh --truenas 25.10.6 --nvidia 611.10 --custom-run ./NVIDIA-Linux-x86_64-611.10.run
+cp ~/Downloads/NVIDIA-Linux-x86_64-621.10.run .
+./configure.sh --truenas 25.10.8 --nvidia 621.10 --custom-run ./NVIDIA-Linux-x86_64-621.10.run
 ```
 
-In both modes `NVIDIA_VERSION` is only a **label** — it names the output and drives the driver/kernel compatibility checks, but nothing verifies it against the installer. Set it to the version the `.run` actually contains, or those checks will be reasoning about the wrong driver. The build prints a warning either way. `--reconfigure` keeps the override rather than dropping it.
+In both modes `NVIDIA_VERSION` is only a **label** — it names the output and drives the driver/kernel compatibility checks, but nothing verifies it against the installer. Set it to the version the `.run` actually contains, or those checks will be reasoning about the wrong driver. The build prints a warning either way. `--reconfigure` keeps the override rather than dropping it. A `--run-url` download is verified when a `.sha256sum` file sits next to it; a `--custom-run` file is not verified.
 
 ### Common Build Variants
 
-**Use a pre-downloaded update file** to avoid re-downloading the ~1.8 GB TrueNAS update on every build:
+**Use a pre-downloaded update file** when the build can't fetch one itself, such as a stable 27 release. Downloads are already cached between builds, and a file you supply this way is not checksum-verified:
 
 ```bash
 # Download once
-wget -O truenas.update "https://update-public.sys.truenas.net/TrueNAS-26-BETA/TrueNAS-26.0.0-BETA.1.update"
+wget -O truenas.update "https://update-public.sys.truenas.net/TrueNAS-27-RC/TrueNAS-27.0.0-RC.1.update"
 
 # Build — the script detects the local file and skips download
 docker compose run --rm nvidia-builder
@@ -518,7 +546,7 @@ re-run the normal deploy command:
 ./deploy-nvidia.sh output/<TRUENAS_VERSION>/nvidia.raw
 ```
 
-The script now prints:
+The script prints:
 
 - host `/usr/lib/os-release`
 - embedded `usr/lib/extension-release.d/extension-release.nvidia`
@@ -542,7 +570,7 @@ This copies the running image to `/mnt/<pool>/.config/truenas-nvidia-driver-upda
 **When the update did change the kernel**, rebuild:
 
 1. Re-run `./configure.sh` (it auto-detects the new version) or update `TRUENAS_VERSION` in `.env`
-2. Remove any cached `truenas.update` file
+2. Remove any `truenas.update` you placed in the project directory (downloads in `./cache/` are kept per version and can stay)
 3. Run `docker compose build && docker compose run --rm nvidia-builder`
 4. Deploy the new `nvidia.raw`
 5. Re-run `./deploy-nvidia.sh --persist` so the saved copy matches the new kernel
@@ -561,7 +589,7 @@ It's an ordinary deployment, so the image it replaces is backed up first and you
 
 ### Rollback to Previous Driver
 
-If `systemd-sysext merge` rejects a freshly deployed image, the deploy script automatically restores the previous `nvidia.raw` (or removes it on a fresh install) and re-merges, so the system is left in its prior working state rather than broken.
+If `systemd-sysext merge` rejects a freshly deployed image, or the image doesn't end up merged, the deploy script automatically restores the previous `nvidia.raw` (or removes it on a fresh install) and re-merges, so the system is left in its prior working state rather than broken.
 
 To roll back manually, the deploy script saves backups in a `backups/` directory alongside itself (keeps the 5 most recent). Easiest is the manager's **rollback** entry, which lists them with the date each was taken:
 
@@ -579,7 +607,7 @@ ls -la backups/
 ./deploy-nvidia.sh backups/nvidia.raw.backup_20260422_160428
 ```
 
-Rolling back is an ordinary deployment, so the image being replaced is itself backed up first — you can always go back the other way.
+Rolling back is an ordinary deployment, so the image being replaced is itself backed up first — you can always go back the other way. It also goes through the same kernel check: a backup from before a TrueNAS update that changed the kernel is refused, because its modules can't load. Rebuild instead, or use `--uninstall` with an image from the current release.
 
 ---
 
@@ -587,23 +615,36 @@ Rolling back is an ordinary deployment, so the image being replaced is itself ba
 
 ```
 .
-├── configure.sh            # Interactive setup wizard (generates docker-compose.yaml)
+├── configure.sh            # Interactive setup wizard (generates .env)
 ├── Dockerfile              # Debian 12 build container
-├── docker-compose.yaml     # Build configuration (auto-generated or manual)
+├── docker-compose.yaml     # Build configuration template (reads .env, never edited)
 ├── entrypoint.sh           # Main build script
 ├── deploy-nvidia.sh        # TrueNAS deployment script
-├── output/                 # Build outputs organized by TrueNAS version
+├── tests/                  # Offline regression tests
+├── predefined-patches/     # Curated patch lists for EOL drivers
+├── patches/                # Your own source patches, by kernel
+├── output/                 # Build outputs by TrueNAS version, build logs in output/logs/
 ├── cache/                  # Cached TrueNAS update + NVIDIA installer downloads
 ├── backups/                # Previous nvidia.raw backups (auto-managed)
 ├── LICENSE
 └── README.md
 ```
 
+### Running the tests
+
+```bash
+tests/deploy-activation-test.sh
+tests/entrypoint-test.sh
+tests/configure-test.sh
+```
+
+All three run offline and need no root, Docker or TrueNAS. The deploy test runs `deploy-nvidia.sh` in a sandbox with stubs for every host command, including a `midclt` that follows the real `docker.configure_nvidia`. The build test exercises the download, checksum and log helpers from `entrypoint.sh`, and the configure test covers version discovery. None of them replaces a real build and deploy.
+
 ## Requirements
 
 - **Build machine**: Docker with `docker compose`
 - **Configuration wizard**: `curl` or `wget` (for fetching version lists)
-- **TrueNAS**: 24.04+ / 25.x / 26.x (systemd-sysext support)
+- **TrueNAS**: 24.10+ / 25.x / 26.x. 24.04 and older are not supported, because they ship the driver as ordinary packages rather than a sysext. `configure.sh`, the build and `deploy-nvidia.sh` all refuse them, and `--check` reports one as a problem. 27 pre-releases download, but building against them is untested
 - **GPU**: Any NVIDIA GPU supported by the target driver version
 
 ## Troubleshooting
@@ -616,6 +657,26 @@ uname -r                    # running kernel
 modinfo nvidia | grep vermagic  # module's target kernel
 ```
 These must match. Rebuild with the correct `TRUENAS_VERSION`.
+
+### `nvidia-smi` fails with "Driver/library version mismatch"
+
+The new libraries are merged but the old kernel module is still loaded, usually because something held it during the deploy. Run `./deploy-nvidia.sh --check`: if it reports a pending reboot, reboot. Until then, Apps may fail to start as well.
+
+### Deploy refuses the image: "built for kernel …"
+
+The image's modules were built for a different kernel than the one running, so they wouldn't load. This is expected for a backup or image from before a TrueNAS update. Rebuild for the current version. `--force-kernel` installs it anyway, which only makes sense if you're about to boot that kernel.
+
+### Build stops with "SHA256 mismatch"
+
+The download doesn't match the checksum its server publishes, usually because the transfer was cut off or corrupted. The build has already deleted the file, so run it again. If it keeps failing, check for a proxy between you and the server.
+
+### A build failed and the container is gone
+
+Look in `./output/logs/`. `build-<timestamp>.log` has the console output and `nvidia-installer-<timestamp>.log` has the installer's own log, which is where compile errors end up.
+
+### `du` shows a much smaller image than expected
+
+`du` counts allocated blocks, and on ZFS those trail behind a file that was just written, so a finished image can briefly look far too small. Use `stat -c%s nvidia.raw` for the real size. The scripts report sizes this way.
 
 ### Docker fails with "iptables: Failed to initialize nft"
 
@@ -661,4 +722,5 @@ MIT — see [LICENSE](LICENSE).
 - NVIDIA driver installer from [NVIDIA's official download site](https://www.nvidia.com/Download/index.aspx)
 - nvidia-container-toolkit from [NVIDIA's container toolkit repo](https://github.com/NVIDIA/nvidia-container-toolkit)
 - Legacy 470-on-mainline-kernel patches by [**joanbm**'s nvidia-470xx-linux-mainline](https://github.com/joanbm/nvidia-470xx-linux-mainline) — the curated set used by the `predefined` patch mode to build the EOL 470 branch on kernel 6.10+
+- [**truenas-community-sysexts/nvidia-driver-support**](https://github.com/truenas-community-sysexts/nvidia-driver-support) — a sibling project built on this one's extraction pipeline, whose hardware findings fed back into the deploy checks, download verification and TrueNAS 27 support here
 - [**truenas-community-sysexts** — Building Sysexts for TrueNAS SCALE](https://github.com/truenas-community-sysexts/.github/blob/main/docs/sysext-guide.md) — community reference for sysext activation paths, `/etc` → `/usr` remapping, the `modules.dep` overlay problem, and update-persistence patterns

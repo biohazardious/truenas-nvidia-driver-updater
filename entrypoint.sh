@@ -5,8 +5,8 @@
 # Runs inside a privileged Debian 12 (Bookworm) container.
 #
 # Required environment variables:
-#   NVIDIA_VERSION     — NVIDIA driver version (e.g. 595.58.03)
-#   TRUENAS_VERSION    — TrueNAS version (e.g. 25.10.6 or 26.0.0-BETA.1)
+#   NVIDIA_VERSION     — NVIDIA driver version (e.g. 595.112.07)
+#   TRUENAS_VERSION    — TrueNAS version (e.g. 25.10.8 or 27.0.0-RC.1)
 #
 # Optional:
 #   NVIDIA_KERNEL_MODULE_TYPE
@@ -56,8 +56,8 @@
 #   TrueNAS 25.x and earlier:
 #     https://download.truenas.com/TrueNAS-SCALE-{CODENAME}/{VERSION}/
 #     TrueNAS-SCALE-{VERSION}.update?download=1
-#   TrueNAS 26+:
-#     https://update-public.sys.truenas.net/TrueNAS-26-BETA/TrueNAS-{VERSION}.update
+#   TrueNAS 26+ (BETA and RC builds; 26 was renamed 27 at RC.1):
+#     https://update-public.sys.truenas.net/TrueNAS-{MAJOR}-{STAGE}/TrueNAS-{VERSION}.update
 # =============================================================================
 set -euo pipefail
 IFS=$'\n\t'
@@ -70,20 +70,20 @@ info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()   { echo -e "${RED}[FATAL]${NC} $*" >&2; exit 1; }
+
+# File length, not du: on ZFS du counts allocated blocks, which lag far behind a
+# file that was just written.
+human_size() { stat -c%s "$1" 2>/dev/null | LC_ALL=C numfmt --to=si --round=nearest --suffix=B; }
 banner(){ echo -e "\n${BOLD}════════════════════════════════════════════════════════════${NC}";
           echo -e "${BOLD}  $*${NC}";
           echo -e "${BOLD}════════════════════════════════════════════════════════════${NC}\n"; }
 
-# Persist nvidia-installer's log out of the (ephemeral) container to the mounted
-# /output directory, echo its tail inline so the real failure is visible without
-# digging out the file, then abort.
+# Echo the tail of nvidia-installer's log inline so the real failure is visible
+# without digging out the file, then abort. The log wrapper saves the full copy.
 NVIDIA_INSTALLER_LOG="/var/log/nvidia-installer.log"
 save_installer_log_and_die() {
     local message="$1"
     if [[ -f "${NVIDIA_INSTALLER_LOG}" ]]; then
-        if [[ -d /output ]] && cp -f "${NVIDIA_INSTALLER_LOG}" /output/nvidia-installer.log 2>/dev/null; then
-            warn "Full installer log saved to ./output/nvidia-installer.log"
-        fi
         echo -e "${YELLOW}──── last 40 lines of ${NVIDIA_INSTALLER_LOG} ────${NC}" >&2
         tail -n 40 "${NVIDIA_INSTALLER_LOG}" >&2 || true
         echo -e "${YELLOW}────────────────────────────────────────────────────────${NC}" >&2
@@ -148,7 +148,7 @@ installer_supports_option() {
 # Extend as new ceilings become known. Sources: NVIDIA Linux forums / distro
 # bug trackers + testing. Built with the kernel's own GCC (see
 # select_nvidia_build_cc), the stock 470 .run compiles cleanly through kernel
-# 6.6 (verified: TrueNAS 24.04/24.10) and breaks at 6.10 when follow_pfn was
+# 6.6 (verified: TrueNAS 24.10) and breaks at 6.10 when follow_pfn was
 # removed — so its last patch-free kernel is 6.9. Newer needs source patches
 # (supply them via the patch dir; see NVIDIA_PATCH_DIR).
 declare -A NVIDIA_BRANCH_MAX_KERNEL=(
@@ -383,12 +383,19 @@ update_repacked_update_manifest() {
 build_truenas_update_url() {
     local version="$1"
     local codename="${2:-}"
-    local update_filename=""
+    local update_filename="" major="${1%%.*}" stage=""
 
     update_filename="$(build_truenas_update_filename "${version}")"
 
-    if [[ "${version}" =~ ^26\..*BETA ]]; then
-        printf 'https://update-public.sys.truenas.net/TrueNAS-26-BETA/%s\n' "${update_filename}"
+    # A 26+ release without a BETA/RC suffix has no known location yet.
+    if [[ "${major}" =~ ^[0-9]+$ ]] && (( major >= 26 )); then
+        case "${version}" in
+            *-BETA.*) stage="BETA" ;;
+            *-RC.*)   stage="RC" ;;
+            *)        return 1 ;;
+        esac
+        printf 'https://update-public.sys.truenas.net/TrueNAS-%s-%s/%s\n' \
+            "${major}" "${stage}" "${update_filename}"
         return 0
     fi
 
@@ -404,13 +411,72 @@ build_truenas_update_url() {
 }
 
 build_truenas_update_filename() {
-    local version="$1"
+    local version="$1" major="${1%%.*}"
 
-    if [[ "${version}" =~ ^26\..*BETA ]]; then
+    if [[ "${major}" =~ ^[0-9]+$ ]] && (( major >= 26 )); then
         printf 'TrueNAS-%s.update\n' "${version}"
     else
         printf 'TrueNAS-SCALE-%s.update\n' "${version}"
     fi
+}
+
+# TrueNAS only ships the driver as a sysext from 24.10 on; before that it is
+# ordinary packages, with no nvidia.raw for this project to replace.
+truenas_version_supported() {
+    local major="${1%%.*}" rest="${1#*.}"
+    local minor="${rest%%.*}"
+    [[ "${major}" =~ ^[0-9]+$ ]] && [[ "${minor}" =~ ^[0-9]+$ ]] || return 1
+    (( 10#${major} * 100 + 10#${minor} >= 2410 ))
+}
+
+# Print the digest published at a checksum URL, or nothing when there is none:
+# NVIDIA has no sidecar for some older versions, and a 200 that isn't a digest is
+# a proxy's error page. Anything else means the check itself failed.
+fetch_expected_sha256() {
+    local url="$1" body="" status="" digest=""
+
+    body="$(mktemp)"
+    status="$(curl -sSL -m 30 --retry 3 -o "${body}" -w '%{http_code}' "${url}" 2>/dev/null)" \
+        || status="no response"
+
+    case "${status}" in
+        200)
+            digest="$(awk 'NR == 1 { print tolower($1) }' "${body}")"
+            rm -f "${body}"
+            [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] && printf '%s\n' "${digest}"
+            return 0
+            ;;
+        404)
+            rm -f "${body}"
+            return 0
+            ;;
+        *)
+            rm -f "${body}"
+            die "Could not fetch the checksum at ${url} (HTTP ${status})"
+            ;;
+    esac
+}
+
+# Check a download against a digest from fetch_expected_sha256. A bad file is
+# deleted: wget -c would otherwise treat it as complete on every later run.
+verify_sha256() {
+    local file="$1" expected="$2" actual=""
+
+    if [[ -z "${expected}" ]]; then
+        warn "No checksum published for $(basename "${file}") — continuing unverified"
+        return 0
+    fi
+
+    info "Verifying SHA256 of $(basename "${file}") …"
+    actual="$(sha256sum "${file}" | awk '{print $1}')"
+    if [[ "${actual}" != "${expected}" ]]; then
+        rm -f "${file}"
+        die "SHA256 mismatch for $(basename "${file}")
+  expected: ${expected}
+  actual:   ${actual}
+The file was deleted. Run the build again to download it fresh."
+    fi
+    ok "SHA256 verified"
 }
 
 # Detect the GCC major version the target kernel was compiled with, read from
@@ -480,10 +546,55 @@ select_nvidia_build_cc() {
 }
 
 # ── sanity checks ────────────────────────────────────────────────────────────
+# ── Persistent build log ─────────────────────────────────────────────────────
+# The container is removed when the build ends, and nvidia-installer's log goes
+# with it. Run the build as a child under tee so its console output and the
+# installer log both land in ./output/logs/, whether it worked or not. The tee
+# has to be a plain pipeline: the container dies with this process, so a
+# background logger would lose the end of the log, usually the part that matters.
+BUILD_LOG_DIR="/output/logs"
+BUILD_LOGS_KEPT=3
+
+trim_build_logs() {
+    { ls -1 "${BUILD_LOG_DIR}/$1"-*.log 2>/dev/null || true; } \
+        | sort -r | tail -n +$((BUILD_LOGS_KEPT + 1)) \
+        | while read -r old; do rm -f "${old}"; done
+}
+
+if [[ -z "${BUILD_LOG_STAMP:-}" ]] && [[ -d /output ]] && mkdir -p "${BUILD_LOG_DIR}" 2>/dev/null; then
+    BUILD_LOG_STAMP="$(date +%Y%m%d_%H%M%S)"
+    export BUILD_LOG_STAMP
+    build_log="${BUILD_LOG_DIR}/build-${BUILD_LOG_STAMP}.log"
+
+    set +e
+    "${BASH}" "$0" "$@" 3>&2 2>&1 | tee -i "${build_log}"
+    build_rc=${PIPESTATUS[0]}
+    set -e
+
+    # Colours and the steps of \r-driven progress bars only make sense live.
+    sed -i -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r$//' -e 's/.*\r//' "${build_log}" || true
+
+    if [[ -f "${NVIDIA_INSTALLER_LOG}" ]]; then
+        cp -f "${NVIDIA_INSTALLER_LOG}" "${BUILD_LOG_DIR}/nvidia-installer-${BUILD_LOG_STAMP}.log" || true
+    fi
+    trim_build_logs build
+    trim_build_logs nvidia-installer
+
+    echo ""
+    info "Build log: ./output/logs/$(basename "${build_log}")"
+    exit "${build_rc}"
+fi
+
+# fd 3 is the real terminal: wget draws its progress bar there, out of the log.
+[[ -e /proc/self/fd/3 ]] || exec 3>&2
+
+# ── Build starts here ────────────────────────────────────────────────────────
 banner "NVIDIA sysext builder for TrueNAS"
 
 : "${NVIDIA_VERSION:?NVIDIA_VERSION environment variable is not set}"
 : "${TRUENAS_VERSION:?TRUENAS_VERSION environment variable is not set}"
+truenas_version_supported "${TRUENAS_VERSION}" \
+    || die "TrueNAS ${TRUENAS_VERSION} is not supported. The minimum is 24.10: older releases ship the driver as ordinary packages, so there is no nvidia.raw to replace."
 
 NVIDIA_KERNEL_MODULE_TYPE="${NVIDIA_KERNEL_MODULE_TYPE:-open}"
 NVIDIA_INSTALL_DRM="${NVIDIA_INSTALL_DRM:-true}"
@@ -533,7 +644,7 @@ else
     if [[ -n "${CACHE_DIR}" ]]; then
         UPDATE_FILE="${CACHE_DIR}/$(build_truenas_update_filename "${TRUENAS_VERSION}")"
         if [[ -s "${UPDATE_FILE}" ]]; then
-            info "Found cached update: ${UPDATE_FILE} ($(du -h "${UPDATE_FILE}" | cut -f1)) — resuming/validating (delete to force fresh download)"
+            info "Found cached update: ${UPDATE_FILE} ($(human_size "${UPDATE_FILE}")) — resuming/validating (delete to force fresh download)"
         fi
     fi
 
@@ -543,11 +654,14 @@ else
         info "Downloading TrueNAS ${TRUENAS_VERSION} update file …"
     fi
     info "URL: ${DOWNLOAD_URL}"
-    wget -q --show-progress -c -O "${UPDATE_FILE}" "${DOWNLOAD_URL}" || {
+    # Fetched first, so a broken checksum fails before the ~2 GB transfer.
+    UPDATE_SHA256="$(fetch_expected_sha256 "${DOWNLOAD_URL%%\?*}.sha256")"
+    wget -q --show-progress -c -O "${UPDATE_FILE}" "${DOWNLOAD_URL}" 2>&3 || {
         report_url_status "${DOWNLOAD_URL}"
         die "Failed to download TrueNAS update file from ${DOWNLOAD_URL}"
     }
-    ok "Downloaded $(du -h "${UPDATE_FILE}" | cut -f1)"
+    ok "Downloaded $(human_size "${UPDATE_FILE}")"
+    verify_sha256 "${UPDATE_FILE}" "${UPDATE_SHA256}"
 fi
 
 info "NVIDIA driver version : ${NVIDIA_VERSION}"
@@ -579,7 +693,7 @@ INNER_SQUASHFS="${STAGE1_DIR}/rootfs.squashfs"
 [[ -f "${INNER_SQUASHFS}" ]] \
     || die "rootfs.squashfs was not found inside truenas.update. Aborting."
 
-ok "Found inner rootfs.squashfs ($(du -h "${INNER_SQUASHFS}" | cut -f1))"
+ok "Found inner rootfs.squashfs ($(human_size "${INNER_SQUASHFS}"))"
 
 # =============================================================================
 # PHASE 2 — Extract kernel headers + modules from the inner rootfs
@@ -604,7 +718,7 @@ if [[ -n "${STOCK_NVIDIA_RAW}" ]]; then
     # deleting the squashfs below doesn't take it with us.
     mv "${STOCK_NVIDIA_RAW}" "${BUILD_DIR}/nvidia.raw.stock"
     STOCK_NVIDIA_RAW="${BUILD_DIR}/nvidia.raw.stock"
-    ok "Stock driver image kept for rescue: $(du -h "${STOCK_NVIDIA_RAW}" | cut -f1)"
+    ok "Stock driver image kept for rescue: $(human_size "${STOCK_NVIDIA_RAW}")"
 else
     warn "No stock nvidia.raw found in this release — the rescue image will be skipped"
 fi
@@ -825,10 +939,12 @@ else
         info "Found cached installer: ${RUN_FILE_PATH} — resuming/validating"
     fi
     info "Downloading from ${DOWNLOAD_URL} … (resumes if partially cached)"
-    wget -q --show-progress -c -O "${RUN_FILE_PATH}" "${DOWNLOAD_URL}" || {
+    RUN_SHA256="$(fetch_expected_sha256 "${DOWNLOAD_URL%%\?*}.sha256sum")"
+    wget -q --show-progress -c -O "${RUN_FILE_PATH}" "${DOWNLOAD_URL}" 2>&3 || {
         report_url_status "${DOWNLOAD_URL}"
         die "Failed to download ${RUN_FILE} from ${DOWNLOAD_URL}"
     }
+    verify_sha256 "${RUN_FILE_PATH}" "${RUN_SHA256}"
 fi
 
 chmod +x "${RUN_FILE_PATH}"
@@ -1401,7 +1517,7 @@ du -sh "${STAGING_DIR}"/usr/*/ 2>/dev/null | sed 's/^/  /'
 # The content is identical; only compression efficiency differs.
 build_release_artifact "${STAGING_DIR}" "${OUTPUT_PATH}" "nvidia.raw"
 
-FINAL_SIZE=$(du -h "${OUTPUT_PATH}" | cut -f1)
+FINAL_SIZE=$(human_size "${OUTPUT_PATH}")
 FINAL_BYTES=$(stat -c%s "${OUTPUT_PATH}" 2>/dev/null || echo "unknown")
 ok "${OUTPUT_FILENAME} created successfully"
 
@@ -1413,7 +1529,7 @@ if [[ -n "${STOCK_NVIDIA_RAW}" ]] && [[ -f "${STOCK_NVIDIA_RAW}" ]]; then
     STOCK_OUTPUT_PATH="${OUTPUT_DIR}/nvidia.raw.stock"
     cp "${STOCK_NVIDIA_RAW}" "${STOCK_OUTPUT_PATH}"
     write_sha256_file "${STOCK_OUTPUT_PATH}"
-    ok "Stock rescue image written: nvidia.raw.stock ($(du -h "${STOCK_OUTPUT_PATH}" | cut -f1))"
+    ok "Stock rescue image written: nvidia.raw.stock ($(human_size "${STOCK_OUTPUT_PATH}"))"
 fi
 
 UPDATED_TRUENAS_UPDATE_PATH=""

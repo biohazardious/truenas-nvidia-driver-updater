@@ -72,12 +72,12 @@ Usage:
   ./configure.sh --help       Show this help message
 
 Non-interactive mode (for automation / CI):
-  ./configure.sh --truenas 25.10.6 --nvidia 595.91.07
-  ./configure.sh --truenas 25.10.6 --nvidia 595.91.07 --module open --embed false
+  ./configure.sh --truenas 25.10.8 --nvidia 595.112.07
+  ./configure.sh --truenas 25.10.8 --nvidia 595.112.07 --module open --embed false
 
   All flags:
-    --truenas VERSION     TrueNAS version (e.g. 25.10.6)
-    --nvidia VERSION      NVIDIA driver version (e.g. 595.91.07)
+    --truenas VERSION     TrueNAS version (e.g. 25.10.8)
+    --nvidia VERSION      NVIDIA driver version (e.g. 595.112.07)
     --module TYPE         Kernel module type: open (default) or proprietary
     --embed true|false    Embed nvidia.raw in truenas.update (default: false)
     --patch MODE          Source patches: none, custom, predefined, or auto
@@ -187,8 +187,6 @@ declare -A CODENAME_MAP=(
     ["Fangtooth"]="25.04"
     ["ElectricEel"]="24.10"
     ["Electric Eel"]="24.10"
-    ["Dragonfish"]="24.04"
-    ["Cobia"]="23.10"
 )
 
 # Reverse: major version → codename
@@ -196,8 +194,6 @@ declare -A VERSION_TO_CODENAME=(
     ["25.10"]="Goldeye"
     ["25.04"]="Fangtooth"
     ["24.10"]="Electric Eel"
-    ["24.04"]="Dragonfish"
-    ["23.10"]="Cobia"
 )
 
 fetch_truenas_branch_info() {
@@ -280,6 +276,22 @@ fetch_truenas_branch_info() {
     fi
 }
 
+# TrueNAS only ships the driver as a sysext from 24.10 on; before that it is
+# ordinary packages, with no nvidia.raw for this project to replace.
+truenas_version_supported() {
+    local major="${1%%.*}" rest="${1#*.}"
+    local minor="${rest%%.*}"
+    [[ "${major}" =~ ^[0-9]+$ ]] && [[ "${minor}" =~ ^[0-9]+$ ]] || return 1
+    (( 10#${major} * 100 + 10#${minor} >= 2410 ))
+}
+
+require_supported_truenas() {
+    truenas_version_supported "$1" && return 0
+    err "TrueNAS $1 is not supported. The minimum is 24.10: older releases ship the"
+    err "driver as ordinary packages, so there is no nvidia.raw to replace."
+    exit 1
+}
+
 fetch_truenas_versions() {
     local html=""
     local -a versions=()
@@ -327,6 +339,7 @@ fetch_truenas_versions() {
 
         # Skip non-version entries (e.g. GITMANIFEST from deeper paths)
         [[ "${version}" =~ ^[0-9] ]] || continue
+        truenas_version_supported "${version}" || continue
 
         # Skip if we've already seen this version
         if echo "${seen_versions}" | grep -qF "|${version}|" 2>/dev/null; then
@@ -563,8 +576,6 @@ advise_gpu_branch_fit() {
 # the wizard heads-up below; the build reads the REAL kernel from the image and
 # is authoritative. Extend as new TrueNAS releases ship.
 declare -A TRUENAS_KERNEL_MM=(
-    ["23.10"]="6.1"
-    ["24.04"]="6.6"
     ["24.10"]="6.6"
     ["25.04"]="6.12"
     ["25.10"]="6.12"
@@ -1327,6 +1338,9 @@ detect_truenas_version() {
         DETECTED_TRUENAS_VERSION="$(midclt call system.version 2>/dev/null | tr -d '"[:space:]')" || true
     fi
 
+    # Middleware can answer with a product prefix, e.g. TrueNAS-SCALE-25.10.8.
+    DETECTED_TRUENAS_VERSION="${DETECTED_TRUENAS_VERSION#"${DETECTED_TRUENAS_VERSION%%[0-9]*}"}"
+
     if [[ -n "${DETECTED_TRUENAS_VERSION}" ]]; then
         ok "Detected TrueNAS version: ${DETECTED_TRUENAS_VERSION}"
     fi
@@ -1550,6 +1564,8 @@ main() {
     if [[ -n "${CLI_TRUENAS}" ]] && [[ -n "${CLI_NVIDIA}" ]]; then
         info "Running in non-interactive mode"
 
+        require_supported_truenas "${CLI_TRUENAS}"
+
         local selected_truenas="${CLI_TRUENAS}"
         local selected_nvidia="${CLI_NVIDIA}"
         local selected_module_type="${CLI_MODULE:-open}"
@@ -1744,6 +1760,9 @@ main() {
                 ;;
         esac
 
+        # Checked after the menu, so an old .env can still be moved to a new version.
+        require_supported_truenas "${selected_truenas}"
+
         # Keep module type consistent with the (possibly just-changed) driver:
         # a switch to a pre-515 branch must drop back to proprietary.
         if ! nvidia_supports_module_type "${selected_nvidia}"; then
@@ -1831,7 +1850,7 @@ main() {
             warn "Failed to fetch version list. Please enter manually."
             ui_inputbox selected_truenas \
                 "TrueNAS Version" \
-                "Enter TrueNAS version (e.g. 25.10.6):"
+                "Enter TrueNAS version (e.g. 25.10.8):"
             local major_minor=""
             major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
             selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
@@ -1844,6 +1863,7 @@ main() {
     fi
 
     [[ -n "${selected_truenas}" ]] || { err "No TrueNAS version selected. Aborting."; exit 1; }
+    require_supported_truenas "${selected_truenas}"
 
     if [[ -n "${selected_codename}" ]]; then
         ok "Selected: ${selected_truenas} (${selected_codename})"
@@ -1894,7 +1914,7 @@ main() {
         warn "Failed to fetch version list. Please enter manually."
         ui_inputbox selected_nvidia \
             "NVIDIA Driver" \
-            "Enter NVIDIA driver version (e.g. 595.91.07):"
+            "Enter NVIDIA driver version (e.g. 595.112.07):"
     fi
 
     [[ -n "${selected_nvidia}" ]] || { err "No NVIDIA version selected. Aborting."; exit 1; }
