@@ -411,6 +411,20 @@ fetch_truenas_versions() {
 # Minimum driver version to show (older ones don't support modern TrueNAS kernels)
 NVIDIA_MIN_MAJOR=470
 
+# Where NVIDIA's own page says which query yields each branch label, and the
+# lookup service those queries go to.
+NVIDIA_UNIX_PAGE_URL="https://www.nvidia.com/en-us/drivers/unix/"
+NVIDIA_LOOKUP_URL="https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php?func=DriverManualLookup"
+
+# Used when the page can't be read or yields no usable query (TYPE|PARAMS,
+# copied from the linux64 blocks of that page).
+NVIDIA_LOOKUP_FALLBACK=(
+    "PB|psid=133&pfid=1075&osID=12&languageCode=1033&beta=0&isWHQL=0&dltype=-1&dch=0&upCRD=null&qnf=0&ctk=null&sort1=&numberOfResults=1"
+    "NFB|psid=133&pfid=1075&osID=12&languageCode=1033&beta=null&isWHQL=0&dltype=-1&dch=0&upCRD=null&qnf=1&ctk=null&sort1=1&numberOfResults=1"
+    "BETA|psid=133&pfid=1075&osID=12&languageCode=1033&beta=1&isWHQL=0&dltype=-1&dch=0&upCRD=null&qnf=0&ctk=null&sort1=1&numberOfResults=1"
+    "Legacy|psid=122&pfid=944&osID=12&languageCode=1033&isWHQL=0&beta=0&dltype=-1&dch=0&upCRD=null&qnf=0&ctk=null&sort1=1&release=470&numberOfResults=1"
+)
+
 # Extract major version prefix from a version string (e.g. "595.80" → "595")
 nvidia_major() {
     [[ "$1" =~ ^([0-9]+)\. ]] && printf '%s' "${BASH_REMATCH[1]}"
@@ -775,98 +789,104 @@ nvidia_latest_in_series() {
     return 1
 }
 
+# Read NVIDIA's unix-drivers page (stdin) and print "TYPE|PARAMS" for every
+# linux64 lookup block. Blocks whose params look unsafe are dropped: the string
+# is later put into a URL, so only a plain query-string alphabet is accepted.
+nvidia_lookup_queries() {
+    local type params
+    while IFS='|' read -r type params; do
+        [[ "${type}" =~ ^(PB|NFB|BETA|Legacy)$ ]] || continue
+        [[ "${params}" =~ ^[A-Za-z0-9=\&_.-]+$ ]] || continue
+        printf '%s|%s\n' "${type}" "${params}"
+    done < <(awk '
+        /"drvrLkupInfo"/ { p = ""; t = ""; o = "" }
+        /"urlParams"/ {
+            line = $0
+            gsub(/"\+countryID\+"/, "1033", line)
+            if (match(line, /"urlParams"[ \t]*:[ \t]*"[^"]*"/)) {
+                p = substr(line, RSTART, RLENGTH)
+                sub(/^"urlParams"[ \t]*:[ \t]*"/, "", p); sub(/"$/, "", p)
+            }
+        }
+        /"drvrType"/ { if (match($0, /:[ \t]*"[^"]*"/)) { t = substr($0, RSTART, RLENGTH); gsub(/^:[ \t]*"|"$/, "", t) } }
+        /"osCode"/   { if (match($0, /:[ \t]*"[^"]*"/)) { o = substr($0, RSTART, RLENGTH); gsub(/^:[ \t]*"|"$/, "", o) } }
+        /^[ \t]*}/   { if (o == "linux64" && t != "" && p != "") print t "|" p; p = ""; t = ""; o = "" }
+    ')
+}
+
+# Ask NVIDIA's lookup service one query and print the version it answers with.
+# Returns 1 when the answer is not what the label needs, 2 when the service
+# could not be reached.
+nvidia_lookup_version() {
+    local type="$1" params="$2" body="" flag="" version=""
+    body="$(fetch_url "${NVIDIA_LOOKUP_URL}&${params}" 2>/dev/null)" || return 2
+    case "${type}" in
+        PB)     flag='"IsRecommended" : "1"' ;;
+        NFB)    flag='"IsFeaturePreview" : "1"' ;;
+        BETA)   flag='"IsBeta" : "1"' ;;
+        Legacy) flag="" ;;
+        *)      return 1 ;;
+    esac
+    [[ -z "${flag}" ]] || [[ "${body}" == *"${flag}"* ]] || return 1
+    version="$(grep -oP 'NVIDIA-Linux-x86_64-\K[0-9]+\.[0-9]+(\.[0-9]+)?(?=\.run)' <<< "${body}" | head -1)" || true
+    [[ "${version}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 1
+    if [[ "${type}" == "Legacy" ]]; then
+        local release=""
+        release="$(grep -oP '(^|&)release=\K[0-9]+' <<< "${params}" | head -1)" || true
+        [[ -n "${release}" && "$(nvidia_major "${version}")" == "${release}" ]] || return 1
+    fi
+    printf '%s' "${version}"
+}
+
 fetch_nvidia_branch_info() {
-    # Determine branch tags using a hybrid approach:
-    #   1. Try nvidia.com/en-us/drivers/unix.md for branch series identification
-    #   2. Cross-reference with the actual sorted version list for correct latest
-    #   3. Detect stale .md data (newer major series exist)
-    #   4. Fall back to pure heuristic if .md fails
+    # Label driver versions using the queries NVIDIA's own page defines:
+    #   1. read the lookup queries from the unix-drivers page (built-in copy if
+    #      the page is unreadable)
+    #   2. ask each one; keep the answer only when its flag confirms the label
+    #      and the version is actually in our list
+    # A label that cannot be confirmed is simply not shown.
     #
-    # Args: sorted version list (newest first)
+    # Args: version list from download.nvidia.com
+    # Sets: NVIDIA_VERSION_TAGS[version], NVIDIA_BRANCH_VERSION[TYPE],
+    #       NVIDIA_BRANCH_INFO_OK (1 when at least one label was confirmed)
 
     declare -gA NVIDIA_VERSION_TAGS=()
+    declare -gA NVIDIA_BRANCH_VERSION=()
+    NVIDIA_BRANCH_INFO_OK=0
     local -a sorted=("$@")
 
     [[ ${#sorted[@]} -eq 0 ]] && return 1
 
-    local production="" feature="" legacy=""
-    local newest_major=""
-    newest_major="$(nvidia_major "${sorted[0]}")"
-
-    # ── Strategy 1: Try .md endpoint for branch series identification ────────
-    local md_content=""
-    md_content="$(fetch_url "https://www.nvidia.com/en-us/drivers/unix.md" 2>/dev/null)" || true
-
-    if [[ -n "${md_content}" ]]; then
-        local md_production="" md_feature="" md_legacy=""
-
-        md_production="$(echo "${md_content}" \
-            | grep -ioP 'Production Branch Version:\s*\[?\K[0-9][0-9.]+' \
-            | head -1)" || true
-        md_feature="$(echo "${md_content}" \
-            | grep -ioP 'New Feature Branch Version:\s*\[?\K[0-9][0-9.]+' \
-            | head -1)" || true
-        md_legacy="$(echo "${md_content}" \
-            | grep -ioP 'Legacy GPU version[^:]*:\s*\[?\K[0-9][0-9.]+' \
-            | head -1)" || true
-
-        # Cross-reference: find actual latest in each .md series from our list
-        if [[ -n "${md_production}" ]]; then
-            local prod_major=""
-            prod_major="$(nvidia_major "${md_production}")"
-            production="$(nvidia_latest_in_series "${prod_major}" "${sorted[@]}")" || true
-        fi
-
-        if [[ -n "${md_feature}" ]]; then
-            local feat_major=""
-            feat_major="$(nvidia_major "${md_feature}")"
-
-            # Detect stale .md: if our version list has a newer major series
-            # than what .md reports as "New Feature", use the newer one instead
-            if [[ -n "${newest_major}" ]] && [[ -n "${feat_major}" ]] \
-               && [[ "${newest_major}" -gt "${feat_major}" ]] 2>/dev/null; then
-                feature="$(nvidia_latest_in_series "${newest_major}" "${sorted[@]}")" || true
-                info "Detected newer driver series (${newest_major}.xx) beyond .md data (${feat_major}.xx)"
-            else
-                feature="$(nvidia_latest_in_series "${feat_major}" "${sorted[@]}")" || true
-            fi
-        fi
-
-        if [[ -n "${md_legacy}" ]]; then
-            local legacy_major=""
-            legacy_major="$(nvidia_major "${md_legacy}")"
-            legacy="$(nvidia_latest_in_series "${legacy_major}" "${sorted[@]}")" || true
-        fi
+    local page="" queries=""
+    page="$(fetch_url "${NVIDIA_UNIX_PAGE_URL}" 2>/dev/null)" || page=""
+    queries="$(nvidia_lookup_queries <<< "${page}")"
+    if [[ -z "${queries}" ]]; then
+        info "Using built-in NVIDIA lookup queries"
+        queries="$(printf '%s\n' "${NVIDIA_LOOKUP_FALLBACK[@]}")"
     fi
 
-    # ── Strategy 2: Heuristic fallback if .md didn't provide data ────────────
-    if [[ -z "${production}" ]] && [[ -z "${feature}" ]]; then
-        info "Using heuristic branch detection from version list"
+    local -A label=(
+        [PB]="★ Production Branch"
+        [NFB]="★ New Feature Branch"
+        [BETA]="Beta — not for production use"
+        [Legacy]="★ Legacy GPU (470.xx)"
+    )
+    local type params version rc listed v
+    while IFS='|' read -r type params; do
+        [[ -n "${type}" ]] || continue
+        version="$(nvidia_lookup_version "${type}" "${params}")" && rc=0 || rc=$?
+        [[ ${rc} -eq 2 ]] && break   # service unreachable: the rest would fail too
+        [[ ${rc} -eq 0 ]] || continue
+        listed=0
+        for v in "${sorted[@]}"; do [[ "${v}" == "${version}" ]] && listed=1; done
+        [[ ${listed} -eq 1 ]] || continue
+        NVIDIA_BRANCH_VERSION["${type}"]="${version}"
+        NVIDIA_VERSION_TAGS["${version}"]="${NVIDIA_VERSION_TAGS[${version}]:+${NVIDIA_VERSION_TAGS[${version}]} · }${label[${type}]}"
+        NVIDIA_BRANCH_INFO_OK=1
+    done <<< "${queries}"
 
-        # Newest version overall → New Feature Branch
-        feature="${sorted[0]}"
-
-        # Latest version in a DIFFERENT major series → Production Branch
-        for ver in "${sorted[@]}"; do
-            if [[ "$(nvidia_major "${ver}")" != "${newest_major}" ]]; then
-                production="${ver}"
-                break
-            fi
-        done
-    fi
-
-    # Legacy fallback: latest 470.xx from version list
-    if [[ -z "${legacy}" ]]; then
-        legacy="$(nvidia_latest_in_series "470" "${sorted[@]}")" || true
-    fi
-
-    # ── Assign tags (avoid duplicates) ───────────────────────────────────────
-    [[ -n "${production}" ]] && NVIDIA_VERSION_TAGS["${production}"]="★ Production Branch"
-    if [[ -n "${feature}" ]] && [[ "${feature}" != "${production}" ]]; then
-        NVIDIA_VERSION_TAGS["${feature}"]="★ New Feature Branch"
-    fi
-    if [[ -n "${legacy}" ]] && [[ "${legacy}" != "${production}" ]] && [[ "${legacy}" != "${feature}" ]]; then
-        NVIDIA_VERSION_TAGS["${legacy}"]="★ Legacy GPU (470.xx)"
+    if [[ ${NVIDIA_BRANCH_INFO_OK} -eq 0 ]]; then
+        warn "Branch labels unavailable — see ${NVIDIA_UNIX_PAGE_URL}"
     fi
 
     # When the detected card is only supported up to an older branch, surface the
