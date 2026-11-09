@@ -556,39 +556,16 @@ truenas_train_redirect() {
     printf '%s\n' "${target}"
 }
 
-# resolve_truenas_update TRAIN VERSION — sets TRUENAS_UPDATE_URL and
-# TRUENAS_UPDATE_SHA256 to the .update file TrueNAS publishes for VERSION:
-#   1. the one its download.truenas.com folder lists (checksum: its .sha256);
-#   2. else the one releases.json of TRAIN, then of the train TRAIN redirects
-#      to, names on update.truenas.com (checksum: the entry's own).
-# Returns 1 when neither has one, 2 when the folder's checksum couldn't be read
-# (fetch_expected_sha256 has said why).
-resolve_truenas_update() {
-    local train="$1" version="$2" folder="" file="" t="" entry="" filename="" checksum=""
-    local -a files=()
-    TRUENAS_UPDATE_URL="" TRUENAS_UPDATE_SHA256=""
-    valid_truenas_train "${train}" && valid_truenas_version "${version}" || return 1
-
-    folder="https://download.truenas.com/${train}/${version}"
-    mapfile -t files < <(list_release_files "${train}" "${version}" || true)
-    for file in "${files[@]}"; do
-        [[ "${file}" =~ ^[A-Za-z0-9._+-]+\.update$ ]] || continue
-        TRUENAS_UPDATE_SHA256="$(fetch_expected_sha256 "${folder}/${file}.sha256?download=1")" || return 2
-        TRUENAS_UPDATE_URL="${folder}/${file}?download=1"
-        return 0
-    done
-
+# truenas_listed_release TRAIN VERSION — "<train><TAB><filename><TAB><checksum>"
+# from the releases.json of TRAIN, else of the train TRAIN redirects to, for the
+# first that lists VERSION (values unchecked). Returns 1 when neither does.
+truenas_listed_release() {
+    local train="$1" version="$2" t="" entry=""
     t="${train}"
     while [[ -n "${t}" ]]; do
         entry="$(truenas_release_entry "${t}" "${version}")" || entry=""
         if [[ -n "${entry}" ]]; then
-            IFS=$'\t' read -r filename checksum <<< "${entry}"
-            if [[ ! "${filename}" =~ ^[A-Za-z0-9._+-]+\.update$ || ! "${checksum}" =~ ^[0-9a-f]{64}$ ]]; then
-                warn "update.truenas.com/scale/${t}/releases.json has no usable file name and checksum for ${version}" >&2
-                return 1
-            fi
-            TRUENAS_UPDATE_URL="https://update.truenas.com/scale/${t}/${filename}"
-            TRUENAS_UPDATE_SHA256="${checksum}"
+            printf '%s\t%s\n' "${t}" "${entry}"
             return 0
         fi
         [[ "${t}" == "${train}" ]] || break
@@ -597,12 +574,63 @@ resolve_truenas_update() {
     return 1
 }
 
+# resolve_truenas_update TRAIN VERSION — sets TRUENAS_UPDATE_URL and
+# TRUENAS_UPDATE_SHA256 to the .update file TrueNAS publishes for VERSION:
+#   1. the one its download.truenas.com folder lists. Its checksum is the
+#      listed <file>.sha256; without one, the checksum releases.json gives the
+#      same file name; without either, none (the download warns, unverified).
+#   2. else the one releases.json of TRAIN, then of the train TRAIN redirects
+#      to, names on update.truenas.com (checksum: the entry's own).
+# Returns 1 when neither has one, 2 when a listed .sha256 couldn't be read or
+# isn't a digest: the build must not go ahead unverified then.
+resolve_truenas_update() {
+    local train="$1" version="$2" folder="" file="" name="" t="" entry="" filename="" checksum=""
+    local -a files=()
+    TRUENAS_UPDATE_URL="" TRUENAS_UPDATE_SHA256=""
+    valid_truenas_train "${train}" && valid_truenas_version "${version}" || return 1
+
+    folder="https://download.truenas.com/${train}/${version}"
+    mapfile -t files < <(list_release_files "${train}" "${version}" || true)
+    for file in "${files[@]}"; do
+        [[ "${file}" =~ ^[A-Za-z0-9._+-]+\.update$ ]] || continue
+        # A folder holds one .update; should it ever hold more, the first listed wins.
+        TRUENAS_UPDATE_URL="${folder}/${file}?download=1"
+        for name in "${files[@]}"; do
+            [[ "${name}" == "${file}.sha256" ]] || continue
+            TRUENAS_UPDATE_SHA256="$(fetch_expected_sha256 "${folder}/${name}?download=1")" || return 2
+            if [[ -z "${TRUENAS_UPDATE_SHA256}" ]]; then
+                warn "${folder}/${name} is listed but holds no SHA256 digest" >&2
+                return 2
+            fi
+            return 0
+        done
+        if entry="$(truenas_listed_release "${train}" "${version}")"; then
+            IFS=$'\t' read -r t filename checksum <<< "${entry}"
+            if [[ "${filename}" == "${file}" && "${checksum}" =~ ^[0-9a-f]{64}$ ]]; then
+                TRUENAS_UPDATE_SHA256="${checksum}"
+            fi
+        fi
+        return 0
+    done
+
+    entry="$(truenas_listed_release "${train}" "${version}")" || return 1
+    IFS=$'\t' read -r t filename checksum <<< "${entry}"
+    if [[ ! "${filename}" =~ ^[A-Za-z0-9._+-]+\.update$ || ! "${checksum}" =~ ^[0-9a-f]{64}$ ]]; then
+        warn "update.truenas.com/scale/${t}/releases.json has no usable file name and checksum for ${version}" >&2
+        return 1
+    fi
+    TRUENAS_UPDATE_URL="https://update.truenas.com/scale/${t}/${filename}"
+    TRUENAS_UPDATE_SHA256="${checksum}"
+    return 0
+}
+
 # TrueNAS only ships the driver as a sysext from 24.10 on; before that it is
 # ordinary packages, with no nvidia.raw for this project to replace.
 truenas_version_supported() {
     local major="${1%%.*}" rest="${1#*.}"
-    local minor="${rest%%.*}"
-    [[ "${major}" =~ ^[0-9]+$ ]] && [[ "${minor}" =~ ^[0-9]+$ ]] || return 1
+    # The minor is the digits after the first dot: 25.10-RC.1 is 25.10.
+    local minor="${rest%%[!0-9]*}"
+    [[ "$1" == *.* ]] && [[ "${major}" =~ ^[0-9]+$ ]] && [[ "${minor}" =~ ^[0-9]+$ ]] || return 1
     (( 10#${major} * 100 + 10#${minor} >= 2410 ))
 }
 
@@ -827,7 +855,7 @@ else
     resolve_truenas_update "${TRUENAS_TRAIN}" "${TRUENAS_VERSION}" || resolve_rc=$?
     case "${resolve_rc}" in
         0) ;;
-        2) exit 1 ;;   # the checksum couldn't be read; fetch_expected_sha256 said why
+        2) die "The published checksum of TrueNAS ${TRUENAS_VERSION}'s update file could not be read, so it is not downloaded unverified. Try again later, or place truenas.update in the repo." ;;
         *) die "TrueNAS ${TRUENAS_VERSION} has no .update file in download.truenas.com/${TRUENAS_TRAIN}/${TRUENAS_VERSION}/ or update.truenas.com/scale/${TRUENAS_TRAIN}/releases.json. Place truenas.update in the repo to build from a local file." ;;
     esac
     DOWNLOAD_URL="${TRUENAS_UPDATE_URL}"

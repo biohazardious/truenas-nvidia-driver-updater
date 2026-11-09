@@ -372,6 +372,12 @@ check "names the minimum" present "${sb}" "24.10"
 check "installed image untouched" is "$(installed "${sb}")" OLD
 check "integration never touched" is "$(grep -c docker.update "${sb}/events")" 0
 
+sb="$(new_sandbox old-host-short true OLD)"
+echo 24.04.2 > "${sb}/etc/version"
+deploy "${sb}" NEW
+check "24.04.2 is refused" nonzero "${RC}"
+check "24.04.2 names the minimum" present "${sb}" "24.10"
+
 sb="$(new_sandbox old-host-dry true OLD)"
 echo 24.04.2.5 > "${sb}/etc/version"
 deploy "${sb}" NEW --dry-run
@@ -401,7 +407,7 @@ check "--check counts it as a problem" nonzero "${RC}"
 check "--check names the minimum" present "${sb}" "24.10"
 
 echo "host at or above the minimum TrueNAS version"
-for version in 24.10.2.4 25.04.2.6 25.10.8 27.0.0-RC.1 TrueNAS-SCALE-25.10.8; do
+for version in 24.10.2.4 25.04.2.6 25.10.8 25.10-RC.1 25.10-BETA.1 27.0.0-RC.1 TrueNAS-SCALE-25.10.8; do
     sb="$(new_sandbox "new-host-${version}" true OLD)"
     echo "${version}" > "${sb}/etc/version"
     deploy "${sb}" NEW

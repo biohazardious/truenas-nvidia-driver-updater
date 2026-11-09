@@ -66,6 +66,15 @@ case "${url}" in
     "https://download.truenas.com/TrueNAS-27-RC/27.0.0-RC.1/") f=folder-27.0.0-RC.1.html ;;
     "https://download.truenas.com/TrueNAS-SCALE-Goldeye/25.10.8/TrueNAS-SCALE-25.10.8.update.sha256?download=1")
         printf '%s  TrueNAS-SCALE-25.10.8.update\n' "${FIXTURE_SIDECAR_DIGEST}"; exit 0 ;;
+    # TrueNAS-Test lists 25.10.8's files: 25.10.0's sidecar is a web page, 25.10.1's is missing.
+    "https://download.truenas.com/TrueNAS-Test/25.10.0/"|"https://download.truenas.com/TrueNAS-Test/25.10.1/")
+        f=folder-25.10.8.html ;;
+    "https://download.truenas.com/TrueNAS-Test/25.10.0/TrueNAS-SCALE-25.10.8.update.sha256?download=1")
+        echo '<html>not here</html>'; exit 0 ;;
+    # Listings with the .update but no sidecar.
+    "https://download.truenas.com/TrueNAS-Test/25.10.8/"|"https://download.truenas.com/TrueNAS-SCALE-Goldeye-RC/25.10.8/"|\
+    "https://download.truenas.com/TrueNAS-SCALE-Goldeye-RC/25.10.7/")
+        f=folder-25.10.8-no-sidecar.html ;;
     https://download.truenas.com/*/*/) f=folder-empty.html ;;
     "https://update.truenas.com/scale/trains_v2.json") f=update-trains_v2.json ;;
     https://update.truenas.com/scale/*/releases.json)
@@ -104,7 +113,7 @@ TN_HELPERS="${WORK}/truenas-helpers.sh"
     echo 'die() { echo "FATAL $*" >&2; exit 1; }'
     for fn in valid_truenas_train valid_truenas_version fetch_url find_truenas_train \
               resolve_truenas_train list_release_files truenas_release_entry \
-              truenas_train_redirect resolve_truenas_update fetch_expected_sha256; do
+              truenas_train_redirect truenas_listed_release resolve_truenas_update fetch_expected_sha256; do
         lift "${fn}"
     done
     echo "fetch_url() { UPDATE_DOWN=\"\${UPDATE_DOWN:-}\" '${SERVE}' \"\$1\"; }"
@@ -139,6 +148,18 @@ check "the page match is exact"    is "$(resolve_truenas_train 25.10 '' '')" ""
 check "unknown version → 1"        not resolve_truenas_train 26.0.0 '' ''
 check "update.truenas.com down, folder has .update" is "$(UPDATE_DOWN=1; resolve_truenas_update TrueNAS-SCALE-Goldeye 25.10.8 && echo "$TRUENAS_UPDATE_URL")" "https://download.truenas.com/TrueNAS-SCALE-Goldeye/25.10.8/TrueNAS-SCALE-25.10.8.update?download=1"
 check "update.truenas.com down, no .update → 1" not bash -c "source '${TN_HELPERS}'; UPDATE_DOWN=1; resolve_truenas_update TrueNAS-27-RC 27.0.0-RC.1"
+echo "the checksum of a listed .update"
+check "a listed sidecar that is a web page → 2" is "$(resolve_truenas_update TrueNAS-Test 25.10.0 >/dev/null 2>&1; echo $?)" 2
+check "a listed sidecar that is missing → 2" is "$(resolve_truenas_update TrueNAS-Test 25.10.1 >/dev/null 2>&1; echo $?)" 2
+resolve_truenas_update TrueNAS-SCALE-Goldeye-RC 25.10.8
+check "no sidecar: still from download.truenas.com" is "$TRUENAS_UPDATE_URL" "https://download.truenas.com/TrueNAS-SCALE-Goldeye-RC/25.10.8/TrueNAS-SCALE-25.10.8.update?download=1"
+check "no sidecar: releases.json's checksum (via the redirect)" is "$TRUENAS_UPDATE_SHA256" c518e5407759686d1ba46512900b887ad4d8f5f7f80e40bc3317bf38b035190d
+resolve_truenas_update TrueNAS-SCALE-Goldeye-RC 25.10.7
+check "releases.json names another file: no checksum" is "$TRUENAS_UPDATE_SHA256" ""
+resolve_truenas_update TrueNAS-Test 25.10.8; rc=$?
+check "no checksum anywhere: still resolved" is "$rc" 0
+check "no checksum anywhere: the listed URL" is "$TRUENAS_UPDATE_URL" "https://download.truenas.com/TrueNAS-Test/25.10.8/TrueNAS-SCALE-25.10.8.update?download=1"
+check "no checksum anywhere: empty checksum" is "$TRUENAS_UPDATE_SHA256" ""
 check "nothing calls the old URL builders" is "$(grep -c 'build_truenas_update_' "$REPO/entrypoint.sh")" 0
 check "no version cutoff left"     is "$(grep -cE '>= *26|-ge +26' "$REPO/entrypoint.sh" "$REPO/configure.sh" | awk -F: '{s+=$2} END {print s}')" 0
 check "no update-public/auto-public anywhere" is "$(grep -rcE 'update-public|auto-public' "$REPO"/*.sh "$REPO/README.md" "$REPO/docker-compose.yaml" "$REPO/.env.example" | awk -F: '{s+=$2} END {print s}')" 0
@@ -158,6 +179,12 @@ build_dl 26.0.0 "" ""
 check "an unknown release names the fix" has "${DL}/console" "Unable to find the release folder of TrueNAS 26.0.0 on download.truenas.com. Set TRUENAS_TRAIN in .env (e.g. TrueNAS-SCALE-Goldeye) or place truenas.update in the repo."
 build_dl 27.0.0-RC.9 TrueNAS-27-RC ""
 check "a release without an .update names both places" has "${DL}/console" "TrueNAS 27.0.0-RC.9 has no .update file in download.truenas.com/TrueNAS-27-RC/27.0.0-RC.9/ or update.truenas.com/scale/TrueNAS-27-RC/releases.json. Place truenas.update in the repo to build from a local file."
+build_dl 25.10.0 TrueNAS-Test ""
+check "a bad listed checksum stops the build" nonzero "${RC}"
+check "it says the checksum is unreadable" has "${DL}/console" "could not be read"
+check "it stops before the download" lacks "${DL}/console" "Downloading"
+build_dl 25.10.8 TrueNAS-Test ""
+check "no checksum anywhere: the download goes ahead" has "${DL}/console" "Downloading TrueNAS 25.10.8 (TrueNAS-Test) update file from download.truenas.com"
 build_dl '25.10.8/../x' "" ""
 check "an invalid TRUENAS_VERSION stops" nonzero "${RC}"
 check "it says the version is invalid" has "${DL}/console" "is not a valid TrueNAS version"
@@ -165,10 +192,10 @@ check "it stops before downloading" lacks "${DL}/console" "Downloading"
 
 echo "minimum TrueNAS version"
 supported() { bash -c "source '${HELPERS}'; truenas_version_supported \"\$1\"" _ "$1" 2>/dev/null; }
-for version in 24.10.2.4 25.04.2.6 25.10.8 26.0.0-BETA.3 27.0.0-RC.1; do
+for version in 24.10.2.4 25.04.2.6 25.10.8 25.10-RC.1 25.10-BETA.1 26.0.0-BETA.3 27.0.0-RC.1; do
     supported "${version}"; check "${version} is supported" is "$?" 0
 done
-for version in 24.04.2.5 23.10.2 not-a-version; do
+for version in 24.04.2.5 24.04.2 23.10.2 2410 not-a-version; do
     supported "${version}"; check "${version} is not supported" nonzero $?
 done
 

@@ -567,8 +567,9 @@ image_target_kernel() {
 # ordinary packages, with no nvidia.raw for this project to replace.
 truenas_version_supported() {
     local major="${1%%.*}" rest="${1#*.}"
-    local minor="${rest%%.*}"
-    [[ "${major}" =~ ^[0-9]+$ ]] && [[ "${minor}" =~ ^[0-9]+$ ]] || return 1
+    # The minor is the digits after the first dot: 25.10-RC.1 is 25.10.
+    local minor="${rest%%[!0-9]*}"
+    [[ "$1" == *.* ]] && [[ "${major}" =~ ^[0-9]+$ ]] && [[ "${minor}" =~ ^[0-9]+$ ]] || return 1
     (( 10#${major} * 100 + 10#${minor} >= 2410 ))
 }
 
