@@ -10,10 +10,12 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 > |---|---|---|
 > | TrueNAS | **25.10.8** (Goldeye) | kernel 6.12.113 |
 > | TrueNAS pre-release | **27.0.0-RC.1** | kernel 6.18.52; 26 was renamed 27 at RC.1. Downloads work, building against it is untested |
-> | NVIDIA — New Feature Branch | **620.70.06** | newest, Turing and newer |
-> | NVIDIA — Production Branch | **595.112.07** | the safe default for most users |
-> | NVIDIA — Maxwell to Volta | **580.196.07** | last branch for these cards |
-> | NVIDIA — Legacy | **470.256.02** | Kepler only; needs [patches](#building-eol-drivers-on-newer-kernels-patches) on kernel 6.10+ |
+> | NVIDIA — Production Branch | **620.70.06** | as listed by NVIDIA on 2026-11-09 |
+> | NVIDIA — New Feature Branch | **615.78.08** | as listed by NVIDIA on 2026-11-09 |
+> | NVIDIA — Beta | **595.45.04** | not for production use |
+> | NVIDIA — Legacy | **470.256.02** | needs [patches](#building-eol-drivers-on-newer-kernels-patches) on kernel 6.10+ |
+>
+> Which branch drives *your* card isn't hardcoded either: the wizard checks each version against NVIDIA's supported-chip list and tags the one that fits (see [Driver labels](#driver-labels)).
 
 ---
 
@@ -405,7 +407,7 @@ Legacy/EOL NVIDIA branches only build against kernels up to a certain point — 
 
 If the target kernel is newer than the branch supports, the build **aborts immediately** with an explanation. The interactive wizard also shows an early heads-up when you select a legacy branch. To build anyway, either supply [source patches](#building-eol-drivers-on-newer-kernels-patches) (which also relaxes this check) or set `SKIP_KERNEL_COMPAT_CHECK=true`.
 
-> **Kepler note:** if your GPU is *only* supported by the 470 branch (Kepler — GeForce 600/700 series), it works out of the box up to TrueNAS 24.10. For TrueNAS 25.x (kernel 6.12) you'll need community kernel patches (see below). Newer GPUs (Maxwell/Pascal/Turing/Ampere/Ada+) should use a current branch (580 for Maxwell–Volta, 595/620 for Turing and newer), which builds cleanly everywhere.
+> **Kepler note:** if your GPU is *only* supported by the 470 branch (Kepler — GeForce 600/700 series), it works out of the box up to TrueNAS 24.10. For TrueNAS 25.x (kernel 6.12) you'll need community kernel patches (see below). Newer GPUs should use a current branch, which builds cleanly everywhere; the wizard's `★ Recommended for your <card>` tag shows which one drives yours.
 
 ### Driver labels
 
@@ -428,8 +430,8 @@ A driver can compile, package and merge perfectly and still not drive your card,
 [OK]    Detected GPU: NVIDIA GP102 [GeForce GTX 1080 Ti] (rev a1)
 
    1) 580.196.07  ★ Recommended for your NVIDIA GeForce GTX 1080 Ti
-   2) 620.70.06  ★ New Feature Branch — does NOT support NVIDIA GeForce GTX 1080 Ti
-   3) 595.112.07  ★ Production Branch — does NOT support NVIDIA GeForce GTX 1080 Ti
+   2) 620.70.06  ★ Production Branch — does NOT support NVIDIA GeForce GTX 1080 Ti
+   3) 615.78.08  ★ New Feature Branch — does NOT support NVIDIA GeForce GTX 1080 Ti
 ```
 
 - The menu cursor starts on the recommended version; with none, on the Production branch, and never on a Beta.
