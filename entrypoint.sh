@@ -112,6 +112,78 @@ env_is_true() {
     esac
 }
 
+# ── Target GPU fit ──────────────────────────────────────────────────────────
+# gpu_fit_report JSON MODULE TARGETS
+#   TARGETS is a comma list of devid:subvendor:subdevice (lowercase hex, the
+#   last two may be empty). Prints one line per target:
+#     ok|<id>|<name>   legacy|<id>|<name>|<branch>   unlisted|<id>|
+#     module|<id>|<name>|<flavor that would drive it>
+# Rules (NVIDIA's supported-gpus.json): only rows WITHOUT legacybranch count as
+# "driven"; open needs kernelopen; proprietary needs gsp_proprietary_supported
+# or no kernelopen (pre-GSP). Uses only jq 1.6 features (Debian bookworm).
+gpu_fit_report() {
+    local json="$1" module="$2" targets="$3" target id sv sd
+    local -a parts
+    IFS=',' read -r -a parts <<< "${targets}"
+    for target in "${parts[@]}"; do
+        [[ -n "${target}" ]] || continue
+        IFS=':' read -r id sv sd <<< "${target}"
+        id="${id,,}"; id="${id#0x}"; sv="${sv,,}"; sv="${sv#0x}"; sd="${sd,,}"; sd="${sd#0x}"
+        jq -r --arg id "${id}" --arg sv "${sv}" --arg sd "${sd}" --arg mod "${module,,}" '
+            def norm: ascii_downcase | ltrimstr("0x");
+            def has_feat($f): ((.features // []) | map(select(. == $f)) | length) > 0;
+            [.chips[] | select((.devid | norm) == $id)] as $rows
+            | ($rows | map(select(has("legacybranch") | not))) as $cur
+            | ($rows | map(select(has("legacybranch")))) as $leg
+            | if ($cur | length) > 0 then
+                ($cur | map(select(((.subvendorid // "") | norm) == $sv and ((.subdevid // "") | norm) == $sd))) as $exact
+                | (if $sv != "" and $sd != "" and ($exact | length) > 0 then $exact[0] else $cur[0] end) as $r
+                | ($r | has_feat("kernelopen")) as $open
+                | ($r | has_feat("gsp_proprietary_supported")) as $gsp
+                | (if $mod == "open" then $open else ($gsp or ($open | not)) end) as $fits
+                | if $fits then "ok|\($id)|\($r.name)"
+                  else "module|\($id)|\($r.name)|\(if $mod == "open" then "proprietary" else "open" end)" end
+              elif ($leg | length) > 0 then
+                "legacy|\($id)|\($leg[0].name)|\($leg[0].legacybranch)"
+              else "unlisted|\($id)|" end
+        ' "${json}"
+    done
+}
+
+# Stops the build before the long compile when the driver (or module flavor)
+# won't drive the GPUs the user chose in ./configure.sh.
+check_target_gpus() {
+    local json="${NVIDIA_SRC_ROOT}/supported-gpus/supported-gpus.json" module report kind id name extra
+    if [[ -z "${NVIDIA_TARGET_GPUS:-}" ]]; then
+        info "No target GPUs recorded; skipping the GPU support check."
+        return 0
+    fi
+    if env_is_true "${SKIP_GPU_CHECK:-false}"; then
+        warn "SKIP_GPU_CHECK=true; not checking that NVIDIA ${NVIDIA_VERSION} supports ${NVIDIA_TARGET_GPUS}."
+        return 0
+    fi
+    if [[ ! -f "${json}" ]]; then
+        warn "NVIDIA ${NVIDIA_VERSION} ships no supported-gpus.json; cannot check the target GPUs."
+        return 0
+    fi
+    if installer_supports_option "--kernel-module-type"; then
+        module="${NVIDIA_KERNEL_MODULE_TYPE}"
+    else
+        module="proprietary"
+    fi
+    report="$(gpu_fit_report "${json}" "${module}" "${NVIDIA_TARGET_GPUS}")" \
+        || die "Could not read ${json} to check the target GPUs (set SKIP_GPU_CHECK=true to build anyway)."
+    while IFS='|' read -r kind id name extra; do
+        [[ -n "${kind}" ]] || continue
+        case "${kind}" in
+            ok) ok "${name} (10de:${id}) is supported by NVIDIA ${NVIDIA_VERSION} (${module} modules)" ;;
+            legacy) die "${name} (10de:${id}) is not supported by NVIDIA ${NVIDIA_VERSION}; NVIDIA lists it for the ${extra} legacy driver. Re-run ./configure.sh and pick ${extra}." ;;
+            unlisted) die "10de:${id} is not in NVIDIA ${NVIDIA_VERSION}'s supported list." ;;
+            module) die "${name} (10de:${id}) needs ${extra} kernel modules. Re-run ./configure.sh --module ${extra}, or set SKIP_GPU_CHECK=true to build anyway." ;;
+        esac
+    done <<< "${report}"
+}
+
 # Returns 0 (true) when the extracted nvidia-installer recognizes a given long
 # option. Older driver branches lack many flags that newer ones added, and the
 # installer aborts on the FIRST unrecognized option, so we cannot hardcode a
@@ -971,6 +1043,8 @@ NVIDIA_SRC_ROOT="$(dirname "${NVIDIA_INSTALLER_BIN}")"
 chmod +x "${NVIDIA_INSTALLER_BIN}" 2>/dev/null || true   # in case we run it directly
 ok "Installer option probe ready: ${NVIDIA_INSTALLER_BIN}"
 
+check_target_gpus
+
 # ── Apply user-supplied source patches into the extracted tree ───────────────
 USE_EXTRACTED_TREE=false
 if [[ ${#PATCH_FILES[@]} -gt 0 ]]; then
@@ -1489,6 +1563,15 @@ mkdir -p "${EXT_RELEASE_DIR}"
 info "Writing extension-release.nvidia metadata …"
 write_truenas_extension_release "${EXT_RELEASE_DIR}/extension-release.nvidia"
 ok "extension-release.nvidia written"
+
+# GPU metadata for deploy-nvidia.sh: NVIDIA's list plus what this image was built as.
+if [[ -f "${NVIDIA_SRC_ROOT}/supported-gpus/supported-gpus.json" ]]; then
+    mkdir -p "${STAGING_DIR}/usr/share/nvidia-sysext"
+    cp "${NVIDIA_SRC_ROOT}/supported-gpus/supported-gpus.json" "${STAGING_DIR}/usr/share/nvidia-sysext/supported-gpus.json"
+    printf 'NVIDIA_VERSION=%s\nNVIDIA_KERNEL_MODULE_TYPE=%s\n' "${NVIDIA_VERSION}" "${NVIDIA_KERNEL_MODULE_TYPE}" \
+        > "${STAGING_DIR}/usr/share/nvidia-sysext/build-info"
+    ok "GPU list and build-info embedded in the image"
+fi
 
 # =============================================================================
 # PHASE 6 — Build the final squashfs image

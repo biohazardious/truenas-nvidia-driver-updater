@@ -1,0 +1,9 @@
+{
+  "chips": [
+    {"devid": "0x1180", "name": "GeForce GTX 680", "legacybranch": "470.xx", "features": ["hdmi4k", "vdpaufeaturesetD"]},
+    {"devid": "0x1B80", "name": "NVIDIA GeForce GTX 1080", "legacybranch": "580.xx", "features": ["kernelopen"]},
+    {"devid": "0x1FF0", "subdevid": "0x1612", "subvendorid": "0x17AA", "name": "NVIDIA T1000 8GB", "features": ["dpycbcr420", "dpgsynccompatible", "hdmi4k60rgb444", "hdmigsynccompatible", "runtimepm", "vdpaufeaturesetJ", "kernelopen", "gsp_proprietary_supported"]},
+    {"devid": "0x2C02", "name": "NVIDIA GeForce RTX 5080", "features": ["dpycbcr420", "dpgsynccompatible", "hdmi4k60rgb444", "hdmigsynccompatible", "runtimepm", "vdpaufeaturesetK", "kernelopen"]},
+    {"devid": "0x2D30", "subdevid": "0x2054", "subvendorid": "0x10DE", "name": "NVIDIA RTX PRO 2000 Blackwell", "features": ["dpycbcr420", "dpgsynccompatible", "hdmi4k60rgb444", "hdmigsynccompatible", "runtimepm", "vdpaufeaturesetK", "kernelopen"]}
+  ]
+}

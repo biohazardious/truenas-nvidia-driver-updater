@@ -17,7 +17,7 @@ RUN printf 'deb http://deb.debian.org/debian trixie main\n' > /etc/apt/sources.l
 RUN apt-get update && apt-get install -y \
     build-essential wget curl squashfs-tools kmod xz-utils \
     bison flex libelf-dev bc rsync patch \
-    libssl-dev pkg-config pciutils \
+    libssl-dev pkg-config pciutils jq \
     gnupg ca-certificates \
     && apt-get install -y -t trixie gcc-13 gcc-14 \
     && rm -rf /var/lib/apt/lists/*
