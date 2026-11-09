@@ -60,6 +60,17 @@ fetch_url() {
     fi
 }
 
+# 0 when $1, the exit status of fetch_url, means the host could not be reached
+# at all (no DNS, refused, timed out, TLS failed) rather than an HTTP error.
+fetch_unreachable() {
+    if [[ "${FETCH_CMD:-curl}" == "curl" ]]; then
+        case "$1" in 5|6|7|28|35|52|56) return 0 ;; esac
+    else
+        case "$1" in 4|5) return 0 ;; esac
+    fi
+    return 1
+}
+
 # Fetch at most $2 bytes of the body of $1 (a Range request; the output is
 # capped even when the server ignores Range and sends the whole file).
 fetch_url_range() {
@@ -209,6 +220,10 @@ declare -gA TRUENAS_VERSION_TRAIN=()
 declare -gA TRUENAS_VERSION_TAGS=()
 declare -gA TRUENAS_VERSION_PROFILE=()
 TRUENAS_LIST_TRIED=false
+# Train of a version that was given or chosen here rather than listed: --train,
+# the train typed in the wizard, TRUENAS_TRAIN in .env. Not cleared by
+# fetch_truenas_versions. Filled by remember_truenas_train.
+declare -gA TRUENAS_CHOSEN_TRAIN=()
 
 # The host's own release record (written by TrueNAS; holds "train").
 TRUENAS_MANIFEST_FILE="${TRUENAS_MANIFEST_FILE:-/data/manifest.json}"
@@ -249,17 +264,27 @@ print(t if isinstance(t, str) else "")' "${file}" 2>/dev/null)" || train=""
     return 0
 }
 
-# Train of the selected version: from the download.truenas.com list, else —
-# for the version this host runs (which the list may not have indexed yet) —
-# from the host's manifest.json. Prints nothing when neither knows it.
+# Train of the selected version: from the download.truenas.com list, else the
+# one given or chosen for it (--train, the wizard, .env), else — for the version
+# this host runs (which the list may not have indexed yet) — from the host's
+# manifest.json. Prints nothing when none of them knows it.
 resolve_selected_train() {
     local version="$1"
     if [[ -n "${TRUENAS_VERSION_TRAIN[${version}]:-}" ]]; then
         printf '%s\n' "${TRUENAS_VERSION_TRAIN[${version}]}"
+    elif [[ -n "${version}" ]] && [[ -n "${TRUENAS_CHOSEN_TRAIN[${version}]:-}" ]]; then
+        printf '%s\n' "${TRUENAS_CHOSEN_TRAIN[${version}]}"
     elif [[ -n "${version}" ]] && [[ "${version}" == "${DETECTED_TRUENAS_VERSION:-}" ]]; then
         host_truenas_train
     fi
     return 0
+}
+
+# Remember the train given or chosen for a version, so the kernel lookup and
+# every check after it use it. Ignores an empty version or a non-train.
+remember_truenas_train() {
+    [[ -n "${1:-}" ]] && valid_train "${2:-}" || return 0
+    TRUENAS_CHOSEN_TRAIN["$1"]="$2"
 }
 
 # Ask for the train once (an invalid answer is asked again). Empty is allowed:
@@ -296,6 +321,7 @@ wizard_truenas_train() {
         warn "The release folder of TrueNAS ${version} is not known here."
         prompt_truenas_train train
     fi
+    remember_truenas_train "${version}" "${train}"
     _wizard_train="${train}"
 }
 
@@ -369,8 +395,15 @@ fetch_truenas_release_labels() {
     for v in "$@"; do wanted["${v}"]=1; done
 
     local -a trains=()
-    local t trains_json="" releases_json="" line ver profile lts label
-    trains_json="$(fetch_url "https://update.truenas.com/scale/trains_v2.json" 2>/dev/null)" || trains_json=""
+    local t trains_json="" releases_json="" line ver profile lts label rc=0
+    trains_json="$(fetch_url "https://update.truenas.com/scale/trains_v2.json" 2>/dev/null)" || rc=$?
+    # update.truenas.com unreachable: asking each train's releases.json too would
+    # only wait out the same timeout once per train.
+    if (( rc != 0 )) && fetch_unreachable "${rc}"; then
+        warn "TrueNAS release labels unavailable — update.truenas.com could not be read"
+        return 1
+    fi
+    (( rc == 0 )) || trains_json=""
     while IFS= read -r t; do
         [[ -n "${t}" && "${t}" != *Nightlies* ]] || continue
         valid_train "${t}" || continue
@@ -450,8 +483,12 @@ require_supported_truenas() {
     exit 1
 }
 
+# Fills TRUENAS_VERSIONS and TRUENAS_VERSION_TRAIN from download.truenas.com and
+# labels them from update.truenas.com; --no-labels skips the labels (nothing
+# shows them on the non-interactive path).
 fetch_truenas_versions() {
-    local html=""
+    local html="" labels=true
+    [[ "${1:-}" == "--no-labels" ]] && labels=false
     TRUENAS_LIST_TRIED=true
 
     info "Fetching TrueNAS versions from download.truenas.com …"
@@ -465,13 +502,14 @@ fetch_truenas_versions() {
     #   href="TrueNAS-SCALE-Goldeye/25.10.8"
     #   href="TrueNAS-27-RC/27.0.0-RC.1"
     # so the parent folder of every version is its train. Files (ISOs, nightly
-    # builds) and deeper paths are not releases.
+    # builds) and deeper paths are not releases. Kept in page order, like the
+    # build's find_truenas_train, so a version listed twice gets the same train.
     local raw_versions=""
     raw_versions="$(grep -oE 'href="TrueNAS-[^"/]+/[0-9][^"]*"' <<< "${html}" \
         | sed 's/^href="//;s/"$//;s:/$::' \
         | grep -vE '\.(iso|gpg|sha256|mtree|update|deb|gz|xz|bz2)$' \
         | grep -vE 'Nightlies|MASTER|packages' \
-        | sort -u)" || true
+        | awk '!seen[$0]++')" || true
 
     if [[ -z "${raw_versions}" ]]; then
         warn "Could not parse TrueNAS versions from download page"
@@ -490,7 +528,7 @@ fetch_truenas_versions() {
         valid_train "${train}" || continue
         [[ "${version}" =~ ^[0-9]+\.[0-9]+[0-9A-Za-z.-]*$ ]] || continue
         truenas_version_supported "${version}" || continue
-        # A version listed under two trains keeps the first one.
+        # A version listed under two trains keeps the first one on the page.
         [[ -n "${TRUENAS_VERSION_TRAIN[${version}]:-}" ]] && continue
 
         TRUENAS_VERSION_TRAIN["${version}"]="${train}"
@@ -513,7 +551,9 @@ fetch_truenas_versions() {
     TRUENAS_VERSIONS=("${sorted_arr[@]}")
 
     # TrueNAS's own labels; the list is complete without them.
-    fetch_truenas_release_labels "${TRUENAS_VERSIONS[@]}" || true
+    if [[ "${labels}" == true ]]; then
+        fetch_truenas_release_labels "${TRUENAS_VERSIONS[@]}" || true
+    fi
 
     ok "Found ${#TRUENAS_VERSIONS[@]} TrueNAS versions"
     return 0
@@ -1852,6 +1892,7 @@ read_existing_config() {
         warn "Ignoring the release folder in .env (${EXISTING_TRAIN}): not a folder name; the build will look it up."
         EXISTING_TRAIN=""
     fi
+    remember_truenas_train "${EXISTING_TRUENAS}" "${EXISTING_TRAIN}"
 
     return 0
 }
@@ -1965,6 +2006,7 @@ main() {
             err "Invalid --train '${CLI_TRAIN}' (expected a release folder such as TrueNAS-SCALE-Goldeye)"
             exit 1
         fi
+        remember_truenas_train "${CLI_TRUENAS}" "${CLI_TRAIN}"
 
         local selected_truenas="${CLI_TRUENAS}"
         local selected_nvidia="${CLI_NVIDIA}"
@@ -2006,7 +2048,7 @@ main() {
         # host's manifest. Nothing is asked here; left empty, the build finds it.
         local selected_train="${CLI_TRAIN}"
         if [[ -z "${selected_train}" ]]; then
-            fetch_truenas_versions || true
+            fetch_truenas_versions --no-labels || true
             selected_train="$(resolve_selected_train "${selected_truenas}")"
             [[ -n "${selected_train}" ]] \
                 || info "Release folder of TrueNAS ${selected_truenas} not found here — the build will look it up."
@@ -2129,6 +2171,8 @@ main() {
                     UI_MENU_DEFAULT="$(driver_menu_default)"
                     ui_menu selected_nvidia "NVIDIA Driver" \
                         "Select new NVIDIA driver:" "${nvidia_menu_args[@]}"
+                    # Reads the kernel here, in this shell, so the checks below reuse it.
+                    announce_truenas_kernel "${selected_truenas}"
                     advise_legacy_driver "${selected_nvidia}" "${selected_truenas}"
                     advise_gpu_branch_fit "${selected_nvidia}"
                     advise_patches "${selected_truenas}"
