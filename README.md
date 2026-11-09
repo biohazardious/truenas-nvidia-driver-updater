@@ -290,7 +290,8 @@ The menu can't pass `--force-kernel` or `--force-gpu`. If a menu deploy or rollb
 
 ── GPUs ───────────────────────────────────────────────────
   (each NVIDIA card with its bound driver, and whether the installed
-   driver drives it; vfio-pci cards are listed as reserved for a VM)
+   driver drives it; vfio-pci cards are listed as reserved for a VM,
+   and an nvidia-bound card a VM passes through is flagged)
 
 ── Problems ────────────────────────────────────────────────
 [WARN]  The installed image was built for kernel 6.12.113-production+truenas,
@@ -299,6 +300,8 @@ The menu can't pass `--force-kernel` or `--force-gpu`. If a menu deploy or rollb
 ```
 
 It reads the driver version and target kernel out of the image itself (from the squashfs listing — nothing is extracted), reports the activation symlinks, `systemd-sysext status`, the middleware integration state and available backups, and **exits non-zero when it finds a problem** (including an installed driver that doesn't drive a non-reserved GPU) so it can be used in a health check. A missing `/dev/nvidia-uvm` is reported with a note rather than counted as a problem — a box that only transcodes never needs it, so it must not flip the exit status of a health check.
+
+It also counts as a problem a card that a VM passes through (the GPU or its HDMI audio function) while `nvidia` still holds it, which happens when the card was taken out of **System → Advanced → Isolated GPU Devices** but left in the VM. Starting that VM makes libvirt unbind the card from `nvidia`, and the driver's audio power-management code then dereferences the wrong driver's data and panics the kernel, so the host reboots ([NVIDIA/open-gpu-kernel-modules#1365](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1365), seen with 620.70.06). Isolate the card and reboot, or remove it from the VM. The VM list comes from `midclt call vm.query`. Without it, this check is skipped.
 
 A pending reboot gets a note too. If the loaded kernel module differs from the driver in the image, `--check` names both versions and doesn't count it as a problem, because it clears by itself. It stays quiet when the image was built for a different kernel, since a reboot wouldn't help there.
 

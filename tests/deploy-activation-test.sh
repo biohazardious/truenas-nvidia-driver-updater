@@ -62,6 +62,12 @@ STUB
 #!/bin/bash
 echo "midclt $*" >> "${SB}/events"
 link="${SB}/run/extensions/nvidia.raw"
+# The VMs a test placed in ${SB}/vms.json; fails like a box without VMs support otherwise.
+if [[ "$*" == *vm.query* ]]; then
+    [[ -f "${SB}/vms.json" ]] || exit 1
+    cat "${SB}/vms.json"
+    exit 0
+fi
 if [[ "$*" == *docker.config* ]]; then
     echo "{\"nvidia\": $(cat "${SB}/integration")}"
     exit 0
@@ -437,7 +443,7 @@ put_image() {
 gpu_sandbox() {
     rm -rf "${WORK}/gpu"
     local s; s="$(new_sandbox gpu true "${3:-OLD}")"
-    cp "${FIXTURES}/$1" "${s}/lspci"
+    if [[ "$1" == /* ]]; then cp "$1" "${s}/lspci"; else cp "${FIXTURES}/$1" "${s}/lspci"; fi
     put_image "${s}" "$2"
 }
 
@@ -475,6 +481,7 @@ menu_with() {
 # that image; output in <sb>/check-out
 check_with() {
     gpu_sandbox "$1" "$2" "NEW DRIVER=580.196.07"
+    [[ -n "${VMS:-}" ]] && printf '%s' "${VMS}" > "${WORK}/gpu/vms.json"
     load_modules "${WORK}/gpu"; loaded_driver "${WORK}/gpu" 580.196.07
     echo "580.196.07, Test GPU" > "${WORK}/gpu/smi"
     SB="${WORK}/gpu" PATH="${WORK}/gpu/bin:${PATH}" \
@@ -565,6 +572,49 @@ check "lists it under Problems"  has "${sb}/check-out" "does not drive"
 check_with lspci-gtx1080.txt none
 check "no metadata: no support line" lacks "${sb}/check-out" "supported by the installed driver"
 check "no metadata: still lists the card" has "${sb}/check-out" "(0000:01:00.0): no driver bound"
+
+echo "--check: a GPU assigned to a VM but not isolated"
+# Today's T1000 box after its isolation was removed: nvidia and snd_hda_intel
+# hold 03:00.x at boot, so starting the VM unbinds them and panics the kernel.
+UNISOLATED="${WORK}/lspci-t1000-on-nvidia.txt"
+sed -e '/^0000:03:00.0/,/^0000:03:00.1/s/Kernel driver in use: vfio-pci/Kernel driver in use: nvidia/' \
+    -e '/^0000:03:00.1/,/^0000:81/s/Kernel driver in use: vfio-pci/Kernel driver in use: snd_hda_intel/' \
+    "${FIXTURES}/lspci-truenas-t1000-vfio-rtxpro2000.txt" > "${UNISOLATED}"
+vm_with() {  # vm_with <name> <pptdev>... — a 25.x vm.query result with those PCI devices
+    local name="$1" d devs=""; shift
+    for d in "$@"; do devs+="${devs:+,}{\"attributes\": {\"dtype\": \"PCI\", \"pptdev\": \"${d}\"}}"; done
+    printf '[{"id": 9, "name": "%s", "devices": [%s, {"attributes": {"dtype": "DISK", "path": "/dev/zvol/x"}}]}]' "${name}" "${devs}"
+}
+check "fixture puts the T1000 on nvidia" grep -q "Kernel driver in use: nvidia" <(sed -n '/^0000:03:00.0/,/^0000:03:00.1/p' "${UNISOLATED}")
+
+VMS="$(vm_with Linux pci_0000_03_00_1 pci_0000_03_00_0)"
+check "an unisolated GPU in a VM fails --check" is "$(check_with "${UNISOLATED}" open-580; echo $RC)" 1
+check "the GPU line names the VM"   has "${sb}/check-out" "assigned to VM 'Linux' but not isolated"
+check "explains it under Problems"  has "${sb}/check-out" "T1000 8GB (0000:03:00.0) is assigned to VM 'Linux' but bound to nvidia"
+check "says how to fix it"          has "${sb}/check-out" "Isolated GPU Devices"
+check "names it once in Problems"   is "$(count_in "${sb}/check-out" "is assigned to VM 'Linux' but bound to nvidia")" 1
+check "the host's own GPU is fine"  lacks "${sb}/check-out" "0000:81:00.0) is assigned"
+
+VMS="$(vm_with Linux pci_0000_03_00_1)"
+check "only the audio function in a VM fails too" is "$(check_with "${UNISOLATED}" open-580; echo $RC)" 1
+check "audio only: still names the GPU" has "${sb}/check-out" "T1000 8GB (0000:03:00.0) is assigned to VM 'Linux' but bound to nvidia"
+
+VMS='[{"id": 3, "name": "Old", "devices": [{"dtype": "PCI", "attributes": {"pptdev": "pci_0000_03_00_0"}}]}]'
+check "24.10 device shape is read" is "$(check_with "${UNISOLATED}" open-580; echo $RC)" 1
+check "24.10: names the VM"         has "${sb}/check-out" "assigned to VM 'Old' but bound to nvidia"
+
+VMS="$(vm_with Linux pci_0000_03_00_1 pci_0000_03_00_0)"
+check "an isolated GPU in a VM is fine" is "$(check_with lspci-truenas-t1000-vfio-rtxpro2000.txt open-580; echo $RC)" 0
+check "isolated: no VM warning"     lacks "${sb}/check-out" "not isolated"
+
+VMS='[]'
+check "no VMs: an nvidia GPU is fine" is "$(check_with "${UNISOLATED}" open-580; echo $RC)" 0
+VMS=''
+check "vm.query failing: still fine" is "$(check_with "${UNISOLATED}" open-580; echo $RC)" 0
+check "vm.query failing: no VM line" lacks "${sb}/check-out" "assigned to VM"
+VMS='not json'
+check "garbage from vm.query: still fine" is "$(check_with "${UNISOLATED}" open-580; echo $RC)" 0
+VMS=''
 
 echo ""
 echo "${PASS} passed, ${FAIL} failed"

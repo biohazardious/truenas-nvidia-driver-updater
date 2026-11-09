@@ -66,6 +66,7 @@ CHECK_ONLY=0            # 1 = report the current state and exit
 FORCE_KERNEL=0          # 1 = deploy an image built for another kernel anyway
 FORCE_GPU=0             # 1 = deploy an image that won't drive this host's GPUs anyway
 GPU_UNSUPPORTED=()      # --check: "<card> (<slot>) — <reason>" the installed driver can't drive
+GPU_VM_UNISOLATED=()    # --check: "<card> (<slot>)|<vm>" — nvidia-bound card a VM passes through
 GPU_FIT_HOST=""; GPU_FIT_VERSION=""; GPU_FIT_MODULE=""; GPU_FIT_REPORT=""   # set by image_gpu_fit
 UNINSTALL=0             # 1 = deploy the stock image instead of a given one
 PERSIST_ACTION=""       # "on"/"off" = set up / remove update-persistence
@@ -845,12 +846,44 @@ check_image_gpus() {
 Nothing was changed. Pass --force-gpu to install this image anyway."
 }
 
+# PCI devices passed through to VMs, as `<slot>\t<vm name>` with the slot in
+# lspci -D form (0000:03:00.0). Prints nothing when midclt or python3 is
+# missing or vm.query fails. 25.x keeps dtype in attributes, 24.10 next to them.
+vm_pci_devices() {
+    command -v midclt >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || return 0
+    local json
+    json="$(midclt call vm.query 2>/dev/null)" || return 0
+    python3 -I -c '
+import json, re, sys
+try:
+    vms = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for vm in vms if isinstance(vms, list) else []:
+    for dev in vm.get("devices") or []:
+        attrs = dev.get("attributes") or {}
+        if (attrs.get("dtype") or dev.get("dtype")) != "PCI":
+            continue
+        m = re.fullmatch(r"pci_([0-9a-f]{4})_([0-9a-f]{2})_([0-9a-f]{2})_([0-7])",
+                         str(attrs.get("pptdev", "")).lower())
+        if m:
+            print("%s:%s:%s.%s\t%s" % (*m.groups(), vm.get("name", "?")))
+' <<< "${json}" 2>/dev/null || true
+}
+
 # The GPUs section of --check: what each card is bound to and, when the
 # installed image carries NVIDIA's list, whether its driver drives the card.
 # Cards it does not drive are collected in GPU_UNSUPPORTED for the summary.
+#
+# A card nvidia holds that a VM passes through (the GPU or its audio function)
+# goes into GPU_VM_UNISOLATED: starting that VM makes libvirt unbind it from
+# nvidia, and nv_audio_dynamic_power() then dereferences the audio function's
+# vfio-pci drvdata as an ALSA card and panics the kernel
+# (NVIDIA/open-gpu-kernel-modules#1365, seen with 620.70.06). An isolated card
+# is on vfio-pci from boot and never takes that path.
 report_gpus() {
-    local gpus="" version="" report="" label state reason
-    local slot devid subsys driver name kind extra
+    local gpus="" version="" report="" label state reason vm_devs="" vm
+    local slot devid subsys driver name kind extra dev_slot dev_vm
     local -A fit=() fit_name=()
 
     if ! gpus="$(host_nvidia_gpus)"; then
@@ -884,6 +917,17 @@ report_gpus() {
             *)        state="driven by ${driver}" ;;
         esac
         echo "  ${label} (${slot}): ${state}"
+        if [[ "${driver}" == nvidia ]]; then
+            [[ -n "${vm_devs}" ]] || vm_devs="$(vm_pci_devices)"$'\n'
+            vm=""
+            while IFS=$'\t' read -r dev_slot dev_vm; do
+                [[ "${dev_slot%.*}" == "${slot%.*}" ]] && { vm="${dev_vm}"; break; }
+            done <<< "${vm_devs}"
+            if [[ -n "${vm}" ]]; then
+                echo "      assigned to VM '${vm}' but not isolated — starting it can crash the host"
+                GPU_VM_UNISOLATED+=("${label} (${slot})|${vm}")
+            fi
+        fi
         [[ "${driver}" != vfio-pci ]] && [[ -n "${fit[${slot}]:-}" ]] || continue
         kind="${fit[${slot}]%%|*}"; extra="${fit[${slot}]#*|}"
         case "${kind}" in
@@ -978,7 +1022,7 @@ report_state() {
     echo ""
     echo -e "${BOLD}── GPUs ────────────────────────────────────────────────────${NC}"
     report_gpus
-    problems=$((problems + ${#GPU_UNSUPPORTED[@]}))
+    problems=$((problems + ${#GPU_UNSUPPORTED[@]} + ${#GPU_VM_UNISOLATED[@]}))
 
     echo ""
     echo -e "${BOLD}── Activation ──────────────────────────────────────────────${NC}"
@@ -1096,6 +1140,12 @@ report_state() {
     local gpu
     for gpu in "${GPU_UNSUPPORTED[@]}"; do
         warn "The installed driver does not drive ${gpu}. Rebuild with ./configure.sh and redeploy."
+    done
+    for gpu in "${GPU_VM_UNISOLATED[@]}"; do
+        warn "${gpu%|*} is assigned to VM '${gpu##*|}' but bound to nvidia, not isolated."
+        warn "  Starting that VM unbinds it from nvidia, which can panic the kernel and reboot"
+        warn "  the host (NVIDIA open-gpu-kernel-modules #1365). Add it to System → Advanced →"
+        warn "  Isolated GPU Devices and reboot, or remove it from the VM."
     done
     if [[ -n "${PERSIST_STALE:-}" ]]; then
         warn "The copy saved for update-persistence was built for kernel ${PERSIST_STALE},"
