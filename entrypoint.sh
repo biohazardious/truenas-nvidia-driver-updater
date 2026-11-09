@@ -705,6 +705,36 @@ detect_kernel_build_gcc_major() {
     return 1
 }
 
+# install_kernel_gcc MAJOR — best effort: make gcc-MAJOR available when the
+# image lacks the compiler the kernel was built with. Tries the suites already
+# configured, then Debian's rolling `testing` and `unstable` (each added with
+# pin priority 50, so nothing else moves to them). Returns 0 when gcc-MAJOR is
+# on PATH afterwards, 1 otherwise; never dies, the caller falls back.
+install_kernel_gcc() {
+    local major="$1" suite=""
+    local list_dir="${APT_SOURCES_DIR:-/etc/apt/sources.list.d}"
+    local pref_dir="${APT_PREFERENCES_DIR:-/etc/apt/preferences.d}"
+    [[ "${major}" =~ ^[0-9]+$ ]] || return 1
+    command -v "gcc-${major}" >/dev/null 2>&1 && return 0
+    command -v apt-get >/dev/null 2>&1 || return 1
+
+    apt-get update >&2 || return 1
+    if apt-get install -y --no-install-recommends "gcc-${major}" >&2 \
+        && command -v "gcc-${major}" >/dev/null 2>&1; then
+        return 0
+    fi
+    for suite in testing unstable; do
+        printf 'deb http://deb.debian.org/debian %s main\n' "${suite}" > "${list_dir}/${suite}.list" || return 1
+        printf 'Package: *\nPin: release a=%s\nPin-Priority: 50\n' "${suite}" > "${pref_dir}/${suite}" || return 1
+        apt-get update >&2 || continue
+        if apt-get install -y --no-install-recommends -t "${suite}" "gcc-${major}" >&2 \
+            && command -v "gcc-${major}" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 select_nvidia_build_cc() {
     local override="${NVIDIA_BUILD_CC:-}"
     local detected_cc=""
@@ -724,6 +754,10 @@ select_nvidia_build_cc() {
     local kgcc=""
     kgcc="$(detect_kernel_build_gcc_major)" || true
     if [[ -n "${kgcc}" ]]; then
+        if ! command -v "gcc-${kgcc}" >/dev/null 2>&1; then
+            info "Installing gcc-${kgcc} to match the kernel's compiler …" >&2
+            install_kernel_gcc "${kgcc}" || true
+        fi
         if command -v "gcc-${kgcc}" >/dev/null 2>&1; then
             info "Kernel was built with GCC ${kgcc}; matching it (gcc-${kgcc})" >&2
             printf 'gcc-%s\n' "${kgcc}"

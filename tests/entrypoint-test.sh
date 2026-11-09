@@ -310,6 +310,44 @@ check "legacy message has the escape" has <(msg 1180:: open) "SKIP_GPU_CHECK=tru
 check "unlisted message" has <(msg dead:: open) "10de:dead is not in NVIDIA 580.196.07's supported list."
 check "unlisted message has the escape" has <(msg dead:: open) "SKIP_GPU_CHECK=true"
 
+# install_kernel_gcc: apt-get is a PATH stub that logs its arguments and only
+# "installs" gcc-15 (a stub file in GBIN) when asked for it from -t ${APT_OK_SUITE}.
+echo "install_kernel_gcc"
+GBIN="${WORK}/gcc-bin"; ASRC="${WORK}/apt-src"; APREF="${WORK}/apt-pref"
+mkdir -p "${GBIN}" "${ASRC}" "${APREF}"
+cat > "${GBIN}/apt-get" <<'STUB'
+#!/bin/bash
+echo "apt-get $*" >> "${APT_LOG}"
+[[ "$1" == update ]] && exit 0
+if [[ -n "${APT_OK_SUITE:-}" && " $* " == *" -t ${APT_OK_SUITE} "* ]]; then
+    printf '#!/bin/bash\n' > "${GBIN}/gcc-${@: -1}"; mv "${GBIN}/gcc-${@: -1}" "${GBIN}/${@: -1}"
+    chmod +x "${GBIN}/${@: -1}"; exit 0
+fi
+exit 100
+STUB
+chmod +x "${GBIN}/apt-get"
+igcc() {  # igcc MAJOR [suite apt will succeed from]; apt log in $WORK/apt.log
+    : > "${WORK}/apt.log"
+    ( export PATH="${GBIN}:${PATH}" GBIN APT_LOG="${WORK}/apt.log" APT_OK_SUITE="${2:-}" \
+             APT_SOURCES_DIR="${ASRC}" APT_PREFERENCES_DIR="${APREF}"
+      source <(echo 'set -euo pipefail; info() { :; }; warn() { :; }; die() { exit 1; }'; lift install_kernel_gcc)
+      install_kernel_gcc "$1" )
+}
+rm -f "${GBIN}"/gcc-*
+check "missing gcc installed"        is "$(igcc 15 unstable && echo ok)" ok
+check "apt asked for gcc-15"         grep -q 'install .*gcc-15' "${WORK}/apt.log"
+check "tries testing then unstable"  is "$(grep -oE -- '-t (testing|unstable)' "${WORK}/apt.log" | tr '\n' ' ')" "-t testing -t unstable "
+check "no Debian codename added"     not grep -rqE 'forky|duke|sid|trixie|bookworm' "${WORK}/apt.log" "${ASRC}" "${APREF}"
+check "rolling suites pinned at 50"  is "$(cat "${APREF}"/* | grep -c 'Pin-Priority: 50')" 2
+rm -f "${GBIN}"/gcc-*
+check "testing is enough"            is "$(igcc 15 testing && echo ok)" ok
+check "unstable not tried then"      not grep -q -- '-t unstable' "${WORK}/apt.log"
+rm -f "${GBIN}"/gcc-*
+check "no suite has it → fails"      is "$(igcc 15 >/dev/null 2>&1 && echo ok || echo failed)" failed
+touch "${GBIN}/gcc-12"; chmod +x "${GBIN}/gcc-12"
+check "installed gcc → no apt"       is "$(igcc 12 && echo ok; cat "${WORK}/apt.log")" ok
+check "bad major refused"            is "$(igcc '1;x' >/dev/null 2>&1 && echo ok || echo failed)" failed
+
 echo ""
 echo "${PASS} passed, ${FAIL} failed"
 [[ ${FAIL} -eq 0 ]]

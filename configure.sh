@@ -531,15 +531,6 @@ NVIDIA_MIN_MAJOR=470
 NVIDIA_UNIX_PAGE_URL="https://www.nvidia.com/en-us/drivers/unix/"
 NVIDIA_LOOKUP_URL="https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php?func=DriverManualLookup"
 
-# Used when the page can't be read or yields no usable query (TYPE|PARAMS,
-# copied from the linux64 blocks of that page).
-NVIDIA_LOOKUP_FALLBACK=(
-    "PB|psid=133&pfid=1075&osID=12&languageCode=1033&beta=0&isWHQL=0&dltype=-1&dch=0&upCRD=null&qnf=0&ctk=null&sort1=&numberOfResults=1"
-    "NFB|psid=133&pfid=1075&osID=12&languageCode=1033&beta=null&isWHQL=0&dltype=-1&dch=0&upCRD=null&qnf=1&ctk=null&sort1=1&numberOfResults=1"
-    "BETA|psid=133&pfid=1075&osID=12&languageCode=1033&beta=1&isWHQL=0&dltype=-1&dch=0&upCRD=null&qnf=0&ctk=null&sort1=1&numberOfResults=1"
-    "Legacy|psid=122&pfid=944&osID=12&languageCode=1033&isWHQL=0&beta=0&dltype=-1&dch=0&upCRD=null&qnf=0&ctk=null&sort1=1&release=470&numberOfResults=1"
-)
-
 # Extract major version prefix from a version string (e.g. "595.80" → "595")
 nvidia_major() {
     [[ "$1" =~ ^([0-9]+)\. ]] && printf '%s' "${BASH_REMATCH[1]}"
@@ -908,8 +899,8 @@ nvidia_lookup_version() {
 
 fetch_nvidia_branch_info() {
     # Label driver versions using the queries NVIDIA's own page defines:
-    #   1. read the lookup queries from the unix-drivers page (built-in copy if
-    #      the page is unreadable)
+    #   1. read the lookup queries from the unix-drivers page (page unreadable
+    #      or without usable queries: no labels)
     #   2. ask each one; keep the answer only when its flag confirms the label
     #      and the version is actually in our list
     # A label that cannot be confirmed is simply not shown.
@@ -928,10 +919,7 @@ fetch_nvidia_branch_info() {
     local page="" queries=""
     page="$(fetch_url "${NVIDIA_UNIX_PAGE_URL}" 2>/dev/null)" || page=""
     queries="$(nvidia_lookup_queries <<< "${page}")"
-    if [[ -z "${queries}" ]]; then
-        info "Using built-in NVIDIA lookup queries"
-        queries="$(printf '%s\n' "${NVIDIA_LOOKUP_FALLBACK[@]}")"
-    fi
+    # No readable page or no usable query: nothing to ask, so no labels.
 
     local -A label=(
         [PB]="★ Production Branch"
@@ -952,11 +940,11 @@ fetch_nvidia_branch_info() {
             # nvidia_lookup_version has confirmed equals the version's major.
             # NVIDIA may define more than one Legacy block: each confirmed
             # version gets its own label, and NVIDIA_BRANCH_VERSION[Legacy]
-            # holds the first 470 one when present, otherwise the first one.
+            # holds the one with the highest major.
             release="$(grep -oP '(^|&)release=\K[0-9]+' <<< "${params}" | head -1)" || true
             text="★ Legacy GPU (${release}.xx)"
             v="${NVIDIA_BRANCH_VERSION[Legacy]:-}"
-            if [[ -z "${v}" ]] || [[ "${release}" == "470" && "$(nvidia_major "${v}")" != "470" ]]; then
+            if [[ -z "${v}" ]] || (( 10#$(nvidia_major "${version}") > 10#$(nvidia_major "${v}") )); then
                 NVIDIA_BRANCH_VERSION[Legacy]="${version}"
             fi
         else

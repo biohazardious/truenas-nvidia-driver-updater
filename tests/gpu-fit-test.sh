@@ -25,7 +25,6 @@ not() { ! "$@"; }
 {
     echo 'declare -gA NVIDIA_CHIPS_CACHE=()'
     sed -n '/^NVIDIA_MIN_MAJOR=/p;/^NVIDIA_UNIX_PAGE_URL=/p;/^NVIDIA_LOOKUP_URL=/p' "${REPO}/configure.sh"
-    sed -n '/^NVIDIA_LOOKUP_FALLBACK=(/,/^)/p' "${REPO}/configure.sh"
     for fn in parse_nvidia_gpus nvidia_supported_chips gpu_support gpu_name gpu_display_name detect_nvidia_gpu \
               nvidia_major nvidia_latest_in_series nvidia_lookup_queries nvidia_lookup_version \
               fetch_nvidia_branch_info apply_gpu_fit_tags advise_gpu_branch_fit driver_menu_default \

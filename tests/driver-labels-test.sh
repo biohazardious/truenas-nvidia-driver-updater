@@ -22,7 +22,6 @@ not() { ! "$@"; }
 # ── lift the code under test out of configure.sh ─────────────────────────────
 {
     sed -n '/^NVIDIA_UNIX_PAGE_URL=/p;/^NVIDIA_LOOKUP_URL=/p' "${REPO}/configure.sh"
-    sed -n '/^NVIDIA_LOOKUP_FALLBACK=(/,/^)/p' "${REPO}/configure.sh"
     for fn in nvidia_major nvidia_lookup_queries nvidia_lookup_version fetch_nvidia_branch_info; do
         sed -n "/^${fn}() {/,/^}/p" "${REPO}/configure.sh"
     done
@@ -73,12 +72,6 @@ check "595.112.07 has no label"    is "${TAG[595.112.07]:-}" ""
 check "four linux64 queries read"  is "$(nvidia_lookup_queries < "${FX}/unix-page.html" | wc -l)" 4
 check "info flag set"              is "${NVIDIA_BRANCH_INFO_OK}" 1
 
-echo "page unreadable → built-in queries"
-PAGE_FILE=""
-run "${VERSIONS[@]}"
-check "Production still labelled"  is "${TAG[620.70.06]}" "★ Production Branch"
-check "says it used built-in ones" grep -q "built-in NVIDIA lookup queries" "${WORK}/out"
-
 echo "page without the BETA block"
 PAGE_FILE="${WORK}/nobeta.html"
 sed 's/"drvrType": "BETA"/"drvrType": "GONE"/' "${FX}/unix-page.html" > "${WORK}/nobeta.html"
@@ -125,18 +118,34 @@ check "no Legacy branch version"       is "${NVIDIA_BRANCH_VERSION[Legacy]:-}" "
 LEG580_FILE="${WORK}/api-LEG580.json"
 
 echo "two Legacy blocks (580 first, then 470)"
-PAGE_FILE=""
-SAVED_FALLBACK=("${NVIDIA_LOOKUP_FALLBACK[@]}")
-NVIDIA_LOOKUP_FALLBACK=(
-    "Legacy|psid=122&pfid=944&osID=12&beta=0&sort1=1&release=580&numberOfResults=1"
-    "Legacy|psid=122&pfid=944&osID=12&beta=0&sort1=1&release=470&numberOfResults=1"
-    "Legacy|psid=122&pfid=944&osID=12&beta=0&sort1=1&release=470&numberOfResults=1"
-)
+nvidia_lookup_queries() {
+    printf '%s\n' \
+        "Legacy|psid=122&pfid=944&osID=12&beta=0&sort1=1&release=580&numberOfResults=1" \
+        "Legacy|psid=122&pfid=944&osID=12&beta=0&sort1=1&release=470&numberOfResults=1" \
+        "Legacy|psid=122&pfid=944&osID=12&beta=0&sort1=1&release=470&numberOfResults=1"
+}
 run "${VERSIONS[@]}"
 check "580 labelled with its own series" is "${TAG[580.196.07]:-}" "★ Legacy GPU (580.xx)"
-check "470 labelled once"                is "${TAG[470.256.02]:-}" "★ Legacy GPU (470.xx)"
-check "Legacy branch version is the 470" is "${NVIDIA_BRANCH_VERSION[Legacy]:-}" "470.256.02"
-NVIDIA_LOOKUP_FALLBACK=("${SAVED_FALLBACK[@]}")
+check "both Legacy labelled"             is "${TAG[470.256.02]:-}" "★ Legacy GPU (470.xx)"
+check "two Legacy → newest major"        is "${NVIDIA_BRANCH_VERSION[Legacy]:-}" "580.196.07"
+echo "470 first, then 580 — same result"
+nvidia_lookup_queries() {
+    printf '%s\n' \
+        "Legacy|psid=122&pfid=944&osID=12&beta=0&sort1=1&release=470&numberOfResults=1" \
+        "Legacy|psid=122&pfid=944&osID=12&beta=0&sort1=1&release=580&numberOfResults=1"
+}
+run "${VERSIONS[@]}"
+check "order does not matter"            is "${NVIDIA_BRANCH_VERSION[Legacy]:-}" "580.196.07"
+source "${WORK}/code.sh"   # restore the real nvidia_lookup_queries
+
+echo "NVIDIA page unreadable"
+PAGE_FILE=""
+run "${VERSIONS[@]}"
+check "no built-in queries"        is "$(grep -c 'NVIDIA_LOOKUP_FALLBACK' "${REPO}/configure.sh")" 0
+check "page down → no labels"      is "${#NVIDIA_VERSION_TAGS[@]}" 0
+check "page down → info ok 0"      is "${NVIDIA_BRANCH_INFO_OK}" 0
+check "page down → no built-in line" not grep -q "built-in" "${WORK}/out"
+check "page down → unavailable warn" grep -q "Branch labels unavailable" "${WORK}/out"
 PAGE_FILE="${FX}/unix-page.html"
 
 echo
