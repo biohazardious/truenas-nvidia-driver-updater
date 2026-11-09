@@ -55,7 +55,7 @@ check "23.x is dropped" unlisted 23.10.2
 check "22.x is dropped" unlisted 22.12.4.2
 
 echo "supported releases"
-check "the codename tables start at Electric Eel" is "$(grep -cE 'Cobia|Dragonfish' "${REPO}/configure.sh")" 0
+check "no pre-24.10 trains named" is "$(grep -cE 'Cobia|Dragonfish' "${REPO}/configure.sh")" 0
 check "the kernel table starts at 24.10" is "$(grep -cE '"(23\.10|24\.04)"' "${REPO}/configure.sh")" 0
 
 # Runs a copy, so nothing here can touch the project's real .env. curl and wget

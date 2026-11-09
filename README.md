@@ -321,6 +321,8 @@ ls -la /dev/dri
 Each TrueNAS release lives in a *train*, its folder name on download.truenas.com (`https://download.truenas.com/<train>/<version>/`), for example `TrueNAS-SCALE-Goldeye` for 25.10.x. The wizard looks the train up and writes it to `.env` as `TRUENAS_TRAIN`; nothing in the project keeps a table of releases.
 
 > Old `.env` files with `TRUENAS_CODENAME=Goldeye` and no `TRUENAS_TRAIN` still work (they mean `TrueNAS-SCALE-Goldeye`). With neither set, the build finds the release folder on download.truenas.com itself. If a release has no download anywhere, put its update file in the project directory as `truenas.update`.
+>
+> After pulling this change, rebuild the image (`docker compose build`) before building with a new `.env`.
 
 ### What updates itself
 
@@ -364,7 +366,7 @@ Stays manual:
 
 ### Why systemd-sysext?
 
-TrueNAS 25/26 uses an immutable root filesystem. `systemd-sysext` provides a supported overlay mechanism that merges the contents of `/usr` from extension images on top of the base OS — without modifying it. This means:
+TrueNAS 24.10 and newer uses an immutable root filesystem. `systemd-sysext` provides a supported overlay mechanism that merges the contents of `/usr` from extension images on top of the base OS — without modifying it. This means:
 
 - **Survives reboots** — extensions are re-merged on boot
 - **Clean rollback** — `systemd-sysext unmerge` restores the original state
@@ -676,13 +678,13 @@ tests/gpu-check-parity-test.sh
 tests/truenas-sources-test.sh
 ```
 
-All seven run offline and need no root, Docker or TrueNAS. The deploy test runs `deploy-nvidia.sh` in a sandbox with stubs for every host command, including a `midclt` that follows the real `docker.configure_nvidia`. The build test exercises the download, checksum and log helpers from `entrypoint.sh`, the configure test covers version discovery, the driver-labels test covers the labels and their fallbacks, the GPU-fit test covers the wizard's GPU detection, fit tags and advice, and the parity test runs the build's GPU check (`entrypoint.sh`, jq) and the deploy's (`deploy-nvidia.sh`, python3) on the same fixtures and requires identical answers; it skips itself when jq or python3 is missing . The build and deploy GPU checks themselves are covered by the build and deploy tests. The truenas-sources test covers train lookup, release labels, kernel detection and the `.update` source and checksum order. The tests read local fixtures under `tests/fixtures/` (`nvidia/` and `truenas/`), which are not tracked in git. None of them replaces a real build and deploy.
+All seven run offline and need no root, Docker or TrueNAS. The deploy test runs `deploy-nvidia.sh` in a sandbox with stubs for every host command, including a `midclt` that follows the real `docker.configure_nvidia`. The build test exercises the download, checksum and log helpers from `entrypoint.sh`, the configure test covers version discovery, the driver-labels test covers the labels and their fallbacks, the GPU-fit test covers the wizard's GPU detection, fit tags and advice, and the parity test runs the build's GPU check (`entrypoint.sh`, jq) and the deploy's (`deploy-nvidia.sh`, python3) on the same fixtures and requires identical answers; it skips itself when jq or python3 is missing. The build and deploy GPU checks themselves are covered by the build and deploy tests. The truenas-sources test covers train lookup, release labels, kernel detection and the `.update` source and checksum order. The tests read local fixtures under `tests/fixtures/` (`nvidia/` and `truenas/`), which are not tracked in git. None of them replaces a real build and deploy.
 
 ## Requirements
 
 - **Build machine**: Docker with `docker compose`
 - **Configuration wizard**: `curl` or `wget` (for fetching version lists)
-- **TrueNAS**: 24.10+ / 25.x / 26.x. 24.04 and older are not supported, because they ship the driver as ordinary packages rather than a sysext. `configure.sh`, the build and `deploy-nvidia.sh` all refuse them, and `--check` reports one as a problem. 27 pre-releases download, but building against them is untested
+- **TrueNAS**: 24.10 and newer. 24.04 and older are not supported, because they ship the driver as ordinary packages rather than a sysext. `configure.sh`, the build and `deploy-nvidia.sh` all refuse them, and `--check` reports one as a problem. 27 pre-releases download, but building against them is untested
 - **GPU**: Any NVIDIA GPU supported by the target driver version
 
 ## Troubleshooting

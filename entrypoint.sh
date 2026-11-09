@@ -883,14 +883,14 @@ if [[ -f /workspace/truenas.update ]]; then
     UPDATE_FILE="/workspace/truenas.update"
 else
     TRUENAS_TRAIN="$(resolve_truenas_train "${TRUENAS_VERSION}" "${TRUENAS_TRAIN}" "${TRUENAS_CODENAME}")" \
-        || die "Unable to find the release folder of TrueNAS ${TRUENAS_VERSION} on download.truenas.com. Set TRUENAS_TRAIN in .env (e.g. TrueNAS-SCALE-Goldeye) or place truenas.update in the repo."
+        || die "Unable to find the release folder of TrueNAS ${TRUENAS_VERSION} on download.truenas.com (or download.truenas.com / update.truenas.com could not be reached). Set TRUENAS_TRAIN in .env (e.g. TrueNAS-SCALE-Goldeye) or place truenas.update in the repo."
 
     resolve_rc=0
     resolve_truenas_update "${TRUENAS_TRAIN}" "${TRUENAS_VERSION}" || resolve_rc=$?
     case "${resolve_rc}" in
         0) ;;
         2) die "The published checksum of TrueNAS ${TRUENAS_VERSION}'s update file could not be read, so it is not downloaded unverified. Try again later, or place truenas.update in the repo." ;;
-        *) die "TrueNAS ${TRUENAS_VERSION} has no .update file in download.truenas.com/${TRUENAS_TRAIN}/${TRUENAS_VERSION}/ or update.truenas.com/scale/${TRUENAS_TRAIN}/releases.json. Place truenas.update in the repo to build from a local file." ;;
+        *) die "TrueNAS ${TRUENAS_VERSION} has no .update file in download.truenas.com/${TRUENAS_TRAIN}/${TRUENAS_VERSION}/ or update.truenas.com/scale/${TRUENAS_TRAIN}/releases.json (or download.truenas.com / update.truenas.com could not be reached). Place truenas.update in the repo to build from a local file." ;;
     esac
     DOWNLOAD_URL="${TRUENAS_UPDATE_URL}"
     DOWNLOAD_NAME="${DOWNLOAD_URL%%\?*}"; DOWNLOAD_NAME="${DOWNLOAD_NAME##*/}"
