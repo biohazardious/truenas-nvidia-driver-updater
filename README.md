@@ -21,10 +21,10 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 
 ## Features
 
-- **Interactive wizard** — `configure.sh` fetches real version lists with branch labels taken from NVIDIA's own page (★ Production Branch, ★ New Feature Branch, Beta, Legacy) and guides you through setup. Uses whiptail TUI dialogs when available (TrueNAS has it), with numbered plain-bash menus as fallback
+- **Interactive wizard** — `configure.sh` fetches real version lists with branch labels taken from NVIDIA's own page (★ Production Branch, ★ New Feature Branch, Beta, Legacy) and TrueNAS's own release profiles (★ General, ★ Mission Critical, Early Adopter, · LTS), and guides you through setup. Uses whiptail TUI dialogs when available (TrueNAS has it), with numbered plain-bash menus as fallback
 - **GPU-aware driver recommendation** — detects your GPUs by PCI ID and checks each driver version against NVIDIA's own list of supported chips, recommending a version that drives your card. The same check runs again before the build and before the deploy, so a driver that would install cleanly and then not drive the GPU is stopped
 - **Fully automated** — downloads TrueNAS update file, extracts kernel headers, compiles the driver, packages everything
-- **TrueNAS 24.10 and newer** — supports 24.10 and 25.x codename-based downloads and the BETA and RC update URLs of TrueNAS 26 and later (26 was renamed 27 at RC.1). A 27 stable release has no known URL yet, so supply `truenas.update` yourself; building against 27 has not been tested
+- **TrueNAS 24.10 and newer** — downloads come from the release folder on download.truenas.com, or from update.truenas.com (via `releases.json`) when the folder has no `.update`. Release candidates such as `25.10-RC.1` are accepted. Building against 27 has not been tested
 - **Verified downloads** — the TrueNAS update and NVIDIA installer are checked against the SHA256 published next to them, including cached copies. A mismatch stops the build and deletes the file
 - **Build logs that outlive the container** — each build leaves its console output and `nvidia-installer` log in `./output/logs/`, on failure as well as success (newest 3 of each are kept)
 - **Production-kernel aware** — correctly selects the production kernel over debug variants
@@ -86,6 +86,8 @@ The wizard auto-detects your TrueNAS version and GPU, then walks you through 4 s
 
 Labelled versions come first (Recommended, Production, New Feature, Legacy); the Beta keeps its place in version order among the rest.
 
+The TrueNAS menu starts on the version the host runs. Its labels (`★ General`, `★ Mission Critical`, `Early Adopter`, and `· LTS` where TrueNAS marks a release as LTS) come from TrueNAS's own update profiles on update.truenas.com; a profile the wizard doesn't know gets no label, and if update.truenas.com can't be read the list is shown unlabelled with one line saying so. The wizard also reads the release's exact kernel from `rootfs.mtree` in its download.truenas.com folder and shows it (e.g. `TrueNAS 25.10.8 kernel: 6.12.113-production+truenas`); the legacy-driver warning uses that kernel, and an unknown kernel is said once and the kernel-based advice is skipped.
+
 The wizard offers to start the build when it's done, and — if you're running it **on the TrueNAS box itself** — offers to deploy the finished image straight away, so configure → build → deploy is one uninterrupted run. Both prompts are opt-in; decline and it prints the commands instead. On a separate build host it skips the deploy offer and reminds you to copy the image over.
 
 After the last step, `.env` is generated — Docker Compose reads it automatically. `docker-compose.yaml` is a git-tracked template and never modified.
@@ -104,7 +106,8 @@ Skip the wizard entirely by passing CLI flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--truenas VERSION` | (required) | TrueNAS version |
+| `--truenas VERSION` | (required) | TrueNAS version (must look like `25.10.8` or `25.10-RC.1`; anything else exits 1) |
+| `--train TRAIN` | looked up | Release folder on download.truenas.com, e.g. `TrueNAS-SCALE-Goldeye` |
 | `--nvidia VERSION` | (required) | NVIDIA driver version |
 | `--module TYPE` | `open` | `open` or `proprietary` |
 | `--embed true\|false` | `false` | Embed nvidia.raw in truenas.update |
@@ -139,7 +142,7 @@ cp .env.example .env
 NVIDIA_VERSION=595.112.07
 TRUENAS_VERSION=25.10.8
 NVIDIA_KERNEL_MODULE_TYPE=open
-TRUENAS_CODENAME=Goldeye
+TRUENAS_TRAIN=TrueNAS-SCALE-Goldeye
 NVIDIA_BUILD_CC=
 NVIDIA_INSTALL_DRM=true
 EMBED_NVIDIA_RAW_IN_UPDATE=false
@@ -167,6 +170,8 @@ Run `docker compose build` again after pulling changes: `entrypoint.sh` is copie
 
 The large downloads — the TrueNAS update (~2 GB) and the NVIDIA `.run` (~300 MB) — are cached in `./cache/` (mounted at `/cache`) and reused across runs. Delete a file there to force a fresh download.
 
+The TrueNAS update comes from the release folder on download.truenas.com (`https://download.truenas.com/<train>/<version>/`). If that folder lists no `.update`, the build uses the file name and checksum that `releases.json` on update.truenas.com gives for the version (following `trains_redirection`). For a `.update` listed in the folder, the checksum is its `.sha256` sidecar; a listed but unreadable sidecar stops the build. Without a sidecar, the checksum from `releases.json` is used when it names the same file; if neither exists, the build continues with an "unverified" warning.
+
 Every download is checked against the SHA256 its server publishes, and so is a cached copy on the next run. On a mismatch the build deletes the file and stops; run it again to download a fresh copy. If the server publishes no checksum, which happens with some older NVIDIA releases, the build warns and continues. Files you supply yourself (`truenas.update`, `--custom-run`) are not checked.
 
 Each run also leaves two logs in `./output/logs/`, whether it worked or not: `build-<timestamp>.log` with the console output, and `nvidia-installer-<timestamp>.log`. The newest 3 of each are kept.
@@ -187,6 +192,8 @@ Output naming follows the TrueNAS version:
 | `26.0.0-BETA.1` | `output/26.0.0-BETA.1/` | `TrueNAS-26.0.0-BETA.1.update` |
 | `25.10.8` | `output/25.10.8/` | `TrueNAS-SCALE-25.10.8.update` |
 
+These are the names TrueNAS publishes; a downloaded build keeps the published name. When the build repacks a local `truenas.update` you supplied, the output is named `truenas-<version>.update`.
+
 `NVIDIA_KERNEL_MODULE_TYPE` is passed through to the NVIDIA installer as `--kernel-module-type=<value>`.
 
 | Value | When to use | Notes |
@@ -199,7 +206,7 @@ Output naming follows the TrueNAS version:
 `NVIDIA_BUILD_CC` lets you override the compiler used for the NVIDIA kernel module build:
 
 - leave it empty (default) to **match the GCC the target kernel was built with** — read from `CONFIG_CC_VERSION_TEXT`. This matters: building with a *much newer* GCC (e.g. GCC 14, which makes implicit-declaration a hard error) breaks NVIDIA's `conftest` API detection and causes bogus `implicit declaration of 'dma_is_direct'/'phys_to_dma'` failures on kernels that otherwise build fine.
-- set `NVIDIA_BUILD_CC=gcc-12` (or `gcc-13`/`gcc-14`) to force a specific compiler. The image ships gcc-12/13/14.
+- set `NVIDIA_BUILD_CC=gcc-12` (or `gcc-13`/`gcc-14`) to force a specific compiler. The image ships gcc-12/13/14. If the kernel was built with a GCC the image lacks, the build installs it from Debian `testing`/`unstable` when needed.
 
 `NVIDIA_INSTALL_DRM=true` installs `nvidia-drm.ko` by default. This lets the TrueNAS host load `nvidia_drm` and create `/dev/dri`, which official apps such as Steam Headless may map when GPU support is detected.
 
@@ -309,17 +316,25 @@ ls -la /dev/dri
 
 ---
 
-## TrueNAS Version Reference
+## TrueNAS Releases and Trains
 
-| TrueNAS Version | Codename     |
-|------------------------|--------------|
-| 27.x (26 until RC.1)   | not used     |
-| 26.x                   | not used     |
-| 25.10.x                | Goldeye      |
-| 25.04.x                | Fangtooth    |
-| 24.10.x                | Electric Eel |
+Each TrueNAS release lives in a *train*, its folder name on download.truenas.com (`https://download.truenas.com/<train>/<version>/`), for example `TrueNAS-SCALE-Goldeye` for 25.10.x. The wizard looks the train up and writes it to `.env` as `TRUENAS_TRAIN`; nothing in the project keeps a table of releases.
 
-> `TRUENAS_CODENAME` is only needed for 25.x and earlier download URLs. For TrueNAS 26+, leave it empty. BETA and RC builds of 26+ download automatically. A stable 27 release has no known URL yet, so put its update file in the project directory as `truenas.update`.
+> Old `.env` files with `TRUENAS_CODENAME=Goldeye` and no `TRUENAS_TRAIN` still work (they mean `TrueNAS-SCALE-Goldeye`). With neither set, the build finds the release folder on download.truenas.com itself. If a release has no download anywhere, put its update file in the project directory as `truenas.update`.
+
+### What updates itself
+
+No code change is needed for:
+
+- new TrueNAS releases, trains and their labels (read from download.truenas.com and update.truenas.com each run), and each release's kernel (read from `rootfs.mtree`)
+- new NVIDIA driver versions, branch labels and which GPUs they drive (read from NVIDIA's page and each driver's own supported-chips list)
+- the kernel's GCC: if the image lacks it, the build installs it from the configured Debian suites, then `testing`, then `unstable` (best-effort)
+
+Stays manual:
+
+- `NVIDIA_BRANCH_MAX_KERNEL` in the scripts, when a driver branch reaches end of life on newer kernels
+- source patches in `patches/<kernel>/` for such branches
+- rebuilding and redeploying after a TrueNAS update changes the kernel
 
 ---
 
@@ -418,16 +433,16 @@ If the target kernel is newer than the branch supports, the build **aborts immed
 
 ### Driver labels
 
-The version list comes from `https://download.nvidia.com/XFree86/Linux-x86_64/`. The labels come from the four lookup queries embedded in NVIDIA's consumer page, <https://www.nvidia.com/en-us/drivers/unix/> (a built-in copy of the queries is used if the page can't be parsed). A label is shown only on a version that is in the download list:
+The version list comes from `https://download.nvidia.com/XFree86/Linux-x86_64/`. The labels come from the four lookup queries embedded in NVIDIA's consumer page, <https://www.nvidia.com/en-us/drivers/unix/> (there is no built-in copy; if the page can't be read, there are no labels). A label is shown only on a version that is in the download list:
 
 | Label | Meaning |
 |---|---|
 | `★ Production Branch` | NVIDIA's production branch |
 | `★ New Feature Branch` | NVIDIA's new feature branch |
 | `Beta — not for production use` | NVIDIA's current beta |
-| `★ Legacy GPU (<release>.xx)` | NVIDIA's legacy branch. `<release>` is the series NVIDIA's Legacy query asks for: `release=470` today, so `★ Legacy GPU (470.xx)`. If NVIDIA defines more than one Legacy query, each labels its own version |
+| `★ Legacy GPU (<release>.xx)` | NVIDIA's legacy branch. `<release>` is the series NVIDIA's Legacy query asks for: `release=470` today, so `★ Legacy GPU (470.xx)`. If NVIDIA defines more than one Legacy query, the newest is the Legacy branch and each is still labelled |
 
-If none of this can be confirmed, no labels are shown and one line says `Branch labels unavailable — see https://www.nvidia.com/en-us/drivers/unix/`. If NVIDIA's page drops one query, only that label goes missing. Nothing is guessed, and `unix.md` and the data-center feeds are no longer used.
+If the page can't be read, no labels are shown and one line says `Branch labels unavailable — see https://www.nvidia.com/en-us/drivers/unix/`. If NVIDIA's page drops one query, only that label goes missing. Nothing is guessed, and `unix.md` and the data-center feeds are no longer used.
 
 ### Does the driver actually support your GPU?
 
@@ -532,7 +547,7 @@ In both modes `NVIDIA_VERSION` is only a **label** — it names the output and d
 
 ```bash
 # Download once
-wget -O truenas.update "https://download.truenas.com/TrueNAS-SCALE-Goldeye/25.10.8/TrueNAS-SCALE-25.10.8.update?download=1"
+wget -O truenas.update "https://update.truenas.com/scale/TrueNAS-27-RC/TrueNAS-27.0.0-RC.1.update"
 
 # Build — the script detects the local file and skips download
 docker compose run --rm nvidia-builder
@@ -639,7 +654,7 @@ Rolling back is an ordinary deployment, so the image being replaced is itself ba
 ├── docker-compose.yaml     # Build configuration template (reads .env, never edited)
 ├── entrypoint.sh           # Main build script
 ├── deploy-nvidia.sh        # TrueNAS deployment script
-├── tests/                  # Offline regression tests (fixtures in tests/fixtures/nvidia/)
+├── tests/                  # Offline regression tests (local fixtures in tests/fixtures/)
 ├── predefined-patches/     # Curated patch lists for EOL drivers
 ├── patches/                # Your own source patches, by kernel
 ├── output/                 # Build outputs by TrueNAS version, build logs in output/logs/
@@ -658,9 +673,10 @@ tests/configure-test.sh
 tests/driver-labels-test.sh
 tests/gpu-fit-test.sh
 tests/gpu-check-parity-test.sh
+tests/truenas-sources-test.sh
 ```
 
-All six run offline and need no root, Docker or TrueNAS. The deploy test runs `deploy-nvidia.sh` in a sandbox with stubs for every host command, including a `midclt` that follows the real `docker.configure_nvidia`. The build test exercises the download, checksum and log helpers from `entrypoint.sh`, the configure test covers version discovery, the driver-labels test covers the labels and their fallbacks, the GPU-fit test covers the wizard's GPU detection, fit tags and advice, and the parity test runs the build's GPU check (`entrypoint.sh`, jq) and the deploy's (`deploy-nvidia.sh`, python3) on the same fixtures and requires identical answers; it skips itself when jq or python3 is missing (fixtures in `tests/fixtures/nvidia/`). The build and deploy GPU checks themselves are covered by the build and deploy tests. None of them replaces a real build and deploy.
+All seven run offline and need no root, Docker or TrueNAS. The deploy test runs `deploy-nvidia.sh` in a sandbox with stubs for every host command, including a `midclt` that follows the real `docker.configure_nvidia`. The build test exercises the download, checksum and log helpers from `entrypoint.sh`, the configure test covers version discovery, the driver-labels test covers the labels and their fallbacks, the GPU-fit test covers the wizard's GPU detection, fit tags and advice, and the parity test runs the build's GPU check (`entrypoint.sh`, jq) and the deploy's (`deploy-nvidia.sh`, python3) on the same fixtures and requires identical answers; it skips itself when jq or python3 is missing . The build and deploy GPU checks themselves are covered by the build and deploy tests. The truenas-sources test covers train lookup, release labels, kernel detection and the `.update` source and checksum order. The tests read local fixtures under `tests/fixtures/` (`nvidia/` and `truenas/`), which are not tracked in git. None of them replaces a real build and deploy.
 
 ## Requirements
 
