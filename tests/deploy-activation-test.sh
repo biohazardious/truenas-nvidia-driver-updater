@@ -558,13 +558,10 @@ check "lists the driven card"    grep -q "(0000:81:00.0): driven by nvidia" "${s
 check "names a card lspci can't from the image" has "${sb}/check-out" "NVIDIA RTX PRO 2000 Blackwell (0000:81:00.0): driven by nvidia"
 check "the installed driver supports it" has "${sb}/check-out" "supported by the installed driver: yes"
 check "a fitting GPU is no problem" is "$(check_with lspci-truenas-t1000-vfio-rtxpro2000.txt open-580; echo $RC)" 0
-check "an undriven card does not fail --check" is "$(check_with lspci-gtx1080.txt open-580; echo $RC)" 0
+check "a card with no driver bound" is "$(check_with lspci-gtx1080.txt open-580; echo $RC)" 1
 check "says no driver is bound"  has "${sb}/check-out" "GeForce GTX 1080 (0000:01:00.0): no driver bound"
 check "says why it is unsupported" has "${sb}/check-out" "supported by the installed driver: no — needs proprietary kernel modules"
-check "warns about it"           has "${sb}/check-out" "Warning: the installed driver does not drive"
-check "names the card in the warning" has "${sb}/check-out" "        GeForce GTX 1080 (0000:01:00.0) — needs proprietary kernel modules"
-check "not listed under Problems" lacks "${sb}/check-out" "── Problems"
-check "still reports no problems" has "${sb}/check-out" "No problems detected"
+check "lists it under Problems"  has "${sb}/check-out" "does not drive"
 check_with lspci-gtx1080.txt none
 check "no metadata: no support line" lacks "${sb}/check-out" "supported by the installed driver"
 check "no metadata: still lists the card" has "${sb}/check-out" "(0000:01:00.0): no driver bound"

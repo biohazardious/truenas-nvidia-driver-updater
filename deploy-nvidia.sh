@@ -978,6 +978,7 @@ report_state() {
     echo ""
     echo -e "${BOLD}── GPUs ────────────────────────────────────────────────────${NC}"
     report_gpus
+    problems=$((problems + ${#GPU_UNSUPPORTED[@]}))
 
     echo ""
     echo -e "${BOLD}── Activation ──────────────────────────────────────────────${NC}"
@@ -1066,19 +1067,6 @@ report_state() {
         echo    "        On every boot:  $0 --persist-uvm"
     fi
 
-    # Not counted as a problem: a box can hold a card this driver doesn't cover
-    # on purpose (an old card next to a new one), and --check's exit status must
-    # stay usable in a health check there.
-    if [[ ${#GPU_UNSUPPORTED[@]} -gt 0 ]]; then
-        local gpu
-        echo ""
-        echo -e "${YELLOW}  Warning: the installed driver does not drive:${NC}"
-        for gpu in "${GPU_UNSUPPORTED[@]}"; do
-            echo "        ${gpu}"
-        done
-        echo    "        If you need them on this driver, rebuild with ./configure.sh and redeploy."
-    fi
-
     # Not counted as a problem either: it goes away with the reboot.
     if [[ -n "${REBOOT_PENDING:-}" ]]; then
         echo ""
@@ -1105,6 +1093,10 @@ report_state() {
     fi
     [[ -n "${NOT_ACTIVATED:-}" ]] && \
         warn "The image is not activated: no symlink in /etc/extensions or /run/extensions."
+    local gpu
+    for gpu in "${GPU_UNSUPPORTED[@]}"; do
+        warn "The installed driver does not drive ${gpu}. Rebuild with ./configure.sh and redeploy."
+    done
     if [[ -n "${PERSIST_STALE:-}" ]]; then
         warn "The copy saved for update-persistence was built for kernel ${PERSIST_STALE},"
         warn "not the running ${host_kernel} — it will be refused at boot rather than"
