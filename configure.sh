@@ -60,6 +60,22 @@ fetch_url() {
     fi
 }
 
+# Fetch at most $2 bytes of the body of $1 (a Range request; the output is
+# capped even when the server ignores Range and sends the whole file).
+fetch_url_range() {
+    local url="$1" bytes="$2" rc=0
+    if [[ "${FETCH_CMD}" == "curl" ]]; then
+        curl -fsSL --connect-timeout 15 --max-time 60 -r "0-$((bytes - 1))" "${url}" 2>/dev/null | head -c "${bytes}"
+        rc="${PIPESTATUS[0]}"
+        [[ "${rc}" == 23 ]] && rc=0   # head closed the pipe: the server sent more than asked
+    else
+        wget -qO- --timeout=15 --header="Range: bytes=0-$((bytes - 1))" "${url}" 2>/dev/null | head -c "${bytes}"
+        rc="${PIPESTATUS[0]}"
+        [[ "${rc}" == 141 || "${rc}" == 3 ]] && rc=0
+    fi
+    return "${rc}"
+}
+
 # ── help ─────────────────────────────────────────────────────────────────────
 show_help() {
     cat <<'EOF'
@@ -537,44 +553,110 @@ nvidia_supports_module_type() {
     (( major >= NVIDIA_MODULE_TYPE_MIN_MAJOR ))
 }
 
-# Legacy/EOL driver branches and the highest Linux kernel (MAJOR.MINOR) they can
-# still build against. Kept in sync with NVIDIA_BRANCH_MAX_KERNEL in entrypoint.sh.
+# End-of-life driver branches and the highest Linux kernel (MAJOR.MINOR) they
+# can still build against. Only end-of-life branches are listed, because NVIDIA
+# publishes no maximum kernel per branch; current branches have no entry.
+# Kept in sync with NVIDIA_BRANCH_MAX_KERNEL in entrypoint.sh.
 declare -A NVIDIA_BRANCH_MAX_KERNEL=(
     [390]="5.15"
     [470]="6.9"
 )
 
-# Early heads-up when a legacy/EOL driver branch is selected: those branches fail
-# to compile on recent kernels (e.g. TrueNAS 25.10/26 ship 6.12). This is advisory
-# only — the build does the authoritative check against the real image kernel
-# (see check_driver_kernel_compatibility() in entrypoint.sh).
-advise_legacy_driver() {
-    local version="$1"
-    local major=""
-    major="$(nvidia_major "${version}")"
-    local max="${NVIDIA_BRANCH_MAX_KERNEL[${major}]:-}"
-    [[ -z "${max}" ]] && return 0
+# The kernel of a TrueNAS release, read from the first bytes of its
+# rootfs.mtree on download.truenas.com (the same data the build image has).
+# Cached per version; an unknown kernel is cached too (as empty).
+declare -gA TRUENAS_KERNEL_CACHE=()
 
-    warn "NVIDIA ${version} is a legacy/end-of-life branch."
-    warn "It only builds against Linux kernels up to ~${max}; recent TrueNAS releases"
-    warn "(e.g. 25.10 / 26 ship kernel 6.12) will FAIL to compile it."
-    warn "Use it only for older GPUs on an older TrueNAS release, pick a current"
-    warn "branch (★ Production / ★ New Feature), or drop community patches into"
-    warn "patches/<kernel>/ (e.g. patches/6.12/) to patch it — see the README."
+# Returns 0 when version $1 is strictly greater than $2 (both "MAJOR.MINOR").
+kernel_version_gt() {
+    [[ "$1" == "$2" ]] && return 1
+    [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
 }
 
-# Map a TrueNAS version (e.g. 25.10.3.1) to its kernel MAJOR.MINOR. Used only for
-# the wizard heads-up below; the build reads the REAL kernel from the image and
-# is authoritative. Extend as new TrueNAS releases ship.
-declare -A TRUENAS_KERNEL_MM=(
-    ["24.10"]="6.6"
-    ["25.04"]="6.12"
-    ["25.10"]="6.12"
-)
+# Kernel name in one mtree line ("./boot/vmlinuz-<kernel> mode=..."): prints it
+# when it starts with a digit and is not a debug kernel.
+mtree_kernel_of() {
+    local line="$1" k=""
+    [[ "${line}" == ./boot/vmlinuz-* ]] || return 1
+    k="${line#./boot/vmlinuz-}"
+    k="${k%%[[:space:]]*}"
+    [[ "${k}" =~ ^[0-9] ]] || return 1
+    [[ "${k}" != *debug* ]] || return 1
+    printf '%s\n' "${k}"
+}
+
+truenas_release_kernel() {
+    local version="$1" train="" head="" line="" k=""
+    if [[ -n "${TRUENAS_KERNEL_CACHE[${version}]+x}" ]]; then
+        [[ -n "${TRUENAS_KERNEL_CACHE[${version}]}" ]] || return 1
+        printf '%s\n' "${TRUENAS_KERNEL_CACHE[${version}]}"
+        return 0
+    fi
+    TRUENAS_KERNEL_CACHE[${version}]=""
+    train="$(resolve_selected_train "${version}")"
+    [[ -n "${train}" ]] || return 1
+    head="$(fetch_url_range "https://download.truenas.com/${train}/${version}/rootfs.mtree?download=1" 16384)" || return 1
+    while IFS= read -r line; do
+        if k="$(mtree_kernel_of "${line}")"; then
+            TRUENAS_KERNEL_CACHE[${version}]="${k}"
+            printf '%s\n' "${k}"
+            return 0
+        fi
+    done <<< "${head}"
+    return 1
+}
+
+# MAJOR.MINOR of a TrueNAS release's kernel; empty when unknown. The build
+# reads the REAL kernel from the image and is authoritative.
 truenas_kernel_mm() {
-    local mm=""
-    mm="$(echo "$1" | grep -oP '^\d+\.\d+' || true)"
-    printf '%s' "${TRUENAS_KERNEL_MM[${mm}]:-}"
+    local k=""
+    k="$(truenas_release_kernel "$1" 2>/dev/null)" || return 0
+    [[ "${k}" =~ ^([0-9]+\.[0-9]+) ]] && printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+}
+
+# Step 1 confirmation: the release's kernel, or — once per run — that it is
+# unknown. Runs in the current shell so the cache survives for later lookups.
+TRUENAS_KERNEL_UNKNOWN_SHOWN=false
+announce_truenas_kernel() {
+    local version="$1" k=""
+    truenas_release_kernel "${version}" >/dev/null 2>&1 || true
+    k="${TRUENAS_KERNEL_CACHE[${version}]:-}"
+    if [[ -n "${k}" ]]; then
+        ok "TrueNAS ${version} kernel: ${k}"
+    elif [[ "${TRUENAS_KERNEL_UNKNOWN_SHOWN}" != true ]]; then
+        TRUENAS_KERNEL_UNKNOWN_SHOWN=true
+        info "Kernel of TrueNAS ${version} unknown — kernel-based checks skipped"
+    fi
+    return 0
+}
+
+# Early heads-up when an end-of-life driver branch is selected: those branches
+# fail to compile on recent kernels. Advisory only — the build does the
+# authoritative check against the real image kernel (see
+# check_driver_kernel_compatibility() in entrypoint.sh).
+advise_legacy_driver() {
+    local version="$1" truenas_version="${2:-}"
+    local major="" max="" kernel="" kmm=""
+    major="$(nvidia_major "${version}")"
+    max="${NVIDIA_BRANCH_MAX_KERNEL[${major}]:-}"
+    [[ -z "${max}" ]] && return 0
+
+    if [[ -n "${truenas_version}" ]]; then
+        kernel="$(truenas_release_kernel "${truenas_version}" 2>/dev/null)" || kernel=""
+        kmm="$(truenas_kernel_mm "${truenas_version}")"
+    fi
+    if [[ -n "${kmm}" ]]; then
+        kernel_version_gt "${kmm}" "${max}" || return 0
+        warn "NVIDIA ${version} is an end-of-life branch that builds only up to kernel ${max};"
+        warn "TrueNAS ${truenas_version} ships ${kernel}, so it will FAIL to compile without patches in patches/${kmm}/."
+        warn "Pick a current driver branch (★ Production / ★ New Feature) or add patches — see the README."
+        return 0
+    fi
+    warn "NVIDIA ${version} is an end-of-life branch that builds only up to kernel ${max};"
+    warn "a TrueNAS release with a newer kernel will FAIL to compile it without patches in patches/<kernel>/."
+    warn "Use it only for older GPUs on an older TrueNAS release, pick a current"
+    warn "branch (★ Production / ★ New Feature), or add patches — see the README."
 }
 
 # Warn at config time when the build WILL patch the driver — i.e. the repo's
@@ -1934,13 +2016,14 @@ main() {
         fi
 
         ok "TrueNAS: ${selected_truenas}${selected_train:+ ($(truenas_train_display "${selected_train}"))}"
+        announce_truenas_kernel "${selected_truenas}"
         ok "NVIDIA:  ${selected_nvidia}"
         ok "Module:  ${selected_module_type}"
         ok "Embed:   ${selected_embed}"
 
         ok "Patch:   ${selected_patch_mode}"
 
-        advise_legacy_driver "${selected_nvidia}"
+        advise_legacy_driver "${selected_nvidia}" "${selected_truenas}"
 
         # Same labels and fit advice as the wizard. A failed fetch only costs
         # the labels (and the fit lines then say they could not check).
@@ -2034,6 +2117,7 @@ main() {
                         "Select new TrueNAS version:" "${truenas_menu_args[@]}"
                     if [[ "${selected_truenas}" != "${EXISTING_TRUENAS}" ]]; then
                         wizard_truenas_train selected_train "${selected_truenas}"
+                        announce_truenas_kernel "${selected_truenas}"
                     elif [[ -z "${selected_train}" ]]; then
                         selected_train="$(resolve_selected_train "${selected_truenas}")"
                     fi
@@ -2048,7 +2132,7 @@ main() {
                     UI_MENU_DEFAULT="$(driver_menu_default)"
                     ui_menu selected_nvidia "NVIDIA Driver" \
                         "Select new NVIDIA driver:" "${nvidia_menu_args[@]}"
-                    advise_legacy_driver "${selected_nvidia}"
+                    advise_legacy_driver "${selected_nvidia}" "${selected_truenas}"
                     advise_gpu_branch_fit "${selected_nvidia}"
                     advise_patches "${selected_truenas}"
                 fi
@@ -2168,6 +2252,7 @@ main() {
     else
         ok "Selected: ${selected_truenas}"
     fi
+    announce_truenas_kernel "${selected_truenas}"
     echo ""
 
     # ── Step 2: NVIDIA Driver Version ────────────────────────────────────────
@@ -2204,7 +2289,7 @@ main() {
 
     [[ -n "${selected_nvidia}" ]] || { err "No NVIDIA version selected. Aborting."; exit 1; }
     ok "Selected: ${selected_nvidia}"
-    advise_legacy_driver "${selected_nvidia}"
+    advise_legacy_driver "${selected_nvidia}" "${selected_truenas}"
     advise_gpu_branch_fit "${selected_nvidia}"
     advise_patches "${selected_truenas}"
     echo ""

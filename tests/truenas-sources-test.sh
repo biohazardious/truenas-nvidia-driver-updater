@@ -25,10 +25,13 @@ not() { ! "$@"; }
 # ── lift the code under test out of configure.sh ─────────────────────────────
 {
     echo 'info() { :; }; warn() { :; }; ok() { :; }; err() { :; }'
+    sed -n '/^declare -gA TRUENAS_KERNEL_CACHE=/p;/^TRUENAS_KERNEL_UNKNOWN_SHOWN=/p;/^declare -A NVIDIA_BRANCH_MAX_KERNEL=/,/^)/p' "${REPO}/configure.sh"
     sed -n '/^declare -gA TRUENAS_VERSION_\(TRAIN\|TAGS\|PROFILE\)=/p' "${REPO}/configure.sh"
     for fn in valid_train truenas_train_display host_truenas_train resolve_selected_train \
               truenas_release_label truenas_update_trains truenas_update_releases fetch_truenas_release_labels truenas_menu_default \
               truenas_version_supported fetch_truenas_versions \
+              mtree_kernel_of truenas_release_kernel truenas_kernel_mm fetch_url_range \
+              kernel_version_gt nvidia_major patching_relevant advise_legacy_driver announce_truenas_kernel \
               read_existing_config; do
         sed -n "/^${fn}() {/,/^}/p" "${REPO}/configure.sh"
     done
@@ -108,6 +111,46 @@ check "unlisted host version ignored" is "$(DETECTED_TRUENAS_VERSION=25.10.99; t
 check "order is newest first"     is "${TRUENAS_VERSIONS[0]}" 27.0.0-RC.1
 check "menu default without labels → first non-pre-release" \
     is "$(DETECTED_TRUENAS_VERSION=; declare -gA TRUENAS_VERSION_PROFILE=(); truenas_menu_default)" 25.10.8
+echo "kernel from rootfs.mtree"
+fetch_url_range() {
+    case "$1" in
+        https://download.truenas.com/TrueNAS-SCALE-ElectricEel/24.10.0/rootfs.mtree?download=1) cat "${FX}/rootfs-24.10.0.mtree.head" ;;
+        https://download.truenas.com/TrueNAS-SCALE-Goldeye/25.10.8/rootfs.mtree?download=1) cat "${FX}/rootfs-25.10.8.mtree.head" ;;
+        https://download.truenas.com/TrueNAS-27-RC/27.0.0-RC.1/rootfs.mtree?download=1) cat "${FX}/rootfs-27.0.0-RC.1.mtree.head" ;;
+        *) return 1 ;;
+    esac
+}
+warn() { printf '%s\n' "$*"; }; info() { printf 'INFO %s\n' "$*"; }; ok() { printf 'OK %s\n' "$*"; }
+check "24.10.0 → 6.6.44"      is "$(truenas_release_kernel 24.10.0)" 6.6.44-production+truenas
+check "25.10.8 → 6.12.113"    is "$(truenas_release_kernel 25.10.8)" 6.12.113-production+truenas
+check "27 RC → 6.18.52"       is "$(truenas_release_kernel 27.0.0-RC.1)" 6.18.52-production+truenas
+check "mm for 27 RC"          is "$(truenas_kernel_mm 27.0.0-RC.1)" 6.18
+check "debug kernel ignored"  not grep -q debug <<< "$(truenas_release_kernel 25.10.8)"
+check "other suffix accepted" is "$(mtree_kernel_of './boot/vmlinuz-7.1.2-generic+truenas')" 7.1.2-generic+truenas
+check "unknown train → 1"     not truenas_release_kernel 99.1.1
+check "unknown → empty mm"    is "$(truenas_kernel_mm 99.1.1)" ""
+check "470 on 27 RC needs patches" patching_relevant 470.256.02 27.0.0-RC.1
+check "470 warning names 6.18" grep -q '6.18.52' <<< "$(advise_legacy_driver 470.256.02 27.0.0-RC.1 2>&1)"
+check "470 on 24.10.0 quiet"  not grep -q 'FAIL' <<< "$(advise_legacy_driver 470.256.02 24.10.0 2>&1)"
+check "table gone"            is "$(grep -c 'TRUENAS_KERNEL_MM' "$REPO/configure.sh")" 0
+check "no example kernels in text" is "$(grep -cE '25\.10 / 26 ship|ship kernel 6\.12' "$REPO/configure.sh")" 0
+# Kernel unknown: generic warning, no example kernel; announced once per run.
+check "unknown kernel → generic warning" grep -q 'end-of-life' <<< "$(advise_legacy_driver 470.256.02 99.1.1 2>&1)"
+check "legacy warning text" grep -qF 'ships 6.18.52-production+truenas, so it will FAIL to compile without patches in patches/6.18/.' <<< "$(advise_legacy_driver 470.256.02 27.0.0-RC.1 2>&1)"
+check "unknown generic has no kernel number" not grep -qE 'kernel 6\.[0-9]+[^.]' <<< "$(advise_legacy_driver 470.256.02 99.1.1 2>&1 | grep -v 'up to kernel')"
+check "ok line"  is "$(announce_truenas_kernel 25.10.8)" "OK TrueNAS 25.10.8 kernel: 6.12.113-production+truenas"
+TRUENAS_KERNEL_ANNOUNCED_UNKNOWN=""
+announce_truenas_kernel 99.1.1 > "${WORK}/ann"; announce_truenas_kernel 99.2.2 >> "${WORK}/ann"
+check "unknown info exactly once" is "$(grep -c 'Kernel of TrueNAS 99.1.1 unknown — kernel-based checks skipped' "${WORK}/ann")$(grep -c unknown "${WORK}/ann")" 11
+info() { :; }; warn() { :; }; ok() { :; }
+# Real fetch_url_range with a stubbed curl that ignores Range and sends 49152 bytes.
+eval "$(sed -n '/^fetch_url_range() {/,/^}/p' "${REPO}/configure.sh")"
+curl() { cat "${FX}/rootfs-25.10.8.mtree.head" "${FX}/rootfs-25.10.8.mtree.head" "${FX}/rootfs-25.10.8.mtree.head"; }
+FETCH_CMD=curl
+check "stub body is 3x head"  is "$(curl | wc -c)" "$(( $(wc -c < "${FX}/rootfs-25.10.8.mtree.head") * 3 ))"
+check "range capped at 16384" is "$(fetch_url_range https://x/full 16384 | wc -c)" 16384
+unset -f curl
+
 echo "update.truenas.com down"
 fetch_url() {
     case "$1" in

@@ -210,12 +210,12 @@ installer_supports_option() {
     return 1
 }
 
-# Highest Linux kernel (MAJOR.MINOR) each EOL/legacy NVIDIA branch can still
+# Highest Linux kernel (MAJOR.MINOR) each end-of-life NVIDIA branch can still
 # build its kernel modules against. Newer kernels remove/altered APIs the old
 # module source relies on, so the build fails late, deep in the compile. We use
-# this to fail FAST with a clear message instead. Only branches with a hard,
-# well-documented ceiling are listed; modern branches receive ongoing kernel
-# support and are treated as unrestricted (no entry → no limit).
+# this to fail FAST with a clear message instead. Only end-of-life branches are
+# listed, because NVIDIA publishes no maximum kernel per branch; current
+# branches receive ongoing kernel support and have no entry (no limit).
 #
 # Extend as new ceilings become known. Sources: NVIDIA Linux forums / distro
 # bug trackers + testing. Built with the kernel's own GCC (see
