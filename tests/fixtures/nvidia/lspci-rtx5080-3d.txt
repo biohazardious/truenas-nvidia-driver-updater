@@ -1,3 +1,0 @@
-0000:0a:00.0 3D controller [0302]: NVIDIA Corporation Device [10de:2c02] (rev a1)
-	Kernel driver in use: nvidia
-	Kernel modules: nvidia

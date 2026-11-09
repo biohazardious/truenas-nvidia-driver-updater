@@ -1,3 +1,0 @@
-0000:02:00.0 VGA compatible controller [0300]: NVIDIA Corporation GF100 [GeForce GTX 480] [10de:06c0] (rev a3)
-	Subsystem: NVIDIA Corporation GF100 [GeForce GTX 480] [10de:075f]
-	Kernel modules: nouveau
