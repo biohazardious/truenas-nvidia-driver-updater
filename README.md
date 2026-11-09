@@ -21,7 +21,7 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 
 ## Features
 
-- **Interactive wizard** — `configure.sh` fetches real version lists with branch labels taken from NVIDIA's own page (★ Production Branch, ★ New Feature Branch, Beta, Legacy) and guides you through setup. Uses whiptail TUI dialogs when available (TrueNAS has it), with bash `select` menus as fallback
+- **Interactive wizard** — `configure.sh` fetches real version lists with branch labels taken from NVIDIA's own page (★ Production Branch, ★ New Feature Branch, Beta, Legacy) and guides you through setup. Uses whiptail TUI dialogs when available (TrueNAS has it), with numbered plain-bash menus as fallback
 - **GPU-aware driver recommendation** — detects your GPUs by PCI ID and checks each driver version against NVIDIA's own list of supported chips, recommending a version that drives your card. The same check runs again before the build and before the deploy, so a driver that would install cleanly and then not drive the GPU is stopped
 - **Fully automated** — downloads TrueNAS update file, extracts kernel headers, compiles the driver, packages everything
 - **TrueNAS 24.10 and newer** — supports 24.10 and 25.x codename-based downloads and the BETA and RC update URLs of TrueNAS 26 and later (26 was renamed 27 at RC.1). A 27 stable release has no known URL yet, so supply `truenas.update` yourself; building against 27 has not been tested
@@ -59,25 +59,32 @@ The wizard auto-detects your TrueNAS version and GPU, then walks you through 4 s
 
 ```
 [OK]    Detected TrueNAS version: 25.10.8
-[OK]    Detected GPU: NVIDIA AD102 [GeForce RTX 4090] (rev a1)
+[OK]    Detected GPU: GeForce RTX 4090 (10de:2684)
 
   Step 1: TrueNAS Version  →  Auto-detected! Confirm or pick another.
 
   Step 2: Select NVIDIA Driver Version
-   GPU: NVIDIA GeForce RTX 4090
-   1) 620.70.06  ★ Production Branch
-   2) 615.78.08  ★ New Feature Branch
-   3) 595.45.04  Beta — not for production use
-   4) 470.256.02  ★ Legacy GPU (470.xx)
-   5) 595.99.02
-   ...
-   95) 🔍 Filter versions          ← type to search (e.g. "595" or "production")
-   96) ✎ Enter manually
-   #? 1
+  Detected GPU: GeForce RTX 4090
+  Tip: ★ Production Branch is recommended for most users.
+
+  Page 1 of 8 — showing 1–20 of 150
+  1) 620.70.06  ★ Production Branch  (default)
+  2) 615.78.08  ★ New Feature Branch
+  3) 470.256.02  ★ Legacy GPU (470.xx) — does NOT support GeForce RTX 4090
+  4) 610.57.04
+  5) 595.112.07
+  6) 595.45.04  Beta — not for production use
+  ...
+ 21) ▶ Next page  (showing 1–20 of 150)
+ 22) 🔍 Filter versions          ← type to search (e.g. "595" or "production")
+ 23) ✎ Enter manually
+  #? [Enter = 620.70.06]
 
   Step 3: Select Kernel Module Type      →  open / proprietary
   Step 4: Embed nvidia.raw in .update?   →  yes / no
 ```
+
+Labelled versions come first (Recommended, Production, New Feature, Legacy); the Beta keeps its place in version order among the rest.
 
 The wizard offers to start the build when it's done, and — if you're running it **on the TrueNAS box itself** — offers to deploy the finished image straight away, so configure → build → deploy is one uninterrupted run. Both prompts are opt-in; decline and it prints the commands instead. On a separate build host it skips the deploy offer and reminds you to copy the image over.
 
@@ -142,7 +149,7 @@ NVIDIA_TARGET_GPUS=
 SKIP_GPU_CHECK=false
 ```
 
-`NVIDIA_TARGET_GPUS` lists the GPUs the build must drive (written by `configure.sh`; empty skips the check). `SKIP_GPU_CHECK=true` builds anyway when the driver or kernel-module flavor won't drive them.
+`NVIDIA_TARGET_GPUS` lists the GPUs the build must drive. `configure.sh` fills it in only when it runs on the TrueNAS host itself; on any other machine it leaves it empty (that machine's own GPUs are not the target) and `deploy-nvidia.sh` checks the host's GPUs at deploy time. Empty skips the build's check. `SKIP_GPU_CHECK=true` builds anyway when the driver or kernel-module flavor won't drive them.
 
 `docker-compose.yaml` is a git-tracked template — it reads values from `.env` automatically. Never edit `docker-compose.yaml` directly.
 </details>
@@ -418,7 +425,7 @@ The version list comes from `https://download.nvidia.com/XFree86/Linux-x86_64/`.
 | `★ Production Branch` | NVIDIA's production branch |
 | `★ New Feature Branch` | NVIDIA's new feature branch |
 | `Beta — not for production use` | NVIDIA's current beta |
-| `★ Legacy GPU (470.xx)` | The 470 legacy branch |
+| `★ Legacy GPU (<release>.xx)` | NVIDIA's legacy branch. `<release>` is the series NVIDIA's Legacy query asks for: `release=470` today, so `★ Legacy GPU (470.xx)`. If NVIDIA defines more than one Legacy query, each labels its own version |
 
 If none of this can be confirmed, no labels are shown and one line says `Branch labels unavailable — see https://www.nvidia.com/en-us/drivers/unix/`. If NVIDIA's page drops one query, only that label goes missing. Nothing is guessed, and `unix.md` and the data-center feeds are no longer used.
 
@@ -427,19 +434,24 @@ If none of this can be confirmed, no labels are shown and one line says `Branch 
 A driver can compile, package and merge perfectly and still not drive your card, and `nvidia-smi` then just reports `No devices were found`. The wizard detects your NVIDIA GPUs by PCI ID (`lspci -Dnnk`), downloads each candidate version's `README/supportedchips.html` from download.nvidia.com, and tags the list:
 
 ```
-[OK]    Detected GPU: NVIDIA GP102 [GeForce GTX 1080 Ti] (rev a1)
+[OK]    Detected GPU: GeForce GTX 1080 Ti (10de:1b06)
+  ...
+  Detected GPU: GeForce GTX 1080 Ti
+  Newer branches dropped your GPU — pick 580.196.07 (★ Recommended).
 
-   1) 580.196.07  ★ Recommended for your NVIDIA GeForce GTX 1080 Ti
-   2) 620.70.06  ★ Production Branch — does NOT support NVIDIA GeForce GTX 1080 Ti
-   3) 615.78.08  ★ New Feature Branch — does NOT support NVIDIA GeForce GTX 1080 Ti
+  1) 580.196.07  ★ Recommended for your GeForce GTX 1080 Ti  (default)
+  2) 620.70.06  ★ Production Branch — does NOT support GeForce GTX 1080 Ti
+  3) 615.78.08  ★ New Feature Branch — does NOT support GeForce GTX 1080 Ti
+  4) 470.256.02  ★ Legacy GPU (470.xx)
 ```
 
 - The menu cursor starts on the recommended version; with none, on the Production branch, and never on a Beta.
+- A card the newest driver's list doesn't name at all gets "No listed driver version drives your <card>" instead of the Production tip.
 - With several GPUs every active card is checked, and the recommendation is the newest version of the oldest branch any of them needs. Every labelled version names each card it does not drive; unlabelled versions get no fit tag.
 - A card that needs a branch below 470 gets "This tool can't build a driver for that card".
 - GPUs bound to `vfio-pci` (reserved for VMs) are listed but never checked, and are left out of `NVIDIA_TARGET_GPUS`.
 - `--truenas X --nvidia Y` shows the same labels and advice.
-- The wizard writes `NVIDIA_TARGET_GPUS` and `SKIP_GPU_CHECK` to `.env`. If NVIDIA's chip list can't be fetched, it says so and adds no fit tags rather than guessing.
+- The wizard writes `NVIDIA_TARGET_GPUS` and `SKIP_GPU_CHECK` to `.env`. It records its GPUs as the target only when it runs on the TrueNAS host; elsewhere `NVIDIA_TARGET_GPUS` stays empty and it says the deploy step will check the GPUs. If NVIDIA's chip list can't be fetched, it says so and adds no fit tags rather than guessing.
 
 The wizard's check is advisory, and you can still pick anything. The two later checks refuse:
 
@@ -645,9 +657,10 @@ tests/entrypoint-test.sh
 tests/configure-test.sh
 tests/driver-labels-test.sh
 tests/gpu-fit-test.sh
+tests/gpu-check-parity-test.sh
 ```
 
-All five run offline and need no root, Docker or TrueNAS. The deploy test runs `deploy-nvidia.sh` in a sandbox with stubs for every host command, including a `midclt` that follows the real `docker.configure_nvidia`. The build test exercises the download, checksum and log helpers from `entrypoint.sh`, the configure test covers version discovery, the driver-labels test covers the labels and their fallbacks, and the GPU-fit test covers detection and the fit checks in all three scripts (fixtures in `tests/fixtures/nvidia/`). None of them replaces a real build and deploy.
+All six run offline and need no root, Docker or TrueNAS. The deploy test runs `deploy-nvidia.sh` in a sandbox with stubs for every host command, including a `midclt` that follows the real `docker.configure_nvidia`. The build test exercises the download, checksum and log helpers from `entrypoint.sh`, the configure test covers version discovery, the driver-labels test covers the labels and their fallbacks, the GPU-fit test covers the wizard's GPU detection, fit tags and advice, and the parity test runs the build's GPU check (`entrypoint.sh`, jq) and the deploy's (`deploy-nvidia.sh`, python3) on the same fixtures and requires identical answers; it skips itself when jq or python3 is missing (fixtures in `tests/fixtures/nvidia/`). The build and deploy GPU checks themselves are covered by the build and deploy tests. None of them replaces a real build and deploy.
 
 ## Requirements
 

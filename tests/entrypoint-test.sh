@@ -172,9 +172,13 @@ msg() { ( NVIDIA_TARGET_GPUS="$1"; NVIDIA_KERNEL_MODULE_TYPE="$2"; SKIP_GPU_CHEC
           NVIDIA_VERSION=580.196.07; NVIDIA_SRC_ROOT="${WORK}/src"
           installer_supports_option() { return 0; }
           source "${HELPERS}"; check_target_gpus ) 2>&1; }
-check "module message names the fix" has <(msg 2d30:10de:2054 proprietary) "Re-run ./configure.sh --module open"
-check "legacy message names the branch" has <(msg 1180:: open) "pick 470.xx."
+check "module message names the fix" has <(msg 2d30:10de:2054 proprietary) "Run ./configure.sh --reconfigure (Module Type → open) or set NVIDIA_KERNEL_MODULE_TYPE=open in .env"
+check "module message keeps the escape" has <(msg 2d30:10de:2054 proprietary) "SKIP_GPU_CHECK=true"
+check "no ignored --module hint" not grep -q -- "configure.sh --module" <(msg 2d30:10de:2054 proprietary)
+check "legacy message names the branch" has <(msg 1180:: open) "pick 470.xx"
+check "legacy message has the escape" has <(msg 1180:: open) "SKIP_GPU_CHECK=true"
 check "unlisted message" has <(msg dead:: open) "10de:dead is not in NVIDIA 580.196.07's supported list."
+check "unlisted message has the escape" has <(msg dead:: open) "SKIP_GPU_CHECK=true"
 
 echo ""
 echo "${PASS} passed, ${FAIL} failed"

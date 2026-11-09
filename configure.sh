@@ -756,9 +756,8 @@ fetch_nvidia_branch_info() {
         [PB]="★ Production Branch"
         [NFB]="★ New Feature Branch"
         [BETA]="Beta — not for production use"
-        [Legacy]="★ Legacy GPU (470.xx)"
     )
-    local type params version rc listed v
+    local type params version rc listed v text release
     while IFS='|' read -r type params; do
         [[ -n "${type}" ]] || continue
         version="$(nvidia_lookup_version "${type}" "${params}")" && rc=0 || rc=$?
@@ -767,8 +766,26 @@ fetch_nvidia_branch_info() {
         listed=0
         for v in "${sorted[@]}"; do [[ "${v}" == "${version}" ]] && listed=1; done
         [[ ${listed} -eq 1 ]] || continue
-        NVIDIA_BRANCH_VERSION["${type}"]="${version}"
-        NVIDIA_VERSION_TAGS["${version}"]="${NVIDIA_VERSION_TAGS[${version}]:+${NVIDIA_VERSION_TAGS[${version}]} · }${label[${type}]}"
+        if [[ "${type}" == "Legacy" ]]; then
+            # The series comes from the query's own release= value, which
+            # nvidia_lookup_version has confirmed equals the version's major.
+            # NVIDIA may define more than one Legacy block: each confirmed
+            # version gets its own label, and NVIDIA_BRANCH_VERSION[Legacy]
+            # holds the first 470 one when present, otherwise the first one.
+            release="$(grep -oP '(^|&)release=\K[0-9]+' <<< "${params}" | head -1)" || true
+            text="★ Legacy GPU (${release}.xx)"
+            v="${NVIDIA_BRANCH_VERSION[Legacy]:-}"
+            if [[ -z "${v}" ]] || [[ "${release}" == "470" && "$(nvidia_major "${v}")" != "470" ]]; then
+                NVIDIA_BRANCH_VERSION[Legacy]="${version}"
+            fi
+        else
+            text="${label[${type}]}"
+            NVIDIA_BRANCH_VERSION["${type}"]="${version}"
+        fi
+        # The same label twice on one version (a repeated block) is shown once.
+        if [[ " · ${NVIDIA_VERSION_TAGS[${version}]:-} · " != *" · ${text} · "* ]]; then
+            NVIDIA_VERSION_TAGS["${version}"]="${NVIDIA_VERSION_TAGS[${version}]:+${NVIDIA_VERSION_TAGS[${version}]} · }${text}"
+        fi
         NVIDIA_BRANCH_INFO_OK=1
     done <<< "${queries}"
 
@@ -1202,8 +1219,16 @@ generate_env_file() {
     local patch_mode="${8:-auto}"
     # Cards for the build to check the driver against; an opt-out already in
     # .env (read by --reconfigure) is kept, anything else turns the check on.
-    local target_gpus skip_gpu_check="false"
-    target_gpus="$(nvidia_target_gpus)"
+    # Only this machine's own cards are known here, so they are the target only
+    # when the wizard runs on the TrueNAS host itself (detect_truenas_version
+    # found a version). Anywhere else the list stays empty and the deploy step
+    # checks the real host's GPUs.
+    local target_gpus="" skip_gpu_check="false"
+    if [[ -n "${DETECTED_TRUENAS_VERSION:-}" ]]; then
+        target_gpus="$(nvidia_target_gpus)"
+    else
+        info "Not running on TrueNAS — the GPUs will be checked by deploy-nvidia.sh on the target"
+    fi
     [[ "${EXISTING_SKIP_GPU_CHECK:-}" == "true" ]] && skip_gpu_check="true"
 
     cat > "${output_file}" <<EOF
@@ -1221,8 +1246,10 @@ TRUENAS_VERSION=${truenas_version}
 NVIDIA_KERNEL_MODULE_TYPE=${module_type}
 
 # GPUs the build checks the driver against (devid:subvendor:subdevice, comma
-# separated; cards reserved for a VM are left out). Filled in by configure.sh.
-# Set SKIP_GPU_CHECK=true to build a driver that does not list these cards.
+# separated; cards reserved for a VM are left out). Filled in by configure.sh
+# when it runs on the TrueNAS host; empty elsewhere (deploy-nvidia.sh then
+# checks the host's GPUs). Set SKIP_GPU_CHECK=true to build a driver that does
+# not list these cards.
 NVIDIA_TARGET_GPUS=${target_gpus}
 SKIP_GPU_CHECK=${skip_gpu_check}
 
@@ -1447,19 +1474,21 @@ nvidia_target_gpus() {
 # for a card it dropped, which legacy branch still does — so the wizard checks
 # the fit up front, from that list only. Reserved (vfio-pci) cards are skipped.
 declare -g GPU_RECOMMENDED_VERSION="" GPU_FIT_CONFLICT=0
-declare -ga GPU_UNBUILDABLE=()
+declare -ga GPU_UNBUILDABLE=() GPU_UNLISTED=()
 
 # Run right after fetch_nvidia_branch_info, with NVIDIA_VERSIONS newest-first.
 # Sets: GPU_NAME[idx] for every card, GPU_RECOMMENDED_VERSION (newest version
 #       in the oldest legacy branch an active card needs), GPU_UNBUILDABLE
 #       ("name|branch" for cards whose branch is below NVIDIA_MIN_MAJOR),
-#       GPU_FIT_CONFLICT=1 when the recommended version leaves a card out.
+#       GPU_UNLISTED ("name|newest version" for cards the newest README does
+#       not list at all), GPU_FIT_CONFLICT=1 when the recommended version
+#       leaves a card out.
 # Tags: "★ Recommended for your <name>" on the recommendation; every labelled
 #       version gets " — does NOT support <name>" per active card it does not
 #       drive. A version whose list can't be read gets no fit tag (never guess).
 apply_gpu_fit_tags() {
     declare -g GPU_RECOMMENDED_VERSION="" GPU_FIT_CONFLICT=0
-    declare -ga GPU_UNBUILDABLE=()
+    declare -ga GPU_UNBUILDABLE=() GPU_UNLISTED=()
     declare -gA NVIDIA_VERSION_TAGS
     GPU_NAME=()
 
@@ -1489,6 +1518,7 @@ apply_gpu_fit_tags() {
     local major best=""
     for i in "${active[@]}"; do
         section[${i}]="$(gpu_support "${newest}" "${i}")"
+        [[ "${section[${i}]}" != "unlisted" ]] || GPU_UNLISTED+=("${GPU_NAME[i]}|${newest}")
         case "${section[${i}]}" in current|unlisted) continue ;; esac
         major="${section[${i}]%%.*}"
         [[ "${major}" =~ ^[0-9]+$ ]] || continue
@@ -1597,9 +1627,15 @@ show_gpu_fit_hint() {
     for entry in "${GPU_UNBUILDABLE[@]}"; do
         echo -e "  ${YELLOW}${entry%|*} needs the ${entry##*|}.xx legacy driver — this tool can't build a driver for that card.${NC}"
     done
+    # With a recommendation, the conflict line above already covers these.
+    if [[ -z "${GPU_RECOMMENDED_VERSION:-}" ]]; then
+        for entry in "${GPU_UNLISTED[@]}"; do
+            echo -e "  ${YELLOW}No listed driver version drives your ${entry%|*} — it is not in the supported list of NVIDIA ${entry##*|}, the newest one.${NC}"
+        done
+    fi
     if [[ -n "${GPU_RECOMMENDED_VERSION:-}" && ${GPU_FIT_CONFLICT:-0} -eq 0 ]]; then
         echo -e "  ${YELLOW}Newer branches dropped your GPU — pick ${GPU_RECOMMENDED_VERSION} (★ Recommended).${NC}"
-    elif [[ -z "${GPU_RECOMMENDED_VERSION:-}" && ${#GPU_UNBUILDABLE[@]} -eq 0 ]]; then
+    elif [[ -z "${GPU_RECOMMENDED_VERSION:-}" && ${#GPU_UNBUILDABLE[@]} -eq 0 && ${#GPU_UNLISTED[@]} -eq 0 ]]; then
         echo -e "  ${DIM}Tip: ★ Production Branch is recommended for most users.${NC}"
     fi
     echo ""

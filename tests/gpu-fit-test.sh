@@ -28,7 +28,8 @@ not() { ! "$@"; }
     sed -n '/^NVIDIA_LOOKUP_FALLBACK=(/,/^)/p' "${REPO}/configure.sh"
     for fn in parse_nvidia_gpus nvidia_supported_chips gpu_support gpu_name gpu_display_name detect_nvidia_gpu \
               nvidia_major nvidia_latest_in_series nvidia_lookup_queries nvidia_lookup_version \
-              fetch_nvidia_branch_info apply_gpu_fit_tags advise_gpu_branch_fit driver_menu_default; do
+              fetch_nvidia_branch_info apply_gpu_fit_tags advise_gpu_branch_fit driver_menu_default \
+              show_gpu_fit_hint; do
         sed -n "/^${fn}() {/,/^}/p" "${REPO}/configure.sh"
     done
 } > "${WORK}/code.sh"
@@ -168,6 +169,20 @@ check "470 recommended, marked for the 5080" is "${TAG[470.256.02]}" "★ Recomm
 check "conflict flagged"       is "${GPU_FIT_CONFLICT}" 1
 check "advice on 470 names the 5080" grep -q "NVIDIA GeForce RTX 5080 is newer than NVIDIA 470.256.02" "$WORK/advice"
 
+echo "Step 2 hint"
+GREEN=""; YELLOW=""; DIM=""; NC=""
+host "${FX}/lspci-truenas-t1000-vfio-rtxpro2000.txt"
+check "listed card gets the Production tip" grep -q "Production Branch is recommended" <(show_gpu_fit_hint)
+{
+    echo '0000:01:00.0 VGA compatible controller [0300]: NVIDIA Corporation GB999 [GeForce Future 9090] [10de:dead] (rev a1)'
+} > "${WORK}/lspci-unlisted.txt"
+host "${WORK}/lspci-unlisted.txt"
+check "unlisted card: no recommendation" is "${GPU_RECOMMENDED_VERSION:-}|${#GPU_UNBUILDABLE[@]}" "|0"
+check "unlisted card recorded" is "${GPU_UNLISTED[*]}" "GeForce Future 9090|620.70.06"
+show_gpu_fit_hint > "${WORK}/hint"
+check "unlisted card: no Production tip" not grep -q "Production Branch is recommended" "${WORK}/hint"
+check "unlisted card: says no version drives it" grep -qF "No listed driver version drives your GeForce Future 9090 — it is not in the supported list of NVIDIA 620.70.06, the newest one." "${WORK}/hint"
+
 echo "README unreachable"
 NVIDIA_CHIPS_CACHE=(); README_DOWN=1
 host "${FX}/lspci-gtx1080.txt"
@@ -206,9 +221,16 @@ check "no NVIDIA_ARCH_ tables" is "$(grep -c 'NVIDIA_ARCH_' "$REPO/configure.sh"
 # ── the --nvidia path and the .env hand-off ──────────────────────────────────
 # Runs a copy of the repo (so the real .env is never touched) with lspci and
 # curl stubbed from the fixtures. New copy per scenario; $1 = lspci fixture.
+# The copy runs as if on a TrueNAS host (midclt answers a version) unless $3 is
+# "desktop", where midclt fails.
 make_repo() {
-    local d="$1" lspci_file="$2"
+    local d="$1" lspci_file="$2" host="${3:-truenas}"
     mkdir -p "${d}/bin"
+    if [[ "${host}" == "desktop" ]]; then
+        printf '#!/bin/bash\nexit 1\n' > "${d}/bin/midclt"
+    else
+        printf '#!/bin/bash\necho 25.10.8\n' > "${d}/bin/midclt"
+    fi
     cp "${REPO}/configure.sh" "${REPO}/docker-compose.yaml" "${d}/"
     cp "${lspci_file}" "${d}/lspci.txt"
     printf '#!/bin/bash\ncat "%s/lspci.txt"\n' "${d}" > "${d}/bin/lspci"
@@ -247,6 +269,19 @@ check "warns 620 won't drive the GTX 1080" grep -q "not supported by NVIDIA 620.
 check "target GPU recorded"   grep -qx "NVIDIA_TARGET_GPUS=1b80:1043:85aa" "$WORK/repo/.env"
 check "gpu check on by default" grep -qx "SKIP_GPU_CHECK=false" "$WORK/repo/.env"
 check "labels fetched once" is "$(grep -c 'Fetching NVIDIA driver versions' "$WORK/cli-out")" 1
+check "says it runs on TrueNAS" grep -q "Detected TrueNAS version: 25.10.8" "$WORK/cli-out"
+check "TrueNAS host has no desktop line" not grep -q "Not running on TrueNAS" "$WORK/cli-out"
+echo "--nvidia path on a desktop (not TrueNAS)"
+if [[ -f /etc/version ]]; then
+    echo "  skipped: /etc/version exists, this machine looks like TrueNAS"
+else
+    make_repo "$WORK/repo6" "${FX}/lspci-gtx1080.txt" desktop
+    run_cfg "$WORK/repo6" --truenas 25.10.8 --nvidia 620.70.06 --module open
+    check "desktop card not recorded" grep -qx "NVIDIA_TARGET_GPUS=" "$WORK/repo6/.env"
+    check "says deploy checks the GPUs" grep -q "Not running on TrueNAS — the GPUs will be checked by deploy-nvidia.sh on the target" "$WORK/repo6/out"
+    check "fit advice still shown" grep -q "not supported by NVIDIA 620.70.06" "$WORK/repo6/out"
+    check "gpu check still on" grep -qx "SKIP_GPU_CHECK=false" "$WORK/repo6/.env"
+fi
 echo "--nvidia path, network down"
 make_repo "$WORK/repo4" "${FX}/lspci-gtx1080.txt"
 printf '#!/bin/bash\nexit 22\n' > "$WORK/repo4/bin/curl"

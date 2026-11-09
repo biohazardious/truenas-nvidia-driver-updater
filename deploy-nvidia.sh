@@ -702,7 +702,7 @@ build_info_value() {
 # (pre-GSP). Returns non-zero when the JSON can't be read.
 gpu_fit_eval() {
     local json="$1" module="$2"; shift 2
-    python3 - "${json}" "${module}" "$@" <<'PY'
+    python3 -I - "${json}" "${module}" "$@" <<'PY'
 import json, sys
 
 def norm(v):
@@ -830,7 +830,7 @@ check_image_gpus() {
             ok)       ok "${name} (10de:${devid}) is supported by NVIDIA ${GPU_FIT_VERSION} (${GPU_FIT_MODULE} modules)" ;;
             legacy)   failures+=("${name} (10de:${devid}) is not supported by NVIDIA ${GPU_FIT_VERSION}; NVIDIA lists it for the ${extra} legacy driver. Rebuild with ./configure.sh and pick ${extra}.") ;;
             unlisted) failures+=("10de:${devid} is not in NVIDIA ${GPU_FIT_VERSION}'s supported list.") ;;
-            module)   failures+=("${name} (10de:${devid}) needs ${extra} kernel modules. Rebuild with ./configure.sh --module ${extra}.") ;;
+            module)   failures+=("${name} (10de:${devid}) needs ${extra} kernel modules. Rebuild with ./configure.sh --reconfigure (Module Type → ${extra}) or NVIDIA_KERNEL_MODULE_TYPE=${extra} in .env.") ;;
         esac
     done <<< "${GPU_FIT_REPORT}"
 

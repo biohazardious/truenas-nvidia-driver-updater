@@ -503,6 +503,8 @@ check "integration never touched"             is "$(grep -c docker.update "${sb}
 check "nothing unmerged"                      is "$(grep -c 'systemd-sysext unmerge' "${sb}/events")" 0
 check "names the card and the flavor it needs" has "${sb}/out" "NVIDIA GeForce GTX 1080 (10de:1b80) needs proprietary kernel modules"
 check "points at the rebuild and --force-gpu" has "${sb}/out" "--force-gpu"
+check "rebuild hint uses --reconfigure"       has "${sb}/out" "Rebuild with ./configure.sh --reconfigure (Module Type → proprietary) or NVIDIA_KERNEL_MODULE_TYPE=proprietary in .env"
+check "no ignored --module hint"              lacks "${sb}/out" "configure.sh --module"
 check "does not suggest SKIP_GPU_CHECK"       lacks "${sb}/out" "SKIP_GPU_CHECK"
 check "--force-gpu deploys anyway"            is "$(deploy_with lspci-gtx1080.txt open-580 --force-gpu; installed "${sb}")" NEW
 check "--force-gpu still says why"            has "${sb}/out" "needs proprietary kernel modules"

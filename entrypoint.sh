@@ -177,9 +177,9 @@ check_target_gpus() {
         [[ -n "${kind}" ]] || continue
         case "${kind}" in
             ok) ok "${name} (10de:${id}) is supported by NVIDIA ${NVIDIA_VERSION} (${module} modules)" ;;
-            legacy) die "${name} (10de:${id}) is not supported by NVIDIA ${NVIDIA_VERSION}; NVIDIA lists it for the ${extra} legacy driver. Re-run ./configure.sh and pick ${extra}." ;;
-            unlisted) die "10de:${id} is not in NVIDIA ${NVIDIA_VERSION}'s supported list." ;;
-            module) die "${name} (10de:${id}) needs ${extra} kernel modules. Re-run ./configure.sh --module ${extra}, or set SKIP_GPU_CHECK=true to build anyway." ;;
+            legacy) die "${name} (10de:${id}) is not supported by NVIDIA ${NVIDIA_VERSION}; NVIDIA lists it for the ${extra} legacy driver. Re-run ./configure.sh and pick ${extra}, or set SKIP_GPU_CHECK=true to build anyway." ;;
+            unlisted) die "10de:${id} is not in NVIDIA ${NVIDIA_VERSION}'s supported list. Set SKIP_GPU_CHECK=true to build anyway." ;;
+            module) die "${name} (10de:${id}) needs ${extra} kernel modules. Run ./configure.sh --reconfigure (Module Type → ${extra}) or set NVIDIA_KERNEL_MODULE_TYPE=${extra} in .env, or set SKIP_GPU_CHECK=true to build anyway." ;;
         esac
     done <<< "${report}"
 }

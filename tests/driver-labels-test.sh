@@ -39,6 +39,10 @@ declare -n TAG=NVIDIA_VERSION_TAGS
 PAGE_FILE="${FX}/unix-page.html"   # empty → the page fetch fails
 API_DOWN=0
 PB_FILE="${FX}/api-PB.json"
+# A Legacy answer for a 580 query: by default a real 580 version.
+sed -e 's/470\.256\.02/580.196.07/g' -e 's/"Release" : "470"/"Release" : "580"/' \
+    "${FX}/api-LEG.json" > "${WORK}/api-LEG580.json"
+LEG580_FILE="${WORK}/api-LEG580.json"
 fetch_url() {
     case "$1" in
         *drivers/unix/*) [[ -n "${PAGE_FILE}" ]] && cat "${PAGE_FILE}" || return 1 ;;
@@ -46,6 +50,7 @@ fetch_url() {
             [[ ${API_DOWN} -eq 1 ]] && return 1
             case "$1" in
                 *release=470*) cat "${FX}/api-LEG.json" ;;
+                *release=580*) cat "${LEG580_FILE}" ;;
                 *qnf=1*)       cat "${FX}/api-NFB.json" ;;
                 *beta=1*)      cat "${FX}/api-BETA.json" ;;
                 *beta=0*)      cat "${PB_FILE}" ;;
@@ -103,6 +108,36 @@ PB_FILE="${FX}/api-NFB.json"
 run "${VERSIONS[@]}"
 check "PB not taken from an NFB answer" is "${NVIDIA_BRANCH_VERSION[PB]:-}" ""
 PB_FILE="${FX}/api-PB.json"
+
+echo "Legacy query moved to release=580"
+PAGE_FILE="${WORK}/leg580.html"
+sed 's/&release=470&/\&release=580\&/' "${FX}/unix-page.html" > "${WORK}/leg580.html"
+run "${VERSIONS[@]}"
+check "580.196.07 is Legacy (580.xx)"  is "${TAG[580.196.07]:-}" "★ Legacy GPU (580.xx)"
+check "470.256.02 not labelled"        is "${TAG[470.256.02]:-}" ""
+check "Legacy branch version is 580"   is "${NVIDIA_BRANCH_VERSION[Legacy]:-}" "580.196.07"
+
+echo "Legacy release=580 answered with a 470 version"
+LEG580_FILE="${FX}/api-LEG.json"
+run "${VERSIONS[@]}"
+check "no Legacy label anywhere"       is "${TAG[470.256.02]:-}|${TAG[580.196.07]:-}" "|"
+check "no Legacy branch version"       is "${NVIDIA_BRANCH_VERSION[Legacy]:-}" ""
+LEG580_FILE="${WORK}/api-LEG580.json"
+
+echo "two Legacy blocks (580 first, then 470)"
+PAGE_FILE=""
+SAVED_FALLBACK=("${NVIDIA_LOOKUP_FALLBACK[@]}")
+NVIDIA_LOOKUP_FALLBACK=(
+    "Legacy|psid=122&pfid=944&osID=12&beta=0&sort1=1&release=580&numberOfResults=1"
+    "Legacy|psid=122&pfid=944&osID=12&beta=0&sort1=1&release=470&numberOfResults=1"
+    "Legacy|psid=122&pfid=944&osID=12&beta=0&sort1=1&release=470&numberOfResults=1"
+)
+run "${VERSIONS[@]}"
+check "580 labelled with its own series" is "${TAG[580.196.07]:-}" "★ Legacy GPU (580.xx)"
+check "470 labelled once"                is "${TAG[470.256.02]:-}" "★ Legacy GPU (470.xx)"
+check "Legacy branch version is the 470" is "${NVIDIA_BRANCH_VERSION[Legacy]:-}" "470.256.02"
+NVIDIA_LOOKUP_FALLBACK=("${SAVED_FALLBACK[@]}")
+PAGE_FILE="${FX}/unix-page.html"
 
 echo
 echo "${PASS} passed, ${FAIL} failed"
