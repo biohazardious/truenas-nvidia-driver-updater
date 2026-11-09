@@ -1366,6 +1366,121 @@ detect_truenas_version() {
     fi
 }
 
+# ── GPU identification by PCI ID ─────────────────────────────────────────────
+declare -ga GPU_SLOT=() GPU_DEVID=() GPU_SUBSYS=() GPU_LSPCI_NAME=() GPU_RESERVED=() GPU_RAW_NAME=()
+declare -gA NVIDIA_CHIPS_CACHE=()
+
+# Read `lspci -Dnnk -d 10de:` text on stdin; fill the GPU_* arrays (one index
+# per display controller: classes 0300/0302/0380). GPU_RESERVED=1 when the card
+# is bound to vfio-pci (handed to a VM). GPU_LSPCI_NAME is empty when lspci only
+# knows the card as "Device xxxx". GPU_RAW_NAME is the name the old
+# architecture-table logic expects.
+parse_nvidia_gpus() {
+    GPU_SLOT=(); GPU_DEVID=(); GPU_SUBSYS=(); GPU_LSPCI_NAME=(); GPU_RESERVED=(); GPU_RAW_NAME=()
+    local hdr='^([0-9a-fA-F:.]+) .*\[(0300|0302|0380)\]: (.*) \[10de:([0-9a-fA-F]{4})\]'
+    local line cur=-1 prefix devid
+    while IFS= read -r line; do
+        if [[ "${line}" =~ ${hdr} ]]; then
+            prefix="${BASH_REMATCH[3]}"
+            devid="${BASH_REMATCH[4],,}"
+            cur=${#GPU_DEVID[@]}
+            GPU_SLOT[cur]="${BASH_REMATCH[1]}"
+            GPU_DEVID[cur]="${devid}"
+            GPU_SUBSYS[cur]=""
+            GPU_RESERVED[cur]=0
+            if [[ "${prefix}" =~ \[([^][]*)\]$ ]]; then
+                GPU_LSPCI_NAME[cur]="${BASH_REMATCH[1]}"
+            else
+                GPU_LSPCI_NAME[cur]=""
+            fi
+            if [[ "${prefix}" == *Device ]]; then
+                GPU_RAW_NAME[cur]="Device ${devid}"
+            else
+                GPU_RAW_NAME[cur]="${prefix#NVIDIA Corporation }"
+            fi
+        elif [[ "${line}" =~ ^[[:space:]] ]]; then
+            [[ ${cur} -ge 0 ]] || continue
+            if [[ "${line}" =~ Subsystem:.*\[([0-9a-fA-F]{4}:[0-9a-fA-F]{4})\]$ ]]; then
+                GPU_SUBSYS[cur]="${BASH_REMATCH[1],,}"
+            elif [[ "${line}" =~ Kernel\ driver\ in\ use:\ vfio-pci ]]; then
+                GPU_RESERVED[cur]=1
+            fi
+        else
+            cur=-1   # another device (e.g. the GPU's audio function)
+        fi
+    done
+    return 0
+}
+
+# Print `DEVID|SECTION|NAME` for every row of NVIDIA's supported-chips README for
+# VERSION. SECTION is `current` or the legacy branch (580, 173.14, ...). Rows
+# list "<name> | <devid> [subvendor subdevice]"; only the device ID is kept.
+# Returns 1 when the README cannot be fetched or has no rows.
+nvidia_supported_chips() {
+    local ver="$1" html rows
+    if [[ -n "${NVIDIA_CHIPS_CACHE[${ver}]+x}" ]]; then
+        printf '%s\n' "${NVIDIA_CHIPS_CACHE[${ver}]}"
+        return 0
+    fi
+    html="$(fetch_url "https://download.nvidia.com/XFree86/Linux-x86_64/${ver}/README/supportedchips.html")" || return 1
+    rows="$(awk '
+        BEGIN { RS = "<tr"; sec = "current" }
+        NR > 1 {
+            end = index($0, "</tr>")
+            body = end ? substr($0, 1, end - 1) : $0
+            rest = end ? substr($0, end) : ""
+            n = split(body, t, "<td")
+            if (n >= 3) {
+                name = t[2]; id = t[3]
+                sub(/^[^>]*>/, "", name); gsub(/<[^>]*>/, "", name)
+                sub(/^[^>]*>/, "", id);   gsub(/<[^>]*>/, "", id)
+                gsub(/&nbsp;/, " ", name); gsub(/&amp;/, "\\&", name)
+                gsub(/&[A-Za-z0-9#]+;/, "", name)
+                gsub(/[ \t\r\n]+/, " ", name); sub(/^ /, "", name); sub(/ $/, "", name)
+                gsub(/^[ \t\r\n]+/, "", id); split(id, p, /[ \t\r\n]+/)
+                if (p[1] ~ /^[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]$/)
+                    print toupper(p[1]) "|" sec "|" name
+            }
+            if (match(rest, /name="legacy_[^"]*"/)) {
+                s = substr(rest, RSTART + 13, RLENGTH - 14)
+                sub(/\.xx$/, "", s)
+                sec = s
+            }
+        }' <<< "${html}")"
+    [[ -n "${rows}" ]] || return 1
+    NVIDIA_CHIPS_CACHE[${ver}]="${rows}"
+    printf '%s\n' "${rows}"
+}
+
+# Does driver VERSION support GPU index IDX? Prints `current`, the legacy branch
+# that carries the card (e.g. 580), or `unlisted`. Returns 1 when the README is
+# unavailable — never guess.
+gpu_support() {
+    local ver="$1" idx="$2" id rows hit
+    id="${GPU_DEVID[idx]^^}"
+    nvidia_supported_chips "${ver}" >/dev/null || return 1
+    rows="${NVIDIA_CHIPS_CACHE[${ver}]}"
+    hit="$(awk -F'|' -v id="${id}" '
+        $1 == id { if ($2 == "current") { print "current"; exit } if (first == "") first = $2 }
+        END { if (first != "") print first }' <<< "${rows}" | head -n1)"
+    printf '%s\n' "${hit:-unlisted}"
+}
+
+# Display name for GPU index IDX: what lspci knows, else the newest README's
+# name for that device ID, else a generic one.
+gpu_name() {
+    local idx="$1" name="" rows
+    if [[ -n "${GPU_LSPCI_NAME[idx]}" ]]; then
+        printf '%s\n' "${GPU_LSPCI_NAME[idx]}"
+        return 0
+    fi
+    if [[ -n "${NVIDIA_VERSIONS[0]:-}" ]] && nvidia_supported_chips "${NVIDIA_VERSIONS[0]}" >/dev/null; then
+        rows="${NVIDIA_CHIPS_CACHE[${NVIDIA_VERSIONS[0]}]}"
+        name="$(awk -F'|' -v id="${GPU_DEVID[idx]^^}" '$1 == id { print $3; exit }' <<< "${rows}")"
+    fi
+    printf '%s\n' "${name:-NVIDIA device 10de:${GPU_DEVID[idx]}}"
+}
+
 # Detect every NVIDIA GPU via lspci and derive the driver-branch window that
 # satisfies ALL of them: the ceiling is the lowest "last supporting branch"
 # across the cards, the floor the highest "first supporting branch". A single
@@ -1378,15 +1493,29 @@ detect_nvidia_gpu() {
     declare -g GPU_BRANCH_CEILING="" GPU_CEILING_CARD="" GPU_CEILING_ARCH=""
     declare -g GPU_BRANCH_FLOOR="" GPU_FLOOR_CARD="" GPU_FLOOR_ARCH=""
     declare -g GPU_BRANCH_CONFLICT=0 GPU_UNIDENTIFIED=0
+    GPU_SLOT=(); GPU_DEVID=(); GPU_SUBSYS=(); GPU_LSPCI_NAME=(); GPU_RESERVED=(); GPU_RAW_NAME=()
 
     if ! command -v lspci &>/dev/null; then
         return
     fi
 
-    # Every NVIDIA VGA/3D/Display controller, not just the first one.
-    mapfile -t DETECTED_GPUS < <(lspci 2>/dev/null \
-        | grep -iE '(VGA|3D|Display).*NVIDIA' \
-        | sed 's/.*NVIDIA Corporation //' || true)
+    # Every NVIDIA display controller, identified by PCI ID.
+    local lspci_out
+    lspci_out="$(lspci -Dnnk -d 10de: 2>/dev/null || true)"
+    parse_nvidia_gpus <<< "${lspci_out}"
+
+    [[ ${#GPU_DEVID[@]} -gt 0 ]] || return 0
+
+    # The old architecture-table logic below still reads DETECTED_GPUS: only
+    # active (non-reserved) cards feed it.
+    local i
+    for i in "${!GPU_DEVID[@]}"; do
+        if [[ "${GPU_RESERVED[i]}" == "1" ]]; then
+            ok "Detected GPU: NVIDIA ${GPU_RAW_NAME[i]} (10de:${GPU_DEVID[i]}) — reserved for a VM (vfio-pci) — not checked"
+        else
+            DETECTED_GPUS+=("${GPU_RAW_NAME[i]}")
+        fi
+    done
 
     [[ ${#DETECTED_GPUS[@]} -gt 0 ]] || return 0
     DETECTED_GPU_MODEL="${DETECTED_GPUS[0]}"

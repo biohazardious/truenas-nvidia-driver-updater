@@ -1,0 +1,7 @@
+0000:01:00.0 VGA compatible controller [0300]: NVIDIA Corporation GP104 [GeForce GTX 1080] [10de:1b80] (rev a1)
+	Subsystem: ASUSTeK Computer Inc. GP104 [GeForce GTX 1080] [1043:85aa]
+	Kernel modules: nouveau
+0000:01:00.1 Audio device [0403]: NVIDIA Corporation GP104 High Definition Audio Controller [10de:10f0] (rev a1)
+	Subsystem: ASUSTeK Computer Inc. GP104 High Definition Audio Controller [1043:85aa]
+	Kernel driver in use: snd_hda_intel
+	Kernel modules: snd_hda_intel
