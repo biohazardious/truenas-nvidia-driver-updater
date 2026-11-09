@@ -203,6 +203,83 @@ check "default cleared → Enter asks again" grep -qx "picked=620.70.06" "${WORK
 echo "architecture table gone"
 check "no NVIDIA_ARCH_ tables" is "$(grep -c 'NVIDIA_ARCH_' "$REPO/configure.sh")" 0
 
+# ── the --nvidia path and the .env hand-off ──────────────────────────────────
+# Runs a copy of the repo (so the real .env is never touched) with lspci and
+# curl stubbed from the fixtures. New copy per scenario; $1 = lspci fixture.
+make_repo() {
+    local d="$1" lspci_file="$2"
+    mkdir -p "${d}/bin"
+    cp "${REPO}/configure.sh" "${REPO}/docker-compose.yaml" "${d}/"
+    cp "${lspci_file}" "${d}/lspci.txt"
+    printf '#!/bin/bash\ncat "%s/lspci.txt"\n' "${d}" > "${d}/bin/lspci"
+    cat > "${d}/bin/curl" <<STUB
+#!/bin/bash
+url="\${@: -1}"
+FX="${FX}"
+case "\${url}" in
+    https://download.nvidia.com/XFree86/Linux-x86_64/)
+        for v in 620.70.06 615.78.08 595.45.04 580.196.07 470.256.02; do echo "<a href='\${v}/'>\${v}/</a>"; done ;;
+    */README/supportedchips.html)
+        ver="\${url%/README/*}"; ver="\${ver##*/}"
+        [[ -f "\${FX}/supportedchips-\${ver}.html" ]] && cat "\${FX}/supportedchips-\${ver}.html" || exit 22 ;;
+    *drivers/unix/*) cat "\${FX}/unix-page.html" ;;
+    *AjaxDriverService*)
+        case "\${url}" in
+            *release=470*) cat "\${FX}/api-LEG.json" ;;
+            *qnf=1*)       cat "\${FX}/api-NFB.json" ;;
+            *beta=1*)      cat "\${FX}/api-BETA.json" ;;
+            *beta=0*)      cat "\${FX}/api-PB.json" ;;
+            *) exit 22 ;;
+        esac ;;
+    *) exit 22 ;;
+esac
+STUB
+    printf '#!/bin/bash\nexit 1\n' > "${d}/bin/wget"
+    chmod +x "${d}/bin/"*
+}
+run_cfg() { local d="$1"; shift; PATH="${d}/bin:${PATH}" timeout 60 bash "${d}/configure.sh" "$@" </dev/null > "${d}/out" 2>&1; }
+
+echo "--nvidia path"
+make_repo "$WORK/repo" "${FX}/lspci-gtx1080.txt"
+run_cfg "$WORK/repo" --truenas 25.10.8 --nvidia 620.70.06 --module open
+cp "$WORK/repo/out" "$WORK/cli-out"
+check "warns 620 won't drive the GTX 1080" grep -q "not supported by NVIDIA 620.70.06" "$WORK/cli-out"
+check "target GPU recorded"   grep -qx "NVIDIA_TARGET_GPUS=1b80:1043:85aa" "$WORK/repo/.env"
+check "gpu check on by default" grep -qx "SKIP_GPU_CHECK=false" "$WORK/repo/.env"
+check "labels fetched once" is "$(grep -c 'Fetching NVIDIA driver versions' "$WORK/cli-out")" 1
+echo "--nvidia path, network down"
+make_repo "$WORK/repo4" "${FX}/lspci-gtx1080.txt"
+printf '#!/bin/bash\nexit 22\n' > "$WORK/repo4/bin/curl"
+run_cfg "$WORK/repo4" --truenas 25.10.8 --nvidia 620.70.06
+check "still writes .env" grep -qx "NVIDIA_VERSION=620.70.06" "$WORK/repo4/.env"
+check "target still recorded" grep -qx "NVIDIA_TARGET_GPUS=1b80:1043:85aa" "$WORK/repo4/.env"
+echo "reserved-only host"
+head -4 "${FX}/lspci-truenas-t1000-vfio-rtxpro2000.txt" > "$WORK/reserved.txt"
+make_repo "$WORK/repo2" "$WORK/reserved.txt"
+run_cfg "$WORK/repo2" --truenas 25.10.8 --nvidia 620.70.06
+check "empty target list"     grep -qx "NVIDIA_TARGET_GPUS=" "$WORK/repo2/.env"
+check "no fit warning"        not grep -q "not supported by" "$WORK/repo2/out"
+echo "two cards, one reserved"
+make_repo "$WORK/repo5" "${FX}/lspci-truenas-t1000-vfio-rtxpro2000.txt"
+run_cfg "$WORK/repo5" --truenas 25.10.8 --nvidia 620.70.06
+check "only the active card listed" grep -qx "NVIDIA_TARGET_GPUS=2d30:10de:2054" "$WORK/repo5/.env"
+echo "reconfigure keeps an opt-out"
+make_repo "$WORK/repo3" "${FX}/lspci-gtx1080.txt"
+cat > "$WORK/repo3/.env" <<'ENV'
+NVIDIA_VERSION=580.196.07
+TRUENAS_VERSION=25.10.8
+NVIDIA_KERNEL_MODULE_TYPE=open
+TRUENAS_CODENAME=Goldeye
+EMBED_NVIDIA_RAW_IN_UPDATE=false
+SKIP_GPU_CHECK=true
+NVIDIA_TARGET_GPUS=dead:beef:beef
+ENV
+printf '#!/bin/bash\nexit 22\n' > "$WORK/repo3/bin/curl"
+PATH="$WORK/repo3/bin:${PATH}" timeout 60 bash "$WORK/repo3/configure.sh" --reconfigure --no-whiptail < <(printf '4\n1\n\n\n') > "$WORK/repo3/out" 2>&1
+check "SKIP_GPU_CHECK=true survives" grep -qx "SKIP_GPU_CHECK=true" "$WORK/repo3/.env"
+check "target list is the fresh one" grep -qx "NVIDIA_TARGET_GPUS=1b80:1043:85aa" "$WORK/repo3/.env"
+check "compose passes both"   is "$(grep -cE 'NVIDIA_TARGET_GPUS=|SKIP_GPU_CHECK=' "$REPO/docker-compose.yaml")" 2
+
 echo
 echo "${PASS} passed, ${FAIL} failed"
 [[ ${FAIL} -eq 0 ]]
