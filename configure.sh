@@ -190,6 +190,8 @@ wt_size() {
 # (e.g. 25.10.8 → TrueNAS-SCALE-Goldeye, 27.0.0-RC.1 → TrueNAS-27-RC). The same
 # name is the train on update.truenas.com. Filled by fetch_truenas_versions.
 declare -gA TRUENAS_VERSION_TRAIN=()
+declare -gA TRUENAS_VERSION_TAGS=()
+declare -gA TRUENAS_VERSION_PROFILE=()
 TRUENAS_LIST_TRIED=false
 
 # The host's own release record (written by TrueNAS; holds "train").
@@ -281,84 +283,129 @@ wizard_truenas_train() {
     _wizard_train="${train}"
 }
 
-fetch_truenas_branch_info() {
-    # Tag TrueNAS versions heuristically from the sorted version list.
-    #
-    # Tags:
-    #   ★ Latest Stable      — newest version without -RC, -BETA, -ALPHA
-    #   ★ Latest Pre-release  — newest RC/BETA if it's newer than the latest stable
-    #   ★ Previous Stable     — latest stable in a different major line (YY.MM)
-    #
-    # Args: sorted version list (newest first)
+# Label of a release from its update profile (TrueNAS's own: MISSION_CRITICAL,
+# GENERAL, EARLY_ADOPTER, DEVELOPER) and "lts" flag. An unknown profile → no label.
+truenas_release_label() {
+    local profile="${1:-}" lts="${2:-}" label=""
+    case "${profile}" in
+        MISSION_CRITICAL) label="★ Mission Critical" ;;
+        GENERAL)          label="★ General" ;;
+        EARLY_ADOPTER)    label="Early Adopter" ;;
+        DEVELOPER)        label="Developer" ;;
+        *) return 0 ;;
+    esac
+    [[ "${lts}" == "true" || "${lts}" == "True" ]] && label="${label} · LTS"
+    printf '%s\n' "${label}"
+}
 
+# Prints "<train>" lines of update.truenas.com's trains_v2.json (every train and
+# every redirection target); nothing when unreadable or no python3/jq.
+truenas_update_trains() {
+    local json="$1"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -I -c 'import json, sys
+d = json.load(sys.stdin)
+if not isinstance(d, dict): sys.exit(0)
+t = d.get("trains"); r = d.get("trains_redirection")
+for k in (t if isinstance(t, dict) else {}): print(k)
+for v in (r.values() if isinstance(r, dict) else []):
+    if isinstance(v, str): print(v)' <<< "${json}" 2>/dev/null
+    elif command -v jq >/dev/null 2>&1; then
+        jq -r '((.trains // {}) | if type == "object" then keys[] else empty end),
+               ((.trains_redirection // {}) | if type == "object" then .[] | strings else empty end)' \
+            <<< "${json}" 2>/dev/null
+    fi
+    return 0
+}
+
+# Prints "<version> <profile> <lts>" lines of one train's releases.json.
+truenas_update_releases() {
+    local json="$1"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -I -c 'import json, sys
+d = json.load(sys.stdin)
+if not isinstance(d, dict): sys.exit(0)
+for k, v in d.items():
+    if not isinstance(v, dict): continue
+    p = v.get("profile"); l = v.get("lts")
+    print(k, p if isinstance(p, str) else "-", "true" if l is True else "false")' <<< "${json}" 2>/dev/null
+    elif command -v jq >/dev/null 2>&1; then
+        jq -r 'if type == "object" then to_entries[] | select(.value | type == "object")
+               | "\(.key) \(if (.value.profile | type) == "string" then .value.profile else "-" end) \(if .value.lts == true then "true" else "false" end)"
+               else empty end' <<< "${json}" 2>/dev/null
+    fi
+    return 0
+}
+
+TRUENAS_LABELS_OK=0
+
+# Label the given versions with TrueNAS's own profile from update.truenas.com
+# (fills TRUENAS_VERSION_TAGS and TRUENAS_VERSION_PROFILE). Reads the trains the
+# trains_v2.json names (nightlies excluded) plus the train of every given
+# version; a train without a releases.json is skipped. Never guesses: a version
+# nobody labels, or with an unknown profile, simply has no label.
+fetch_truenas_release_labels() {
     declare -gA TRUENAS_VERSION_TAGS=()
-    local -a sorted=("$@")
+    declare -gA TRUENAS_VERSION_PROFILE=()
+    TRUENAS_LABELS_OK=0
+    local -A wanted=() seen=()
+    local v
+    for v in "$@"; do wanted["${v}"]=1; done
 
-    [[ ${#sorted[@]} -eq 0 ]] && return 1
+    local -a trains=()
+    local t trains_json="" releases_json="" line ver profile lts label
+    trains_json="$(fetch_url "https://update.truenas.com/scale/trains_v2.json" 2>/dev/null)" || trains_json=""
+    while IFS= read -r t; do
+        [[ -n "${t}" && "${t}" != *Nightlies* ]] || continue
+        valid_train "${t}" || continue
+        [[ -n "${seen[${t}]:-}" ]] && continue
+        seen["${t}"]=1; trains+=("${t}")
+    done < <(
+        [[ -n "${trains_json}" ]] && truenas_update_trains "${trains_json}"
+        for v in "$@"; do printf '%s\n' "${TRUENAS_VERSION_TRAIN[${v}]:-}"; done
+    )
 
-    local latest_stable="" latest_prerelease="" previous_stable=""
-    local latest_stable_major=""
-
-    # Find latest stable and latest pre-release
-    for ver in "${sorted[@]}"; do
-        if [[ "${ver}" =~ -(RC|BETA|ALPHA|PRERELEASE) ]]; then
-            # Pre-release version
-            [[ -z "${latest_prerelease}" ]] && latest_prerelease="${ver}"
-        else
-            # Stable version
-            if [[ -z "${latest_stable}" ]]; then
-                latest_stable="${ver}"
-                # Extract major line (e.g. "25.10" from "25.10.3.1")
-                latest_stable_major="$(echo "${ver}" | grep -oP '^\d+\.\d+' || true)"
-            fi
-        fi
-
-        # Stop early once we have both
-        [[ -n "${latest_stable}" ]] && [[ -n "${latest_prerelease}" ]] && break
+    for t in "${trains[@]}"; do
+        releases_json="$(fetch_url "https://update.truenas.com/scale/${t}/releases.json" 2>/dev/null)" || continue
+        [[ -n "${releases_json}" ]] || continue
+        while read -r ver profile lts; do
+            [[ -n "${wanted[${ver}]:-}" && -n "${profile}" ]] || continue
+            TRUENAS_LABELS_OK=1
+            # The same release can be listed by several trains; the first wins.
+            [[ -n "${TRUENAS_VERSION_PROFILE[${ver}]:-}" ]] && continue
+            [[ "${profile}" == "-" ]] && continue
+            TRUENAS_VERSION_PROFILE["${ver}"]="${profile}"
+            label="$(truenas_release_label "${profile}" "${lts}")"
+            [[ -n "${label}" ]] && TRUENAS_VERSION_TAGS["${ver}"]="${label}"
+        done < <(truenas_update_releases "${releases_json}")
     done
 
-    # Find previous stable (latest stable in a DIFFERENT major line)
-    if [[ -n "${latest_stable_major}" ]]; then
-        for ver in "${sorted[@]}"; do
-            [[ "${ver}" =~ -(RC|BETA|ALPHA|PRERELEASE) ]] && continue
-            local ver_major=""
-            ver_major="$(echo "${ver}" | grep -oP '^\d+\.\d+' || true)"
-            if [[ -n "${ver_major}" ]] && [[ "${ver_major}" != "${latest_stable_major}" ]]; then
-                previous_stable="${ver}"
-                break
-            fi
+    if (( TRUENAS_LABELS_OK == 0 )); then
+        warn "TrueNAS release labels unavailable — update.truenas.com could not be read"
+        return 1
+    fi
+    return 0
+}
+
+# Where the TrueNAS menu starts: the version this host runs if listed, else the
+# newest version TrueNAS itself rates GENERAL or MISSION_CRITICAL, else the
+# newest that is not a BETA/RC. Prints nothing when the list is empty.
+truenas_menu_default() {
+    local v
+    if [[ -n "${DETECTED_TRUENAS_VERSION:-}" ]]; then
+        for v in "${TRUENAS_VERSIONS[@]}"; do
+            [[ "${v}" == "${DETECTED_TRUENAS_VERSION}" ]] && { printf '%s\n' "${v}"; return 0; }
         done
     fi
-
-    # Assign tags
-    [[ -n "${latest_stable}" ]] && TRUENAS_VERSION_TAGS["${latest_stable}"]="★ Latest Stable"
-
-    # Only tag pre-release if it's actually NEWER than the latest stable
-    # (i.e. it appears before the latest stable in the sorted list)
-    if [[ -n "${latest_prerelease}" ]] && [[ "${latest_prerelease}" != "${latest_stable}" ]]; then
-        # Check if pre-release is newer (appears before stable in sorted list)
-        for ver in "${sorted[@]}"; do
-            if [[ "${ver}" == "${latest_prerelease}" ]]; then
-                TRUENAS_VERSION_TAGS["${latest_prerelease}"]="★ Latest Pre-release"
-                break
-            elif [[ "${ver}" == "${latest_stable}" ]]; then
-                # Stable came first → pre-release is older, don't tag it
-                break
-            fi
-        done
-    fi
-
-    if [[ -n "${previous_stable}" ]] && [[ "${previous_stable}" != "${latest_stable}" ]]; then
-        TRUENAS_VERSION_TAGS["${previous_stable}"]="★ Previous Stable"
-    fi
-
-    local tag_count=${#TRUENAS_VERSION_TAGS[@]}
-    if [[ ${tag_count} -gt 0 ]]; then
-        ok "Identified ${tag_count} release tag(s)"
-        for ver in "${!TRUENAS_VERSION_TAGS[@]}"; do
-            info "  ${ver} → ${TRUENAS_VERSION_TAGS[${ver}]}"
-        done
-    fi
+    for v in "${TRUENAS_VERSIONS[@]}"; do
+        case "${TRUENAS_VERSION_PROFILE[${v}]:-}" in
+            GENERAL|MISSION_CRITICAL) printf '%s\n' "${v}"; return 0 ;;
+        esac
+    done
+    for v in "${TRUENAS_VERSIONS[@]}"; do
+        [[ "${v}" == *-BETA* || "${v}" == *-RC* ]] || { printf '%s\n' "${v}"; return 0; }
+    done
+    return 0
 }
 
 # TrueNAS only ships the driver as a sysext from 24.10 on; before that it is
@@ -438,30 +485,10 @@ fetch_truenas_versions() {
         return 1
     fi
 
-    # Tag versions (Latest Stable, Latest Pre-release, Previous Stable)
-    fetch_truenas_branch_info "${sorted_arr[@]}"
+    TRUENAS_VERSIONS=("${sorted_arr[@]}")
 
-    # Place tagged versions at the top, then the rest
-    local -a tagged_order=()
-    local -A tagged_seen=()
-
-    # Insert in priority order: Latest Stable first, then Pre-release, then Previous
-    for priority in "Latest Stable" "Latest Pre-release" "Previous Stable"; do
-        for ver in "${sorted_arr[@]}"; do
-            local tag="${TRUENAS_VERSION_TAGS[${ver}]:-}"
-            if [[ -n "${tag}" ]] && [[ "${tag}" == *"${priority}"* ]] && [[ -z "${tagged_seen[${ver}]:-}" ]]; then
-                tagged_order+=("${ver}")
-                tagged_seen["${ver}"]=1
-            fi
-        done
-    done
-
-    # Build final list: tagged first, then all others
-    TRUENAS_VERSIONS=("${tagged_order[@]}")
-    for ver in "${sorted_arr[@]}"; do
-        [[ -n "${tagged_seen[${ver}]:-}" ]] && continue
-        TRUENAS_VERSIONS+=("${ver}")
-    done
+    # TrueNAS's own labels; the list is complete without them.
+    fetch_truenas_release_labels "${TRUENAS_VERSIONS[@]}" || true
 
     ok "Found ${#TRUENAS_VERSIONS[@]} TrueNAS versions"
     return 0
@@ -2002,6 +2029,7 @@ main() {
                     for ver in "${TRUENAS_VERSIONS[@]}"; do
                         truenas_menu_args+=("${ver}" "$(truenas_menu_desc "${ver}")")
                     done
+                    UI_MENU_DEFAULT="$(truenas_menu_default)"
                     ui_menu selected_truenas "TrueNAS Version" \
                         "Select new TrueNAS version:" "${truenas_menu_args[@]}"
                     if [[ "${selected_truenas}" != "${EXISTING_TRUENAS}" ]]; then
@@ -2116,6 +2144,7 @@ main() {
             [[ -n "${DETECTED_TRUENAS_VERSION}" ]] && \
                 truenas_prompt="Auto-detected: ${DETECTED_TRUENAS_VERSION} (not confirmed)\nSelect version:"
 
+            UI_MENU_DEFAULT="$(truenas_menu_default)"
             ui_menu selected_truenas \
                 "Step 1: TrueNAS Version" \
                 "${truenas_prompt}" \

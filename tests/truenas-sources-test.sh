@@ -25,9 +25,10 @@ not() { ! "$@"; }
 # ── lift the code under test out of configure.sh ─────────────────────────────
 {
     echo 'info() { :; }; warn() { :; }; ok() { :; }; err() { :; }'
-    sed -n '/^declare -gA TRUENAS_VERSION_TRAIN=/p' "${REPO}/configure.sh"
+    sed -n '/^declare -gA TRUENAS_VERSION_\(TRAIN\|TAGS\|PROFILE\)=/p' "${REPO}/configure.sh"
     for fn in valid_train truenas_train_display host_truenas_train resolve_selected_train \
-              fetch_truenas_branch_info truenas_version_supported fetch_truenas_versions \
+              truenas_release_label truenas_update_trains truenas_update_releases fetch_truenas_release_labels truenas_menu_default \
+              truenas_version_supported fetch_truenas_versions \
               read_existing_config; do
         sed -n "/^${fn}() {/,/^}/p" "${REPO}/configure.sh"
     done
@@ -39,6 +40,11 @@ source "${WORK}/code.sh"
 fetch_url() {
     case "$1" in
         https://download.truenas.com/) cat "${FX}/download-root.html" ;;
+        https://update.truenas.com/scale/trains_v2.json) cat "${FX}/update-trains_v2.json" ;;
+        https://update.truenas.com/scale/*/releases.json)
+            local f="${1#https://update.truenas.com/scale/}"
+            f="${FX}/update-${f%/releases.json}_releases.json"
+            [[ -r "${f}" ]] && cat "${f}" || return 1 ;;
         *) return 1 ;;
     esac
 }
@@ -51,6 +57,7 @@ env_train_from() {
 }
 
 fetch_truenas_versions >/dev/null 2>&1
+SAVED_VERSIONS=("${TRUENAS_VERSIONS[@]}")
 
 echo "train per version"
 check "25.10.8 → Goldeye"        is "${TRUENAS_VERSION_TRAIN[25.10.8]}" TrueNAS-SCALE-Goldeye
@@ -67,6 +74,53 @@ check "good train accepted"      valid_train TrueNAS-SCALE-Goldeye
 check "bad train rejected"       not valid_train "TrueNAS-x;rm"
 check "train with a slash rejected" not valid_train "TrueNAS-SCALE-Goldeye/25.10.8"
 check "empty train rejected"     not valid_train ""
+
+echo "release labels"
+check "25.10.8 General"           is "${TRUENAS_VERSION_TAGS[25.10.8]}" "★ General"
+check "25.10.7 Mission Critical"  is "${TRUENAS_VERSION_TAGS[25.10.7]}" "★ Mission Critical"
+check "25.10-RC.1 Early Adopter"  is "${TRUENAS_VERSION_TAGS[25.10-RC.1]}" "Early Adopter"
+check "27 RC Early Adopter"       is "${TRUENAS_VERSION_TAGS[27.0.0-RC.1]}" "Early Adopter"
+check "24.10 has no label"        is "${TRUENAS_VERSION_TAGS[24.10.2.4]:-}" ""
+# A one-entry releases.json for train TrueNAS-T, labelled by the real code.
+one_entry_label() {
+    (
+        fetch_url() {
+            [[ "$1" == https://update.truenas.com/scale/TrueNAS-T/releases.json ]] \
+                && printf '{"9.9.9": {"profile": "%s", "lts": %s}}\n' "$PROFILE" "$LTS" || return 1
+        }
+        declare -gA TRUENAS_VERSION_TRAIN=([9.9.9]=TrueNAS-T)
+        PROFILE="$1" LTS="$2"
+        fetch_truenas_release_labels 9.9.9 >/dev/null 2>&1
+        printf '%s' "${TRUENAS_VERSION_TAGS[9.9.9]:-}"
+    )
+}
+lts_fixture_label()     { one_entry_label GENERAL true; }
+unknown_profile_label() { one_entry_label CONSERVATIVE true; }
+check "lts appends"               is "$(lts_fixture_label)" "★ General · LTS"
+check "unknown profile → no label" is "$(unknown_profile_label)" ""
+check "developer label"           is "$(one_entry_label DEVELOPER false)" "Developer"
+check "heuristic tags gone"       is "$(grep -cE 'Latest Stable|Latest Pre-release|Previous Stable' "$REPO/configure.sh")" 0
+
+echo "menu default"
+check "host version wins"         is "$(DETECTED_TRUENAS_VERSION=25.10.7; truenas_menu_default)" 25.10.7
+check "else newest General/MC"    is "$(DETECTED_TRUENAS_VERSION=; truenas_menu_default)" 25.10.8
+check "unlisted host version ignored" is "$(DETECTED_TRUENAS_VERSION=25.10.99; truenas_menu_default)" 25.10.8
+check "order is newest first"     is "${TRUENAS_VERSIONS[0]}" 27.0.0-RC.1
+check "menu default without labels → first non-pre-release" \
+    is "$(DETECTED_TRUENAS_VERSION=; declare -gA TRUENAS_VERSION_PROFILE=(); truenas_menu_default)" 25.10.8
+echo "update.truenas.com down"
+fetch_url() {
+    case "$1" in
+        https://download.truenas.com/) cat "${FX}/download-root.html" ;;
+        *) return 1 ;;
+    esac
+}
+warn() { printf '%s\n' "$*" >> "${WORK}/out"; }
+: > "${WORK}/out"
+fetch_truenas_versions >/dev/null 2>&1
+check "list still complete"       is "${#TRUENAS_VERSIONS[@]}" 8
+check "no labels"                 is "${#TRUENAS_VERSION_TAGS[@]}" 0
+check "says so once"              is "$(grep -c 'TrueNAS release labels unavailable' "$WORK/out")" 1
 
 echo "host train"
 cat > "${WORK}/manifest.json" <<'JSON'
