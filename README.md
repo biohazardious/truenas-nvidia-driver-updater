@@ -19,8 +19,8 @@ TrueNAS ships with a specific NVIDIA driver version baked into its immutable roo
 
 ## Features
 
-- **Interactive wizard** — `configure.sh` fetches real version lists with smart tagging (★ Latest Stable, ★ Production Branch, etc.) and guides you through setup. Uses whiptail TUI dialogs when available (TrueNAS has it), with bash `select` menus as fallback
-- **GPU-aware driver recommendation** — detects the GPU architecture from the chip codename and points Kepler/Maxwell/Pascal/Volta owners at the last branch that still supports their card, warning before a build that would install cleanly and then not drive the GPU
+- **Interactive wizard** — `configure.sh` fetches real version lists with branch labels taken from NVIDIA's own page (★ Production Branch, ★ New Feature Branch, Beta, Legacy) and guides you through setup. Uses whiptail TUI dialogs when available (TrueNAS has it), with bash `select` menus as fallback
+- **GPU-aware driver recommendation** — detects your GPUs by PCI ID and checks each driver version against NVIDIA's own list of supported chips, recommending a version that drives your card. The same check runs again before the build and before the deploy, so a driver that would install cleanly and then not drive the GPU is stopped
 - **Fully automated** — downloads TrueNAS update file, extracts kernel headers, compiles the driver, packages everything
 - **TrueNAS 24.10 and newer** — supports 24.10 and 25.x codename-based downloads and the BETA and RC update URLs of TrueNAS 26 and later (26 was renamed 27 at RC.1). A 27 stable release has no known URL yet, so supply `truenas.update` yourself; building against 27 has not been tested
 - **Verified downloads** — the TrueNAS update and NVIDIA installer are checked against the SHA256 published next to them, including cached copies. A mismatch stops the build and deletes the file
@@ -58,16 +58,16 @@ The wizard auto-detects your TrueNAS version and GPU, then walks you through 4 s
 ```
 [OK]    Detected TrueNAS version: 25.10.8
 [OK]    Detected GPU: NVIDIA AD102 [GeForce RTX 4090] (rev a1)
-[OK]      Architecture: Ada — supported by current driver branches
 
   Step 1: TrueNAS Version  →  Auto-detected! Confirm or pick another.
 
   Step 2: Select NVIDIA Driver Version
    GPU: NVIDIA GeForce RTX 4090
-   1) 595.112.07  ★ Production Branch
-   2) 620.70.06  ★ New Feature Branch
-   3) 470.256.02  ★ Legacy GPU (470.xx)
-   4) 595.99.02
+   1) 620.70.06  ★ Production Branch
+   2) 615.78.08  ★ New Feature Branch
+   3) 595.45.04  Beta — not for production use
+   4) 470.256.02  ★ Legacy GPU (470.xx)
+   5) 595.99.02
    ...
    95) 🔍 Filter versions          ← type to search (e.g. "595" or "production")
    96) ✎ Enter manually
@@ -136,7 +136,11 @@ NVIDIA_INSTALL_DRM=true
 EMBED_NVIDIA_RAW_IN_UPDATE=false
 SKIP_KERNEL_COMPAT_CHECK=false
 NVIDIA_PATCH_MODE=auto
+NVIDIA_TARGET_GPUS=
+SKIP_GPU_CHECK=false
 ```
+
+`NVIDIA_TARGET_GPUS` lists the GPUs the build must drive (written by `configure.sh`; empty skips the check). `SKIP_GPU_CHECK=true` builds anyway when the driver or kernel-module flavor won't drive them.
 
 `docker-compose.yaml` is a git-tracked template — it reads values from `.env` automatically. Never edit `docker-compose.yaml` directly.
 </details>
@@ -225,6 +229,7 @@ The manager finds built images under `output/*/nvidia.raw` (newest TrueNAS relea
 
 The deploy script handles everything:
 - Refuses an image built for a different kernel than the running one, because it would merge and then fail to load. `--force-kernel` overrides this
+- Refuses an image whose driver won't drive this host's GPUs, comparing the GPU list embedded in the image with the host's NVIDIA cards (cards bound to `vfio-pci`, reserved for VMs, are skipped). `--force-gpu` overrides this. Images without a GPU list (built before this check existed, or the stock image on `--uninstall`) are deployed with an info line
 - Turns off TrueNAS's own Docker NVIDIA integration for the duration of the swap (`midclt call -j docker.update '{"nvidia": false}'`) and turns it back on afterwards, so middleware never points at driver files that are being replaced
 - Unmerges active sysext extensions
 - Unlocks the read-only `/usr` ZFS dataset
@@ -245,7 +250,10 @@ The deploy script handles everything:
 ./deploy-nvidia.sh --check              # read-only state report, no root needed
 ./deploy-nvidia.sh --dry-run nvidia.raw # walk the whole flow, change nothing
 ./deploy-nvidia.sh --force-kernel nvidia.raw # deploy for another kernel anyway
+./deploy-nvidia.sh --force-gpu nvidia.raw    # deploy even if it won't drive this host's GPUs
 ```
+
+The menu can't pass `--force-kernel` or `--force-gpu`. If a menu deploy or rollback is refused, redo it from the command line, e.g. `./deploy-nvidia.sh --force-gpu <image>`.
 
 `--check` answers the two questions that fail silently — *is the installed image built for the kernel I'm running*, and *is it actually activated* — instead of leaving you to piece it together from `nvidia-smi` errors:
 
@@ -264,13 +272,17 @@ The deploy script handles everything:
   CUDA nodes      /dev/nvidia-uvm MISSING (nvidia_uvm not loaded)
   nvidia-smi      <no devices / driver not responding>
 
+── GPUs ───────────────────────────────────────────────────
+  (each NVIDIA card with its bound driver, and whether the installed
+   driver drives it; vfio-pci cards are listed as reserved for a VM)
+
 ── Problems ────────────────────────────────────────────────
 [WARN]  The installed image was built for kernel 6.12.113-production+truenas,
 [WARN]  but this host runs 6.18.52-production+truenas. The modules will not load — this is
 [WARN]  what a TrueNAS update does. Rebuild against 6.18.52-production+truenas and redeploy.
 ```
 
-It reads the driver version and target kernel out of the image itself (from the squashfs listing — nothing is extracted), reports the activation symlinks, `systemd-sysext status`, the middleware integration state and available backups, and **exits non-zero when it finds a problem** so it can be used in a health check. A missing `/dev/nvidia-uvm` is reported with a note rather than counted as a problem — a box that only transcodes never needs it, so it must not flip the exit status of a health check.
+It reads the driver version and target kernel out of the image itself (from the squashfs listing — nothing is extracted), reports the activation symlinks, `systemd-sysext status`, the middleware integration state and available backups, and **exits non-zero when it finds a problem** (including an installed driver that doesn't drive a non-reserved GPU) so it can be used in a health check. A missing `/dev/nvidia-uvm` is reported with a note rather than counted as a problem — a box that only transcodes never needs it, so it must not flip the exit status of a health check.
 
 A pending reboot gets a note too. If the loaded kernel module differs from the driver in the image, `--check` names both versions and doesn't count it as a problem, because it clears by itself. It stays quiet when the image was built for a different kernel, since a reboot wouldn't help there.
 
@@ -395,50 +407,42 @@ If the target kernel is newer than the branch supports, the build **aborts immed
 
 > **Kepler note:** if your GPU is *only* supported by the 470 branch (Kepler — GeForce 600/700 series), it works out of the box up to TrueNAS 24.10. For TrueNAS 25.x (kernel 6.12) you'll need community kernel patches (see below). Newer GPUs (Maxwell/Pascal/Turing/Ampere/Ada+) should use a current branch (580 for Maxwell–Volta, 595/620 for Turing and newer), which builds cleanly everywhere.
 
+### Driver labels
+
+The version list comes from `https://download.nvidia.com/XFree86/Linux-x86_64/`. The labels come from the four lookup queries embedded in NVIDIA's consumer page, <https://www.nvidia.com/en-us/drivers/unix/> (a built-in copy of the queries is used if the page can't be parsed). A label is shown only on a version that is in the download list:
+
+| Label | Meaning |
+|---|---|
+| `★ Production Branch` | NVIDIA's production branch |
+| `★ New Feature Branch` | NVIDIA's new feature branch |
+| `Beta — not for production use` | NVIDIA's current beta |
+| `★ Legacy GPU (470.xx)` | The 470 legacy branch |
+
+If none of this can be confirmed, no labels are shown and one line says `Branch labels unavailable — see https://www.nvidia.com/en-us/drivers/unix/`. If NVIDIA's page drops one query, only that label goes missing. Nothing is guessed, and `unix.md` and the data-center feeds are no longer used.
+
 ### Does the driver actually support your GPU?
 
-A driver can compile, package and merge perfectly and still not drive your card — NVIDIA removes older architectures from newer branches, and `nvidia-smi` then just reports `No devices were found`. The wizard reads the chip codename from `lspci` (e.g. `GP102 [GeForce GTX 1080 Ti]`, which is unambiguous where marketing names are not — a GTX 750 Ti is Maxwell while the rest of the 7xx series is Kepler), maps it to an architecture, and both **tags the right driver** in the list and **warns before you build** if the selection doesn't fit:
-
-| Architecture | Cards | Last supporting branch |
-|---|---|---|
-| Kepler | GeForce 600/700, Quadro K, Tesla K | **470.xx** (needs patches on kernel 6.10+) |
-| Maxwell / Pascal / Volta | GTX 750 Ti, GTX 900/10-series, TITAN X/Xp/V, Quadro M/P, Tesla M/P/V | **580.xx** |
-| Turing and newer | RTX 20/30/40/50-series, GTX 16-series, A/L/B-series | current branches |
-| Fermi | GeForce 400/500 | 390.xx — **cannot be built for any TrueNAS kernel** |
-
-Newer cards have a floor too: Blackwell (RTX 50-series) needs 570.xx or newer, Ada 520+, Ampere 450+, Turing 410+. Picking below that gets the same silent failure, so it's flagged as well.
+A driver can compile, package and merge perfectly and still not drive your card, and `nvidia-smi` then just reports `No devices were found`. The wizard detects your NVIDIA GPUs by PCI ID (`lspci -Dnnk`), downloads each candidate version's `README/supportedchips.html` from download.nvidia.com, and tags the list:
 
 ```
 [OK]    Detected GPU: NVIDIA GP102 [GeForce GTX 1080 Ti] (rev a1)
-[OK]      Architecture: Pascal — last supporting driver branch: 580.xx
 
-   1) 580.196.07  ★ Recommended for your Pascal GPU
-   2) 620.70.06  ★ New Feature Branch
-   3) 595.112.07  ★ Production Branch
+   1) 580.196.07  ★ Recommended for your NVIDIA GeForce GTX 1080 Ti
+   2) 620.70.06  ★ New Feature Branch — does NOT support NVIDIA GeForce GTX 1080 Ti
+   3) 595.112.07  ★ Production Branch — does NOT support NVIDIA GeForce GTX 1080 Ti
 ```
 
-**More than one GPU?** Every NVIDIA card is read, not just the first, and the wizard works out the branch window that serves *all* of them — the lowest ceiling and the highest floor:
+- The menu cursor starts on the recommended version; with none, on the Production branch, and never on a Beta.
+- With several GPUs every active card is checked, and the recommendation is the newest version of the oldest branch any of them needs. Every labelled version names each card it does not drive; unlabelled versions get no fit tag.
+- A card that needs a branch below 470 gets "This tool can't build a driver for that card".
+- GPUs bound to `vfio-pci` (reserved for VMs) are listed but never checked, and are left out of `NVIDIA_TARGET_GPUS`.
+- `--truenas X --nvidia Y` shows the same labels and advice.
+- The wizard writes `NVIDIA_TARGET_GPUS` and `SKIP_GPU_CHECK` to `.env`. If NVIDIA's chip list can't be fetched, it says so and adds no fit tags rather than guessing.
 
-```
-[OK]    Detected GPU: NVIDIA TU117GL [T1000 8GB] (rev a1)
-[OK]      Architecture: Turing — supported by current driver branches
-[OK]    Detected GPU: NVIDIA GB206 [RTX PRO 2000 Blackwell] (rev a1)
-[OK]      Architecture: Blackwell — supported by current driver branches
-[OK]    2 NVIDIA GPUs — a driver must be 570.xx or newer to serve all of them
-```
+The wizard's check is advisory, and you can still pick anything. The two later checks refuse:
 
-When the window is empty — say a Kepler GT 710 (≤470) next to an RTX 5090 (≥570) — it says so plainly instead of recommending a branch that leaves one card dead:
-
-```
-[WARN]  The installed GPUs cannot be served by one driver:
-[WARN]    GK208B [GeForce GT 710] (Kepler) needs 470.xx or older
-[WARN]    GB202 [GeForce RTX 5090] (Blackwell) needs 570.xx or newer
-[WARN]  Whichever branch you build, the other card will not be driven.
-```
-
-**Card too new to be named?** A GPU missing from the local `pci.ids` database shows up as `Device 2c05` with no chip codename. That card is reported as unidentified and excluded from the recommendation — the other cards are still checked normally, and the summary says the check doesn't cover everything.
-
-The check is **advisory** — you can still pick anything (e.g. when building for a different machine), and it stays silent rather than guessing.
+- **Build** — `entrypoint.sh` reads the installer's `supported-gpus/supported-gpus.json` and stops before compiling if a target GPU isn't driven by that version, or needs the other kernel-module flavor (Pascal, Maxwell and Volta need `proprietary`; Blackwell needs `open`). `SKIP_GPU_CHECK=true` in `.env` overrides it. The image embeds `usr/share/nvidia-sysext/supported-gpus.json` and `build-info`.
+- **Deploy** — see [Deploy to TrueNAS](#3-deploy-to-truenas); `--force-gpu` overrides it.
 
 ### Building EOL drivers on newer kernels (patches)
 
@@ -621,7 +625,7 @@ Rolling back is an ordinary deployment, so the image being replaced is itself ba
 ├── docker-compose.yaml     # Build configuration template (reads .env, never edited)
 ├── entrypoint.sh           # Main build script
 ├── deploy-nvidia.sh        # TrueNAS deployment script
-├── tests/                  # Offline regression tests
+├── tests/                  # Offline regression tests (fixtures in tests/fixtures/nvidia/)
 ├── predefined-patches/     # Curated patch lists for EOL drivers
 ├── patches/                # Your own source patches, by kernel
 ├── output/                 # Build outputs by TrueNAS version, build logs in output/logs/
@@ -637,9 +641,11 @@ Rolling back is an ordinary deployment, so the image being replaced is itself ba
 tests/deploy-activation-test.sh
 tests/entrypoint-test.sh
 tests/configure-test.sh
+tests/driver-labels-test.sh
+tests/gpu-fit-test.sh
 ```
 
-All three run offline and need no root, Docker or TrueNAS. The deploy test runs `deploy-nvidia.sh` in a sandbox with stubs for every host command, including a `midclt` that follows the real `docker.configure_nvidia`. The build test exercises the download, checksum and log helpers from `entrypoint.sh`, and the configure test covers version discovery. None of them replaces a real build and deploy.
+All five run offline and need no root, Docker or TrueNAS. The deploy test runs `deploy-nvidia.sh` in a sandbox with stubs for every host command, including a `midclt` that follows the real `docker.configure_nvidia`. The build test exercises the download, checksum and log helpers from `entrypoint.sh`, the configure test covers version discovery, the driver-labels test covers the labels and their fallbacks, and the GPU-fit test covers detection and the fit checks in all three scripts (fixtures in `tests/fixtures/nvidia/`). None of them replaces a real build and deploy.
 
 ## Requirements
 
