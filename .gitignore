@@ -45,3 +45,4 @@ CLAUDE.md
 .claude/
 .wolf/
 docs/superpowers/
+tests/fixtures/
