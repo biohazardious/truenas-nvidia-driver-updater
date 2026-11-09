@@ -434,10 +434,19 @@ truenas_version_supported() {
     (( 10#${major} * 100 + 10#${minor} >= 2410 ))
 }
 
+# 0 when $1 looks like a TrueNAS version (it becomes part of download URLs).
+valid_truenas_version() {
+    [[ "${1:-}" =~ ^[0-9]+\.[0-9]+[0-9A-Za-z.-]*$ ]]
+}
+
 require_supported_truenas() {
-    truenas_version_supported "$1" && return 0
-    err "TrueNAS $1 is not supported. The minimum is 24.10: older releases ship the"
-    err "driver as ordinary packages, so there is no nvidia.raw to replace."
+    if ! truenas_version_supported "$1"; then
+        err "TrueNAS $1 is not supported. The minimum is 24.10: older releases ship the"
+        err "driver as ordinary packages, so there is no nvidia.raw to replace."
+        exit 1
+    fi
+    valid_truenas_version "$1" && return 0
+    err "'$1' is not a valid TrueNAS version (e.g. 25.10.8 or 27.0.0-RC.1)."
     exit 1
 }
 
@@ -2216,30 +2225,46 @@ main() {
         fi
     fi
 
-    if [[ -z "${selected_truenas}" ]]; then
-        if fetch_truenas_versions; then
-            # Build tag/description pairs for ui_menu
-            local -a truenas_menu_args=()
-            for ver in "${TRUENAS_VERSIONS[@]}"; do
-                truenas_menu_args+=("${ver}" "$(truenas_menu_desc "${ver}")")
-            done
+    # A typed version is asked for again until it looks like one. The list is
+    # fetched once, and only when it is needed.
+    local truenas_list="untried"
+    local -a truenas_menu_args=()
+    while true; do
+        if [[ -z "${selected_truenas}" ]]; then
+            if [[ "${truenas_list}" == "untried" ]]; then
+                truenas_list="none"
+                if fetch_truenas_versions; then
+                    truenas_list="ok"
+                    # Build tag/description pairs for ui_menu
+                    for ver in "${TRUENAS_VERSIONS[@]}"; do
+                        truenas_menu_args+=("${ver}" "$(truenas_menu_desc "${ver}")")
+                    done
+                else
+                    warn "Failed to fetch version list. Please enter manually."
+                fi
+            fi
 
-            local truenas_prompt="Select the TrueNAS version you are running:"
-            [[ -n "${DETECTED_TRUENAS_VERSION}" ]] && \
-                truenas_prompt="Auto-detected: ${DETECTED_TRUENAS_VERSION} (not confirmed)\nSelect version:"
+            if [[ "${truenas_list}" == "ok" ]]; then
+                local truenas_prompt="Select the TrueNAS version you are running:"
+                [[ -n "${DETECTED_TRUENAS_VERSION}" ]] && \
+                    truenas_prompt="Auto-detected: ${DETECTED_TRUENAS_VERSION} (not confirmed)\nSelect version:"
 
-            UI_MENU_DEFAULT="$(truenas_menu_default)"
-            ui_menu selected_truenas \
-                "Step 1: TrueNAS Version" \
-                "${truenas_prompt}" \
-                "${truenas_menu_args[@]}"
-        else
-            warn "Failed to fetch version list. Please enter manually."
-            ui_inputbox selected_truenas \
-                "TrueNAS Version" \
-                "Enter TrueNAS version (e.g. 25.10.8):"
+                UI_MENU_DEFAULT="$(truenas_menu_default)"
+                ui_menu selected_truenas \
+                    "Step 1: TrueNAS Version" \
+                    "${truenas_prompt}" \
+                    "${truenas_menu_args[@]}"
+            else
+                ui_inputbox selected_truenas \
+                    "TrueNAS Version" \
+                    "Enter TrueNAS version (e.g. 25.10.8):"
+            fi
         fi
-    fi
+        [[ -n "${selected_truenas}" ]] || break
+        valid_truenas_version "${selected_truenas}" && break
+        warn "'${selected_truenas}' is not a valid TrueNAS version (e.g. 25.10.8 or 27.0.0-RC.1)."
+        selected_truenas=""
+    done
 
     [[ -n "${selected_truenas}" ]] || { err "No TrueNAS version selected. Aborting."; exit 1; }
     require_supported_truenas "${selected_truenas}"

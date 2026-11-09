@@ -29,8 +29,11 @@
 #   NVIDIA_INSTALL_DRM  — true/false. When true, build/install nvidia-drm.ko
 #                         so hosts can create /dev/dri after modprobe
 #                         nvidia_drm modeset=1.
-#   TRUENAS_CODENAME   — Required for 25.x and earlier download URLs
-#                         (e.g. Goldeye). Not used for TrueNAS 26+.
+#   TRUENAS_TRAIN      — The release's train, its folder on download.truenas.com
+#                         (e.g. TrueNAS-SCALE-Goldeye, TrueNAS-27-RC). Looked up
+#                         on download.truenas.com when empty.
+#   TRUENAS_CODENAME   — Older .env files: Goldeye means TrueNAS-SCALE-Goldeye.
+#                         Used only when TRUENAS_TRAIN is empty.
 #   SKIP_KERNEL_COMPAT_CHECK
 #                       — true/false (default false). When false, the build
 #                         aborts early if the chosen driver branch is known to
@@ -52,12 +55,12 @@
 #                              with the newly built image, then write a new
 #                              .update artifact to /output
 #
-# Download URL patterns:
-#   TrueNAS 25.x and earlier:
-#     https://download.truenas.com/TrueNAS-SCALE-{CODENAME}/{VERSION}/
-#     TrueNAS-SCALE-{VERSION}.update?download=1
-#   TrueNAS 26+ (BETA and RC builds; 26 was renamed 27 at RC.1):
-#     https://update-public.sys.truenas.net/TrueNAS-{MAJOR}-{STAGE}/TrueNAS-{VERSION}.update
+# Where the update file comes from (see resolve_truenas_update):
+#   the .update the release folder lists, checked against its .sha256:
+#     https://download.truenas.com/{TRAIN}/{VERSION}/{FILE}?download=1
+#   else the one the train's releases.json names, checked against its checksum:
+#     https://update.truenas.com/scale/{TRAIN}/releases.json
+#     https://update.truenas.com/scale/{TRAIN}/{FILE}
 # =============================================================================
 set -euo pipefail
 IFS=$'\n\t'
@@ -452,44 +455,146 @@ update_repacked_update_manifest() {
     fi
 }
 
-build_truenas_update_url() {
-    local version="$1"
-    local codename="${2:-}"
-    local update_filename="" major="${1%%.*}" stage=""
+# ── Where TrueNAS publishes a release ────────────────────────────────────────
+# Every release has a folder download.truenas.com/<train>/<version>/. Most hold
+# the .update file; some (27.0.0-RC.1) only the ISO. update.truenas.com, the
+# server TrueNAS itself updates from, names the .update of every release its
+# train's releases.json lists. Names from either server are checked before they
+# go into a URL.
 
-    update_filename="$(build_truenas_update_filename "${version}")"
-
-    # A 26+ release without a BETA/RC suffix has no known location yet.
-    if [[ "${major}" =~ ^[0-9]+$ ]] && (( major >= 26 )); then
-        case "${version}" in
-            *-BETA.*) stage="BETA" ;;
-            *-RC.*)   stage="RC" ;;
-            *)        return 1 ;;
-        esac
-        printf 'https://update-public.sys.truenas.net/TrueNAS-%s-%s/%s\n' \
-            "${major}" "${stage}" "${update_filename}"
-        return 0
-    fi
-
-    [[ -n "${codename}" ]] || return 1
-
-    # The download path segment has no spaces (e.g. "Electric Eel" is the display
-    # name, but the directory is "TrueNAS-SCALE-ElectricEel"). Strip spaces so a
-    # human-friendly codename from .env still produces a valid URL.
-    codename="${codename// /}"
-
-    printf 'https://download.truenas.com/TrueNAS-SCALE-%s/%s/%s?download=1\n' \
-        "${codename}" "${version}" "${update_filename}"
+valid_truenas_train() {
+    [[ "${1:-}" =~ ^TrueNAS-[A-Za-z0-9-]+$ ]]
 }
 
-build_truenas_update_filename() {
-    local version="$1" major="${1%%.*}"
+valid_truenas_version() {
+    [[ "${1:-}" =~ ^[0-9]+\.[0-9]+[0-9A-Za-z.-]*$ ]]
+}
 
-    if [[ "${major}" =~ ^[0-9]+$ ]] && (( major >= 26 )); then
-        printf 'TrueNAS-%s.update\n' "${version}"
-    else
-        printf 'TrueNAS-SCALE-%s.update\n' "${version}"
+# Fetch a URL to stdout; an HTTP error is a failure.
+fetch_url() {
+    curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 "$1" 2>/dev/null
+}
+
+# find_truenas_train VERSION — the train folder download.truenas.com lists
+# VERSION in (its links read href="TrueNAS-SCALE-Goldeye/25.10.8").
+find_truenas_train() {
+    local version="$1" html="" href="" train=""
+    valid_truenas_version "${version}" || return 1
+    html="$(fetch_url "https://download.truenas.com/")" || return 1
+    while IFS= read -r href; do
+        href="${href#href=\"}"; href="${href%\"}"
+        href="${href#/}"; href="${href%/}"
+        [[ "${href}" == */* ]] || continue
+        train="${href%%/*}"
+        [[ "${href#*/}" == "${version}" ]] || continue
+        valid_truenas_train "${train}" || continue
+        printf '%s\n' "${train}"
+        return 0
+    done < <(grep -oE 'href="[^"]*"' <<< "${html}" || true)
+    return 1
+}
+
+# resolve_truenas_train VERSION TRAIN CODENAME — the release's train: TRAIN from
+# .env; else an older .env's codename (Goldeye → TrueNAS-SCALE-Goldeye); else
+# the folder download.truenas.com lists VERSION in.
+resolve_truenas_train() {
+    local version="$1" train="${2:-}" codename="${3:-}"
+    if [[ -n "${train}" ]]; then
+        if valid_truenas_train "${train}"; then
+            printf '%s\n' "${train}"
+            return 0
+        fi
+        warn "Ignoring TRUENAS_TRAIN='${train}': not a release folder name such as TrueNAS-SCALE-Goldeye" >&2
     fi
+    if [[ -n "${codename}" ]]; then
+        # "Electric Eel" is the display name; the folder is TrueNAS-SCALE-ElectricEel.
+        train="TrueNAS-SCALE-${codename// /}"
+        if valid_truenas_train "${train}"; then
+            printf '%s\n' "${train}"
+            return 0
+        fi
+        warn "Ignoring TRUENAS_CODENAME='${codename}': it doesn't name a release folder" >&2
+    fi
+    find_truenas_train "${version}"
+}
+
+# list_release_files TRAIN VERSION — the files the release folder offers, one
+# name per line. Only the bare href="NAME?download=1" links are files; the page
+# also links ./NAME?wrap=1 previews, parent folders and its own assets. A folder
+# that doesn't exist is an empty 200 page: no names, not an error.
+list_release_files() {
+    local train="$1" version="$2" html="" name=""
+    valid_truenas_train "${train}" && valid_truenas_version "${version}" || return 1
+    html="$(fetch_url "https://download.truenas.com/${train}/${version}/")" || return 1
+    while IFS= read -r name; do
+        name="${name#href=\"}"; name="${name%\?download=1\"}"
+        [[ "${name}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] && printf '%s\n' "${name}"
+    done < <(grep -oE 'href="[^"/?]+\?download=1"' <<< "${html}" || true)
+    return 0
+}
+
+# truenas_release_entry TRAIN VERSION — "<filename><TAB><checksum>" of VERSION in
+# TRAIN's releases.json on update.truenas.com; nothing when it isn't listed.
+truenas_release_entry() {
+    local train="$1" version="$2" json=""
+    json="$(fetch_url "https://update.truenas.com/scale/${train}/releases.json")" || return 1
+    jq -r --arg v "${version}" '
+        if type == "object" and (.[$v] | type) == "object"
+        then "\(.[$v].filename // "")\t\(.[$v].checksum // "")"
+        else empty end' <<< "${json}" 2>/dev/null
+}
+
+# truenas_train_redirect TRAIN — the train update.truenas.com moved TRAIN's
+# systems to (trains_redirection in trains_v2.json: Goldeye-RC → Goldeye).
+truenas_train_redirect() {
+    local train="$1" json="" target=""
+    json="$(fetch_url "https://update.truenas.com/scale/trains_v2.json")" || return 1
+    target="$(jq -r --arg t "${train}" '
+        if type == "object" and (.trains_redirection | type) == "object"
+        then (.trains_redirection[$t] // empty) else empty end' <<< "${json}" 2>/dev/null)" || return 1
+    valid_truenas_train "${target}" && [[ "${target}" != "${train}" ]] || return 1
+    printf '%s\n' "${target}"
+}
+
+# resolve_truenas_update TRAIN VERSION — sets TRUENAS_UPDATE_URL and
+# TRUENAS_UPDATE_SHA256 to the .update file TrueNAS publishes for VERSION:
+#   1. the one its download.truenas.com folder lists (checksum: its .sha256);
+#   2. else the one releases.json of TRAIN, then of the train TRAIN redirects
+#      to, names on update.truenas.com (checksum: the entry's own).
+# Returns 1 when neither has one, 2 when the folder's checksum couldn't be read
+# (fetch_expected_sha256 has said why).
+resolve_truenas_update() {
+    local train="$1" version="$2" folder="" file="" t="" entry="" filename="" checksum=""
+    local -a files=()
+    TRUENAS_UPDATE_URL="" TRUENAS_UPDATE_SHA256=""
+    valid_truenas_train "${train}" && valid_truenas_version "${version}" || return 1
+
+    folder="https://download.truenas.com/${train}/${version}"
+    mapfile -t files < <(list_release_files "${train}" "${version}" || true)
+    for file in "${files[@]}"; do
+        [[ "${file}" =~ ^[A-Za-z0-9._+-]+\.update$ ]] || continue
+        TRUENAS_UPDATE_SHA256="$(fetch_expected_sha256 "${folder}/${file}.sha256?download=1")" || return 2
+        TRUENAS_UPDATE_URL="${folder}/${file}?download=1"
+        return 0
+    done
+
+    t="${train}"
+    while [[ -n "${t}" ]]; do
+        entry="$(truenas_release_entry "${t}" "${version}")" || entry=""
+        if [[ -n "${entry}" ]]; then
+            IFS=$'\t' read -r filename checksum <<< "${entry}"
+            if [[ ! "${filename}" =~ ^[A-Za-z0-9._+-]+\.update$ || ! "${checksum}" =~ ^[0-9a-f]{64}$ ]]; then
+                warn "update.truenas.com/scale/${t}/releases.json has no usable file name and checksum for ${version}" >&2
+                return 1
+            fi
+            TRUENAS_UPDATE_URL="https://update.truenas.com/scale/${t}/${filename}"
+            TRUENAS_UPDATE_SHA256="${checksum}"
+            return 0
+        fi
+        [[ "${t}" == "${train}" ]] || break
+        t="$(truenas_train_redirect "${train}")" || t=""
+    done
+    return 1
 }
 
 # TrueNAS only ships the driver as a sysext from 24.10 on; before that it is
@@ -665,11 +770,15 @@ banner "NVIDIA sysext builder for TrueNAS"
 
 : "${NVIDIA_VERSION:?NVIDIA_VERSION environment variable is not set}"
 : "${TRUENAS_VERSION:?TRUENAS_VERSION environment variable is not set}"
+# It becomes part of the download URLs.
+valid_truenas_version "${TRUENAS_VERSION}" \
+    || die "TRUENAS_VERSION '${TRUENAS_VERSION}' is not a valid TrueNAS version (e.g. 25.10.8 or 27.0.0-RC.1)."
 truenas_version_supported "${TRUENAS_VERSION}" \
     || die "TrueNAS ${TRUENAS_VERSION} is not supported. The minimum is 24.10: older releases ship the driver as ordinary packages, so there is no nvidia.raw to replace."
 
 NVIDIA_KERNEL_MODULE_TYPE="${NVIDIA_KERNEL_MODULE_TYPE:-open}"
 NVIDIA_INSTALL_DRM="${NVIDIA_INSTALL_DRM:-true}"
+TRUENAS_TRAIN="${TRUENAS_TRAIN:-}"
 TRUENAS_CODENAME="${TRUENAS_CODENAME:-}"
 EMBED_NVIDIA_RAW_IN_UPDATE="${EMBED_NVIDIA_RAW_IN_UPDATE:-false}"
 
@@ -703,42 +812,50 @@ PATCH_SOURCE_DESC=""
 
 # ── Obtain the TrueNAS update file ──────────────────────────────────────────
 UPDATE_FILE="/tmp/truenas.update"
+# The name TrueNAS published the update under; a local file has no known name.
+OFFICIAL_UPDATE_FILENAME=""
 
 if [[ -f /workspace/truenas.update ]]; then
     # Use pre-downloaded file from the workspace (avoids re-downloading ~1.8 GB)
     info "Using pre-existing /workspace/truenas.update"
     UPDATE_FILE="/workspace/truenas.update"
 else
-    DOWNLOAD_URL="$(build_truenas_update_url "${TRUENAS_VERSION}" "${TRUENAS_CODENAME}")" \
-        || die "Unable to determine download URL for TRUENAS_VERSION=${TRUENAS_VERSION}. Set /workspace/truenas.update or provide a compatible TRUENAS_CODENAME."
+    TRUENAS_TRAIN="$(resolve_truenas_train "${TRUENAS_VERSION}" "${TRUENAS_TRAIN}" "${TRUENAS_CODENAME}")" \
+        || die "Unable to find the release folder of TrueNAS ${TRUENAS_VERSION} on download.truenas.com. Set TRUENAS_TRAIN in .env (e.g. TrueNAS-SCALE-Goldeye) or place truenas.update in the repo."
+
+    resolve_rc=0
+    resolve_truenas_update "${TRUENAS_TRAIN}" "${TRUENAS_VERSION}" || resolve_rc=$?
+    case "${resolve_rc}" in
+        0) ;;
+        2) exit 1 ;;   # the checksum couldn't be read; fetch_expected_sha256 said why
+        *) die "TrueNAS ${TRUENAS_VERSION} has no .update file in download.truenas.com/${TRUENAS_TRAIN}/${TRUENAS_VERSION}/ or update.truenas.com/scale/${TRUENAS_TRAIN}/releases.json. Place truenas.update in the repo to build from a local file." ;;
+    esac
+    DOWNLOAD_URL="${TRUENAS_UPDATE_URL}"
+    DOWNLOAD_NAME="${DOWNLOAD_URL%%\?*}"; DOWNLOAD_NAME="${DOWNLOAD_NAME##*/}"
+    DOWNLOAD_HOST="${DOWNLOAD_URL#https://}"; DOWNLOAD_HOST="${DOWNLOAD_HOST%%/*}"
+    OFFICIAL_UPDATE_FILENAME="${DOWNLOAD_NAME}"
 
     # Cache the update under its real filename so different versions coexist.
     if [[ -n "${CACHE_DIR}" ]]; then
-        UPDATE_FILE="${CACHE_DIR}/$(build_truenas_update_filename "${TRUENAS_VERSION}")"
+        UPDATE_FILE="${CACHE_DIR}/${DOWNLOAD_NAME}"
         if [[ -s "${UPDATE_FILE}" ]]; then
             info "Found cached update: ${UPDATE_FILE} ($(human_size "${UPDATE_FILE}")) — resuming/validating (delete to force fresh download)"
         fi
     fi
 
-    if [[ -n "${TRUENAS_CODENAME}" ]]; then
-        info "Downloading TrueNAS ${TRUENAS_VERSION} (${TRUENAS_CODENAME}) update file …"
-    else
-        info "Downloading TrueNAS ${TRUENAS_VERSION} update file …"
-    fi
+    info "Downloading TrueNAS ${TRUENAS_VERSION} (${TRUENAS_TRAIN}) update file from ${DOWNLOAD_HOST} …"
     info "URL: ${DOWNLOAD_URL}"
-    # Fetched first, so a broken checksum fails before the ~2 GB transfer.
-    UPDATE_SHA256="$(fetch_expected_sha256 "${DOWNLOAD_URL%%\?*}.sha256")"
     wget -q --show-progress -c -O "${UPDATE_FILE}" "${DOWNLOAD_URL}" 2>&3 || {
         report_url_status "${DOWNLOAD_URL}"
         die "Failed to download TrueNAS update file from ${DOWNLOAD_URL}"
     }
     ok "Downloaded $(human_size "${UPDATE_FILE}")"
-    verify_sha256 "${UPDATE_FILE}" "${UPDATE_SHA256}"
+    verify_sha256 "${UPDATE_FILE}" "${TRUENAS_UPDATE_SHA256}"
 fi
 
 info "NVIDIA driver version : ${NVIDIA_VERSION}"
-if [[ -n "${TRUENAS_CODENAME}" ]]; then
-    info "TrueNAS version       : ${TRUENAS_VERSION} (${TRUENAS_CODENAME})"
+if [[ -n "${TRUENAS_TRAIN}" ]]; then
+    info "TrueNAS version       : ${TRUENAS_VERSION} (${TRUENAS_TRAIN})"
 else
     info "TrueNAS version       : ${TRUENAS_VERSION}"
 fi
@@ -1581,7 +1698,7 @@ banner "Phase 6: Creating nvidia.raw squashfs image"
 OUTPUT_DIR="/output/${TRUENAS_VERSION}"
 OUTPUT_FILENAME="nvidia.raw"
 OUTPUT_PATH="${OUTPUT_DIR}/${OUTPUT_FILENAME}"
-OFFICIAL_UPDATE_FILENAME="$(build_truenas_update_filename "${TRUENAS_VERSION}")"
+OFFICIAL_UPDATE_FILENAME="${OFFICIAL_UPDATE_FILENAME:-truenas-${TRUENAS_VERSION}.update}"
 
 mkdir -p "${OUTPUT_DIR}"
 

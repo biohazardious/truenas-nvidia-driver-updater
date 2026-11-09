@@ -92,6 +92,23 @@ for version in 24.10.2.4 25.04.2.6 25.10.8 27.0.0-RC.1; do
     check "${version} reaches .env" env_has "TRUENAS_VERSION=${version}"
 done
 
+echo "--truenas with a malformed version"
+for version in '25.10.8/../x' '25.10.8 x' '25.10.8;true'; do
+    setup_copy
+    configure --truenas "${version}" --nvidia 595.112.07 </dev/null
+    check "'${version}' is refused" nonzero "${RC}"
+    check "'${version}' is named invalid" says "is not a valid TrueNAS version"
+    check "'${version}' writes no .env" no_env
+done
+
+echo "a malformed version typed into the wizard"
+setup_copy
+configure --no-whiptail < <(printf '25.10.8/../x\n25.10.8\n\n\n\n\n')
+check "it is named invalid" says "is not a valid TrueNAS version"
+# read -p shows no prompt without a terminal: the second answer being taken is
+# what shows the wizard asked again.
+check "the wizard asks again and takes the retyped version" grep -qE 'Selected: 25\.10\.8( |$)' "${SB}/log"
+
 echo "typed into the wizard"
 setup_copy
 configure --no-whiptail < <(printf '24.04.2.5\n\n\n\n\n')

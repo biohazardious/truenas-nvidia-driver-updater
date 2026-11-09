@@ -528,11 +528,11 @@ In both modes `NVIDIA_VERSION` is only a **label** — it names the output and d
 
 ### Common Build Variants
 
-**Use a pre-downloaded update file** when the build can't fetch one itself, such as a stable 27 release. Downloads are already cached between builds, and a file you supply this way is not checksum-verified:
+**Use a pre-downloaded update file** when the build can't fetch one itself. Downloads are already cached between builds, and a file you supply this way is not checksum-verified:
 
 ```bash
 # Download once
-wget -O truenas.update "https://update-public.sys.truenas.net/TrueNAS-27-RC/TrueNAS-27.0.0-RC.1.update"
+wget -O truenas.update "https://download.truenas.com/TrueNAS-SCALE-Goldeye/25.10.8/TrueNAS-SCALE-25.10.8.update?download=1"
 
 # Build — the script detects the local file and skips download
 docker compose run --rm nvidia-builder
