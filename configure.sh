@@ -473,119 +473,6 @@ advise_legacy_driver() {
     warn "patches/<kernel>/ (e.g. patches/6.12/) to patch it — see the README."
 }
 
-# ── GPU architecture ↔ driver branch fit ────────────────────────────────────
-# A driver can build, package and merge perfectly and still not drive the card:
-# NVIDIA drops older architectures from newer branches, and support for a new
-# card only appears from a certain branch onwards. The failure mode is silent —
-# nvidia-smi simply reports "No devices were found" after a 15-minute build — so
-# the wizard checks the fit up front.
-#
-# The chip codename is the primary signal: lspci prints it ("GP102 [GeForce GTX
-# 1080 Ti]") and it is unambiguous, unlike marketing names (a GTX 750 Ti is
-# Maxwell while the rest of the 7xx series is Kepler).
-declare -A NVIDIA_ARCH_LAST_BRANCH=(
-    [Fermi]="390"
-    [Kepler]="470"
-    [Maxwell]="580"
-    [Pascal]="580"
-    [Volta]="580"
-)
-declare -A NVIDIA_ARCH_FIRST_BRANCH=(
-    [Turing]="410"
-    [Ampere]="450"
-    [Ada]="520"
-    [Blackwell]="570"
-)
-
-# Derive the architecture from a detected GPU string. Sets DETECTED_GPU_ARCH,
-# left empty when nothing matches (the wizard then stays silent rather than
-# guessing).
-detect_gpu_architecture() {
-    declare -g DETECTED_GPU_ARCH=""
-    local model="${1:-}"
-    [[ -n "${model}" ]] || return 0
-
-    # Primary: chip codename prefix, e.g. GK110 / GM204 / GP102 / TU104 / AD102.
-    local chip=""
-    chip="$(printf '%s' "${model}" | grep -oE '\b(G[FKMPVB]|TU|GA|AD)[0-9]{3}' | head -1 || true)"
-    case "${chip}" in
-        GF*) DETECTED_GPU_ARCH="Fermi" ;;
-        GK*) DETECTED_GPU_ARCH="Kepler" ;;
-        GM*) DETECTED_GPU_ARCH="Maxwell" ;;
-        GP*) DETECTED_GPU_ARCH="Pascal" ;;
-        GV*) DETECTED_GPU_ARCH="Volta" ;;
-        TU*) DETECTED_GPU_ARCH="Turing" ;;
-        GA*) DETECTED_GPU_ARCH="Ampere" ;;
-        AD*) DETECTED_GPU_ARCH="Ada" ;;
-        GB*) DETECTED_GPU_ARCH="Blackwell" ;;
-    esac
-    [[ -n "${DETECTED_GPU_ARCH}" ]] && return 0
-
-    # Fallback: marketing name. Order matters — the exceptions come first.
-    local name=""
-    name="$(printf '%s' "${model}" | tr '[:lower:]' '[:upper:]')"
-    case "${name}" in
-        *RTX\ 50[0-9][0-9]*|*RTX\ PRO\ 6000*)      DETECTED_GPU_ARCH="Blackwell" ;;
-        *RTX\ 40[0-9][0-9]*|*\ L4*)               DETECTED_GPU_ARCH="Ada" ;;
-        *RTX\ 30[0-9][0-9]*|*\ A[0-9][0-9]*)       DETECTED_GPU_ARCH="Ampere" ;;
-        *RTX\ 20[0-9][0-9]*|*GTX\ 16[0-9][0-9]*|*QUADRO\ RTX*|*TESLA\ T4*)
-                                                   DETECTED_GPU_ARCH="Turing" ;;
-        *TITAN\ V*|*GV100*|*TESLA\ V100*)          DETECTED_GPU_ARCH="Volta" ;;
-        *GTX\ 10[0-9][0-9]*|*GT\ 1030*|*TITAN\ XP*|*QUADRO\ P[0-9]*|*TESLA\ P[0-9]*)
-                                                   DETECTED_GPU_ARCH="Pascal" ;;
-        # GTX 745/750/750 Ti are Maxwell despite the 7xx name — match before Kepler.
-        *GTX\ 7[45][05]*|*GTX\ 9[0-9][0-9]*|*TITAN\ X*|*QUADRO\ M[0-9]*|*TESLA\ M[0-9]*)
-                                                   DETECTED_GPU_ARCH="Maxwell" ;;
-        *GTX\ 6[0-9][0-9]*|*GTX\ 7[0-9][0-9]*|*GT\ 7[0-9][0-9]*|*QUADRO\ K[0-9]*|*TESLA\ K[0-9]*)
-                                                   DETECTED_GPU_ARCH="Kepler" ;;
-        *GTX\ 4[0-9][0-9]*|*GTX\ 5[0-9][0-9]*)     DETECTED_GPU_ARCH="Fermi" ;;
-    esac
-    return 0
-}
-
-# Warn when the selected driver branch does not actually support the detected
-# card. Advisory only — the user may be building for a different machine.
-advise_gpu_branch_fit() {
-    local version="$1"
-
-    local major=""
-    major="$(nvidia_major "${version}")"
-    [[ "${major}" =~ ^[0-9]+$ ]] || return 0
-
-    if [[ ${GPU_BRANCH_CONFLICT:-0} -eq 1 ]]; then
-        warn "The installed GPUs cannot be served by one driver:"
-        warn "  ${GPU_CEILING_CARD} (${GPU_CEILING_ARCH}) needs ${GPU_BRANCH_CEILING}.xx or older"
-        warn "  ${GPU_FLOOR_CARD} (${GPU_FLOOR_ARCH}) needs ${GPU_BRANCH_FLOOR}.xx or newer"
-        warn "Whichever branch you build, the other card will not be driven. Decide which"
-        warn "GPU this sysext is for — or move one of the cards to another machine."
-        return 0
-    fi
-
-    if [[ "${GPU_BRANCH_CEILING:-}" == "390" ]]; then
-        warn "${GPU_CEILING_CARD} is Fermi — it needs the 390.xx branch, which cannot build"
-        warn "against any kernel TrueNAS ships. This tool can't produce a working driver"
-        warn "for that card."
-        return 0
-    fi
-
-    if [[ -n "${GPU_BRANCH_CEILING:-}" ]] && (( major > GPU_BRANCH_CEILING )); then
-        warn "${GPU_CEILING_CARD} is ${GPU_CEILING_ARCH}; NVIDIA dropped that architecture"
-        warn "after the ${GPU_BRANCH_CEILING}.xx branch. Driver ${version} will build and"
-        warn "install fine but WILL NOT drive that card — nvidia-smi reports"
-        warn "'No devices were found'. Pick ${GPU_BRANCH_CEILING}.xx instead (★ Recommended for your GPU)."
-    fi
-
-    if [[ -n "${GPU_BRANCH_FLOOR:-}" ]] && (( major < GPU_BRANCH_FLOOR )); then
-        warn "${GPU_FLOOR_CARD} is ${GPU_FLOOR_ARCH}; NVIDIA support for it starts at the"
-        warn "${GPU_BRANCH_FLOOR}.xx branch. Driver ${version} predates that card and will"
-        warn "not drive it. Pick a current branch (★ Production / ★ New Feature)."
-    fi
-
-    if [[ ${GPU_UNIDENTIFIED:-0} -eq 1 ]]; then
-        warn "One or more GPUs could not be identified — this check does not cover them."
-    fi
-}
-
 # Map a TrueNAS version (e.g. 25.10.3.1) to its kernel MAJOR.MINOR. Used only for
 # the wizard heads-up below; the build reads the REAL kernel from the image and
 # is authoritative. Extend as new TrueNAS releases ship.
@@ -888,27 +775,18 @@ fetch_nvidia_branch_info() {
     if [[ ${NVIDIA_BRANCH_INFO_OK} -eq 0 ]]; then
         warn "Branch labels unavailable — see ${NVIDIA_UNIX_PAGE_URL}"
     fi
+}
 
-    # When the detected card is only supported up to an older branch, surface the
-    # newest driver in THAT branch — otherwise the user picks the top of the list
-    # and ends up with a driver that ignores their GPU.
-    local arch_last="${GPU_BRANCH_CEILING:-}"
-    if [[ -n "${arch_last}" ]] && [[ ${GPU_BRANCH_CONFLICT:-0} -eq 0 ]]; then
-        local recommended=""
-        recommended="$(nvidia_latest_in_series "${arch_last}" "${sorted[@]}")" || true
-        if [[ -n "${recommended}" ]]; then
-            local existing="${NVIDIA_VERSION_TAGS[${recommended}]:-}"
-            NVIDIA_VERSION_TAGS["${recommended}"]="★ Recommended for your ${GPU_CEILING_ARCH} GPU${existing:+ · ${existing}}"
-        fi
-    fi
-
-    local tag_count=${#NVIDIA_VERSION_TAGS[@]}
-    if [[ ${tag_count} -gt 0 ]]; then
-        ok "Identified ${tag_count} driver branch(es)"
-        for ver in "${!NVIDIA_VERSION_TAGS[@]}"; do
-            info "  ${ver} → ${NVIDIA_VERSION_TAGS[${ver}]}"
-        done
-    fi
+# Print the labels (with any GPU fit tags) one per line, newest version first.
+# Args: version list, newest first.
+report_nvidia_version_tags() {
+    local tag_count=${#NVIDIA_VERSION_TAGS[@]} ver
+    [[ ${tag_count} -gt 0 ]] || return 0
+    ok "Identified ${tag_count} driver branch(es)"
+    for ver in "$@"; do
+        [[ -n "${NVIDIA_VERSION_TAGS[${ver}]:-}" ]] || continue
+        info "  ${ver} → ${NVIDIA_VERSION_TAGS[${ver}]}"
+    done
 }
 
 fetch_nvidia_versions() {
@@ -954,8 +832,13 @@ fetch_nvidia_versions() {
         [[ -n "${v}" ]] && sorted_arr+=("${v}")
     done <<< "${sorted_versions}"
 
-    # Now that we have the sorted list, fetch branch tags
+    # Now that we have the sorted list, fetch branch tags and check them against
+    # the detected GPUs. NVIDIA_VERSIONS is newest-first while that runs: the
+    # fit check reads the newest version's supported-chip list.
+    NVIDIA_VERSIONS=("${sorted_arr[@]}")
     fetch_nvidia_branch_info "${sorted_arr[@]}"
+    apply_gpu_fit_tags
+    report_nvidia_version_tags "${sorted_arr[@]}"
 
     # Place tagged versions at the top, then the rest
     local -a tagged_order=()
@@ -1001,17 +884,25 @@ fetch_nvidia_versions() {
 #
 # In whiptail mode: native scrollable dialog.
 # In bash mode:     paginated numbered list.
+#
+# UI_MENU_DEFAULT, when set to one of the tags, is where the menu starts:
+# whiptail puts the cursor on it, the bash menu marks it "(default)" and takes
+# it on an empty answer. It applies to one call only and is cleared afterwards.
+UI_MENU_DEFAULT=""
 ui_menu() {
     local -n _ui_result=$1; shift
     local title="$1"; shift
     local prompt="$1"; shift
     # Remaining args: tag1 desc1 tag2 desc2 ...
 
+    local rc=0
     if [[ "${UI_MODE}" == "whiptail" ]]; then
-        _ui_menu_whiptail _ui_result "${title}" "${prompt}" "$@"
+        _ui_menu_whiptail _ui_result "${title}" "${prompt}" "$@" || rc=$?
     else
-        _ui_menu_bash _ui_result "${title}" "${prompt}" "$@"
+        _ui_menu_bash _ui_result "${title}" "${prompt}" "$@" || rc=$?
     fi
+    UI_MENU_DEFAULT=""
+    return ${rc}
 }
 
 _ui_menu_whiptail() {
@@ -1024,9 +915,12 @@ _ui_menu_whiptail() {
 
     wt_size
 
+    local -a default_item=()
+    [[ -n "${UI_MENU_DEFAULT:-}" ]] && default_item=(--default-item "${UI_MENU_DEFAULT}")
+
     while true; do
         local choice=""
-        choice=$(whiptail --title "${title}" --menu "${prompt}" \
+        choice=$(whiptail --title "${title}" "${default_item[@]}" --menu "${prompt}" \
             ${WT_HEIGHT} ${WT_WIDTH} ${WT_MENU_HEIGHT} \
             "${all_args[@]}" \
             "FILTER" "🔍 Filter / search versions" \
@@ -1092,6 +986,7 @@ _ui_menu_bash() {
         all_descs+=("${2:-}")
         local d="$1"
         [[ -n "${2:-}" ]] && d="${d}  ${2}"
+        [[ -n "${UI_MENU_DEFAULT:-}" && "$1" == "${UI_MENU_DEFAULT}" ]] && d="${d}  (default)"
         all_display+=("${d}")
         shift 2 || shift
     done
@@ -1142,28 +1037,34 @@ _ui_menu_bash() {
             echo -e "${DIM}  Page $((page+1)) of $((max_page+1)) — showing $((start+1))–${end} of ${total}${NC}"
         fi
 
-        PS3="  #? "
-        select choice in "${page_items[@]}"; do
-            if [[ -z "${choice}" ]]; then
+        # A numbered list like `select`, but an empty answer takes the default.
+        local ask="  #? "
+        [[ -n "${UI_MENU_DEFAULT:-}" ]] && ask="  #? [Enter = ${UI_MENU_DEFAULT}] "
+        for (( i = 0; i < ${#page_items[@]}; i++ )); do
+            printf '%3d) %s\n' "$((i + 1))" "${page_items[$i]}" >&2
+        done
+        while true; do
+            local reply=""
+            printf '%s' "${ask}" >&2
+            if ! read -r reply; then
+                _bash_result=""
+                return 1
+            fi
+            if [[ -z "${reply}" ]]; then
+                [[ -n "${UI_MENU_DEFAULT:-}" ]] || continue
+                _bash_result="${UI_MENU_DEFAULT}"
+                return 0
+            fi
+            if ! [[ "${reply}" =~ ^[0-9]{1,4}$ ]] || (( 10#${reply} < 1 || 10#${reply} > ${#page_items[@]} )); then
                 echo -e "  ${RED}Invalid selection. Try again.${NC}"
                 continue
             fi
 
-            # Find the selected index
-            local sel_idx=-1
-            for (( i = 0; i < ${#page_items[@]}; i++ )); do
-                if [[ "${page_items[$i]}" == "${choice}" ]]; then
-                    sel_idx=$i
-                    break
-                fi
-            done
-            [[ ${sel_idx} -lt 0 ]] && continue
-
-            local sel_tag="${page_tags[${sel_idx}]}"
+            local sel_tag="${page_tags[$((10#${reply} - 1))]}"
 
             case "${sel_tag}" in
-                __PREV__)   (( page-- )); break ;;
-                __NEXT__)   (( page++ )); break ;;
+                __PREV__)   page=$((page - 1)); break ;;
+                __NEXT__)   page=$((page + 1)); break ;;
                 __FILTER__)
                     echo ""
                     read -rp "  Filter (empty to reset): " filter_input
@@ -1367,16 +1268,16 @@ detect_truenas_version() {
 }
 
 # ── GPU identification by PCI ID ─────────────────────────────────────────────
-declare -ga GPU_SLOT=() GPU_DEVID=() GPU_SUBSYS=() GPU_LSPCI_NAME=() GPU_RESERVED=() GPU_RAW_NAME=()
+declare -ga GPU_SLOT=() GPU_DEVID=() GPU_SUBSYS=() GPU_LSPCI_NAME=() GPU_RESERVED=() GPU_NAME=()
 declare -gA NVIDIA_CHIPS_CACHE=()
 
 # Read `lspci -Dnnk -d 10de:` text on stdin; fill the GPU_* arrays (one index
 # per display controller: classes 0300/0302/0380). GPU_RESERVED=1 when the card
 # is bound to vfio-pci (handed to a VM). GPU_LSPCI_NAME is empty when lspci only
-# knows the card as "Device xxxx". GPU_RAW_NAME is the name the old
-# architecture-table logic expects.
+# knows the card as "Device xxxx". GPU_NAME is filled later, by
+# apply_gpu_fit_tags.
 parse_nvidia_gpus() {
-    GPU_SLOT=(); GPU_DEVID=(); GPU_SUBSYS=(); GPU_LSPCI_NAME=(); GPU_RESERVED=(); GPU_RAW_NAME=()
+    GPU_SLOT=(); GPU_DEVID=(); GPU_SUBSYS=(); GPU_LSPCI_NAME=(); GPU_RESERVED=(); GPU_NAME=()
     local hdr='^([0-9a-fA-F:.]+) .*\[(0300|0302|0380)\]: (.*) \[10de:([0-9a-fA-F]{4})\]'
     local line cur=-1 prefix devid
     while IFS= read -r line; do
@@ -1392,11 +1293,6 @@ parse_nvidia_gpus() {
                 GPU_LSPCI_NAME[cur]="${BASH_REMATCH[1]}"
             else
                 GPU_LSPCI_NAME[cur]=""
-            fi
-            if [[ "${prefix}" == *Device ]]; then
-                GPU_RAW_NAME[cur]="Device ${devid}"
-            else
-                GPU_RAW_NAME[cur]="${prefix#NVIDIA Corporation }"
             fi
         elif [[ "${line}" =~ ^[[:space:]] ]]; then
             [[ ${cur} -ge 0 ]] || continue
@@ -1481,22 +1377,26 @@ gpu_name() {
     printf '%s\n' "${name:-NVIDIA device 10de:${GPU_DEVID[idx]}}"
 }
 
-# Detect every NVIDIA GPU via lspci and derive the driver-branch window that
-# satisfies ALL of them: the ceiling is the lowest "last supporting branch"
-# across the cards, the floor the highest "first supporting branch". A single
-# driver serves every card only inside that window — and mixed old/new hardware
-# can make it empty, which is worth saying out loud rather than recommending a
-# branch that leaves one card dead.
+# Name to show for GPU index IDX: the one apply_gpu_fit_tags settled on (read
+# from the newest README while the version list was still newest-first), else
+# gpu_name.
+gpu_display_name() {
+    if [[ -n "${GPU_NAME[$1]:-}" ]]; then
+        printf '%s\n' "${GPU_NAME[$1]}"
+    else
+        gpu_name "$1"
+    fi
+}
+
+# Detect every NVIDIA GPU via lspci (fills the GPU_* arrays) and list them.
+# Cards bound to vfio-pci are handed to a VM: listed, never checked.
+# DETECTED_GPU_MODEL is the first active card, for the driver prompt.
 detect_nvidia_gpu() {
     declare -g DETECTED_GPU_MODEL=""
-    declare -ga DETECTED_GPUS=()
-    declare -g GPU_BRANCH_CEILING="" GPU_CEILING_CARD="" GPU_CEILING_ARCH=""
-    declare -g GPU_BRANCH_FLOOR="" GPU_FLOOR_CARD="" GPU_FLOOR_ARCH=""
-    declare -g GPU_BRANCH_CONFLICT=0 GPU_UNIDENTIFIED=0
-    GPU_SLOT=(); GPU_DEVID=(); GPU_SUBSYS=(); GPU_LSPCI_NAME=(); GPU_RESERVED=(); GPU_RAW_NAME=()
+    GPU_SLOT=(); GPU_DEVID=(); GPU_SUBSYS=(); GPU_LSPCI_NAME=(); GPU_RESERVED=(); GPU_NAME=()
 
     if ! command -v lspci &>/dev/null; then
-        return
+        return 0
     fi
 
     # Every NVIDIA display controller, identified by PCI ID.
@@ -1504,77 +1404,183 @@ detect_nvidia_gpu() {
     lspci_out="$(lspci -Dnnk -d 10de: 2>/dev/null || true)"
     parse_nvidia_gpus <<< "${lspci_out}"
 
-    [[ ${#GPU_DEVID[@]} -gt 0 ]] || return 0
-
-    # The old architecture-table logic below still reads DETECTED_GPUS: only
-    # active (non-reserved) cards feed it.
-    local i
+    local i name
     for i in "${!GPU_DEVID[@]}"; do
+        name="$(gpu_name "${i}")"
+        [[ "${name}" == *"10de:${GPU_DEVID[i]}"* ]] || name="${name} (10de:${GPU_DEVID[i]})"
         if [[ "${GPU_RESERVED[i]}" == "1" ]]; then
-            ok "Detected GPU: NVIDIA ${GPU_RAW_NAME[i]} (10de:${GPU_DEVID[i]}) — reserved for a VM (vfio-pci) — not checked"
+            ok "Detected GPU: ${name} — reserved for a VM (vfio-pci) — not checked"
         else
-            DETECTED_GPUS+=("${GPU_RAW_NAME[i]}")
+            ok "Detected GPU: ${name}"
+            [[ -n "${DETECTED_GPU_MODEL}" ]] || DETECTED_GPU_MODEL="$(gpu_name "${i}")"
+        fi
+    done
+    return 0
+}
+
+# ── GPU ↔ driver version fit ─────────────────────────────────────────────────
+# A driver can build, package and merge perfectly and still not drive the card:
+# nvidia-smi just reports "No devices were found" after a 15-minute build.
+# NVIDIA's supported-chip list for each version says which cards it drives and,
+# for a card it dropped, which legacy branch still does — so the wizard checks
+# the fit up front, from that list only. Reserved (vfio-pci) cards are skipped.
+declare -g GPU_RECOMMENDED_VERSION="" GPU_FIT_CONFLICT=0
+declare -ga GPU_UNBUILDABLE=()
+
+# Run right after fetch_nvidia_branch_info, with NVIDIA_VERSIONS newest-first.
+# Sets: GPU_NAME[idx] for every card, GPU_RECOMMENDED_VERSION (newest version
+#       in the oldest legacy branch an active card needs), GPU_UNBUILDABLE
+#       ("name|branch" for cards whose branch is below NVIDIA_MIN_MAJOR),
+#       GPU_FIT_CONFLICT=1 when the recommended version leaves a card out.
+# Tags: "★ Recommended for your <name>" on the recommendation; every labelled
+#       version gets " — does NOT support <name>" per active card it does not
+#       drive. A version whose list can't be read gets no fit tag (never guess).
+apply_gpu_fit_tags() {
+    declare -g GPU_RECOMMENDED_VERSION="" GPU_FIT_CONFLICT=0
+    declare -ga GPU_UNBUILDABLE=()
+    declare -gA NVIDIA_VERSION_TAGS
+    GPU_NAME=()
+
+    local newest="${NVIDIA_VERSIONS[0]:-}" i
+    local -a active=()
+    for i in "${!GPU_DEVID[@]}"; do
+        [[ "${GPU_RESERVED[i]:-0}" == "1" ]] || active+=("${i}")
+    done
+    [[ -n "${newest}" && ${#GPU_DEVID[@]} -gt 0 ]] || return 0
+
+    # Warm the cache here, not inside $(…), so every later lookup reuses it.
+    if ! nvidia_supported_chips "${newest}" >/dev/null; then
+        for i in "${!GPU_DEVID[@]}"; do
+            GPU_NAME[i]="${GPU_LSPCI_NAME[i]:-NVIDIA device 10de:${GPU_DEVID[i]}}"
+        done
+        [[ ${#active[@]} -eq 0 ]] || info "Could not check GPU support — NVIDIA's supported-chip list is unreachable"
+        return 0
+    fi
+    for i in "${!GPU_DEVID[@]}"; do
+        GPU_NAME[i]="$(gpu_name "${i}")"
+    done
+    [[ ${#active[@]} -gt 0 ]] || return 0
+    DETECTED_GPU_MODEL="${GPU_NAME[${active[0]}]}"
+
+    # Which section of the newest list each active card sits in.
+    local -A section=()
+    local major best=""
+    for i in "${active[@]}"; do
+        section[${i}]="$(gpu_support "${newest}" "${i}")"
+        case "${section[${i}]}" in current|unlisted) continue ;; esac
+        major="${section[${i}]%%.*}"
+        [[ "${major}" =~ ^[0-9]+$ ]] || continue
+        if (( major < NVIDIA_MIN_MAJOR )); then
+            GPU_UNBUILDABLE+=("${GPU_NAME[i]}|${section[${i}]}")
+        elif [[ -z "${best}" ]] || (( major < best )); then
+            best="${major}"
         fi
     done
 
-    [[ ${#DETECTED_GPUS[@]} -gt 0 ]] || return 0
-    DETECTED_GPU_MODEL="${DETECTED_GPUS[0]}"
+    if [[ -n "${best}" ]]; then
+        GPU_RECOMMENDED_VERSION="$(nvidia_latest_in_series "${best}" "${NVIDIA_VERSIONS[@]}")" \
+            || GPU_RECOMMENDED_VERSION=""
+    fi
+    if [[ -n "${GPU_RECOMMENDED_VERSION}" ]]; then
+        local names="" existing=""
+        for i in "${active[@]}"; do
+            [[ "${section[${i}]%%.*}" == "${best}" ]] || continue
+            [[ " and ${names} and " == *" and ${GPU_NAME[i]} and "* ]] && continue
+            names="${names:+${names} and }${GPU_NAME[i]}"
+        done
+        existing="${NVIDIA_VERSION_TAGS[${GPU_RECOMMENDED_VERSION}]:-}"
+        NVIDIA_VERSION_TAGS["${GPU_RECOMMENDED_VERSION}"]="★ Recommended for your ${names}${existing:+ · ${existing}}"
+    fi
 
-    local gpu arch last first
-    for gpu in "${DETECTED_GPUS[@]}"; do
-        detect_gpu_architecture "${gpu}"
-        arch="${DETECTED_GPU_ARCH:-}"
+    local ver support
+    for ver in "${NVIDIA_VERSIONS[@]}"; do
+        [[ -n "${NVIDIA_VERSION_TAGS[${ver}]:-}" ]] || continue
+        nvidia_supported_chips "${ver}" >/dev/null || continue
+        for i in "${active[@]}"; do
+            support="$(gpu_support "${ver}" "${i}")" || continue
+            [[ "${support}" == "current" ]] && continue
+            NVIDIA_VERSION_TAGS["${ver}"]+=" — does NOT support ${GPU_NAME[i]}"
+            [[ "${ver}" != "${GPU_RECOMMENDED_VERSION}" ]] || GPU_FIT_CONFLICT=1
+        done
+    done
+    return 0
+}
 
-        ok "Detected GPU: NVIDIA ${gpu}"
+# Warn when driver VERSION does not drive an active card. Advisory only — the
+# user may be building for a different machine.
+advise_gpu_branch_fit() {
+    local version="$1" i support name branch
+    [[ "${version}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 0
+    local -a active=()
+    for i in "${!GPU_DEVID[@]}"; do
+        [[ "${GPU_RESERVED[i]:-0}" == "1" ]] || active+=("${i}")
+    done
+    [[ ${#active[@]} -gt 0 ]] || return 0
 
-        if [[ -z "${arch}" ]]; then
-            # A card too new for the local pci.ids database shows up as
-            # "Device 2c05" — no name, no chip codename. Say so and give no
-            # advice for it rather than guessing.
-            warn "  Architecture: unrecognised — no driver recommendation for this card"
-            GPU_UNIDENTIFIED=1
+    if ! nvidia_supported_chips "${version}" >/dev/null; then
+        info "Could not check GPU support for NVIDIA ${version}"
+        return 0
+    fi
+    for i in "${active[@]}"; do
+        support="$(gpu_support "${version}" "${i}")" || continue
+        [[ "${support}" == "current" ]] && continue
+        name="$(gpu_display_name "${i}")"
+        if [[ "${support}" == "unlisted" ]]; then
+            warn "${name} is newer than NVIDIA ${version} — it is not in that driver's supported list."
             continue
         fi
-
-        last="${NVIDIA_ARCH_LAST_BRANCH[${arch}]:-}"
-        first="${NVIDIA_ARCH_FIRST_BRANCH[${arch}]:-}"
-
-        if [[ -n "${last}" ]]; then
-            ok "  Architecture: ${arch} — last supporting driver branch: ${last}.xx"
-            if [[ -z "${GPU_BRANCH_CEILING}" ]] || (( last < GPU_BRANCH_CEILING )); then
-                GPU_BRANCH_CEILING="${last}"; GPU_CEILING_CARD="${gpu}"; GPU_CEILING_ARCH="${arch}"
-            fi
-        else
-            ok "  Architecture: ${arch} — supported by current driver branches"
-        fi
-
-        if [[ -n "${first}" ]]; then
-            if [[ -z "${GPU_BRANCH_FLOOR}" ]] || (( first > GPU_BRANCH_FLOOR )); then
-                GPU_BRANCH_FLOOR="${first}"; GPU_FLOOR_CARD="${gpu}"; GPU_FLOOR_ARCH="${arch}"
-            fi
+        warn "${name} is not supported by NVIDIA ${version}; NVIDIA lists it for the ${support}.xx legacy driver."
+        branch="${support%%.*}"
+        if [[ "${branch}" =~ ^[0-9]+$ ]] && (( branch < NVIDIA_MIN_MAJOR )); then
+            warn "This tool can't build a driver for that card."
         fi
     done
+    return 0
+}
 
-    # Empty window: the oldest card's ceiling sits below the newest card's floor.
-    if [[ -n "${GPU_BRANCH_CEILING}" ]] && [[ -n "${GPU_BRANCH_FLOOR}" ]] \
-        && (( GPU_BRANCH_FLOOR > GPU_BRANCH_CEILING )); then
-        GPU_BRANCH_CONFLICT=1
+# Where the driver menu starts: the GPU-fit recommendation, else Production,
+# else the first listed version that is not the Beta.
+driver_menu_default() {
+    local v
+    if [[ -n "${GPU_RECOMMENDED_VERSION:-}" ]]; then
+        printf '%s\n' "${GPU_RECOMMENDED_VERSION}"
+        return 0
     fi
+    if [[ -n "${NVIDIA_BRANCH_VERSION[PB]:-}" ]]; then
+        printf '%s\n' "${NVIDIA_BRANCH_VERSION[PB]}"
+        return 0
+    fi
+    for v in "${NVIDIA_VERSIONS[@]}"; do
+        [[ "${v}" == "${NVIDIA_BRANCH_VERSION[BETA]:-}" ]] && continue
+        printf '%s\n' "${v}"
+        return 0
+    done
+    return 0
+}
 
-    if [[ ${#DETECTED_GPUS[@]} -gt 1 ]]; then
-        if [[ ${GPU_BRANCH_CONFLICT} -eq 1 ]]; then
-            warn "${#DETECTED_GPUS[@]} NVIDIA GPUs — no single driver supports all of them (see below)"
-        elif [[ -n "${GPU_BRANCH_CEILING}" ]]; then
-            ok "${#DETECTED_GPUS[@]} NVIDIA GPUs — a driver must be ${GPU_BRANCH_CEILING}.xx or older to serve all of them"
-        elif [[ -n "${GPU_BRANCH_FLOOR}" ]] && (( GPU_BRANCH_FLOOR > NVIDIA_MIN_MAJOR )); then
-            # Only worth saying when the floor actually rules something out —
-            # every branch this tool offers is already >= NVIDIA_MIN_MAJOR.
-            ok "${#DETECTED_GPUS[@]} NVIDIA GPUs — a driver must be ${GPU_BRANCH_FLOOR}.xx or newer to serve all of them"
+# Step 2 hint: the detected cards and what the fit check found.
+show_gpu_fit_hint() {
+    [[ ${#GPU_DEVID[@]} -gt 0 ]] || return 0
+    local i entry
+    for i in "${!GPU_DEVID[@]}"; do
+        if [[ "${GPU_RESERVED[i]}" == "1" ]]; then
+            echo -e "  ${GREEN}Detected GPU:${NC} $(gpu_display_name "${i}") ${DIM}— reserved for a VM — not checked${NC}"
         else
-            ok "${#DETECTED_GPUS[@]} NVIDIA GPUs detected"
+            echo -e "  ${GREEN}Detected GPU:${NC} $(gpu_display_name "${i}")"
         fi
+    done
+    if [[ ${GPU_FIT_CONFLICT:-0} -eq 1 ]]; then
+        echo -e "  ${YELLOW}No single driver drives all of these GPUs: ${GPU_RECOMMENDED_VERSION} (★ Recommended) leaves one out — see the menu.${NC}"
     fi
-
+    for entry in "${GPU_UNBUILDABLE[@]}"; do
+        echo -e "  ${YELLOW}${entry%|*} needs the ${entry##*|}.xx legacy driver — this tool can't build a driver for that card.${NC}"
+    done
+    if [[ -n "${GPU_RECOMMENDED_VERSION:-}" && ${GPU_FIT_CONFLICT:-0} -eq 0 ]]; then
+        echo -e "  ${YELLOW}Newer branches dropped your GPU — pick ${GPU_RECOMMENDED_VERSION} (★ Recommended).${NC}"
+    elif [[ -z "${GPU_RECOMMENDED_VERSION:-}" && ${#GPU_UNBUILDABLE[@]} -eq 0 ]]; then
+        echo -e "  ${DIM}Tip: ★ Production Branch is recommended for most users.${NC}"
+    fi
+    echo ""
 }
 
 # Read existing .env file values for reconfigure mode
@@ -1870,6 +1876,7 @@ main() {
                     for ver in "${NVIDIA_VERSIONS[@]}"; do
                         nvidia_menu_args+=("${ver}" "${NVIDIA_VERSION_TAGS[${ver}]:-}")
                     done
+                    UI_MENU_DEFAULT="$(driver_menu_default)"
                     ui_menu selected_nvidia "NVIDIA Driver" \
                         "Select new NVIDIA driver:" "${nvidia_menu_args[@]}"
                     advise_legacy_driver "${selected_nvidia}"
@@ -2024,26 +2031,12 @@ main() {
     # ── Step 2: NVIDIA Driver Version ────────────────────────────────────────
     banner "Step 2: Select NVIDIA Driver Version"
 
-    # Show GPU hint if detected
-    if [[ -n "${DETECTED_GPU_MODEL}" ]]; then
-        local _g
-        for _g in "${DETECTED_GPUS[@]}"; do
-            echo -e "  ${GREEN}Detected GPU:${NC} NVIDIA ${_g}"
-        done
-        local gpu_last="${GPU_BRANCH_CEILING:-}"
-        if [[ ${GPU_BRANCH_CONFLICT:-0} -eq 1 ]]; then
-            echo -e "  ${YELLOW}Installed GPUs need different driver branches — no single driver serves both.${NC}"
-        elif [[ -n "${gpu_last}" ]]; then
-            echo -e "  ${YELLOW}${GPU_CEILING_ARCH} card — newer branches dropped it; pick ${gpu_last}.xx (★ Recommended for your GPU).${NC}"
-        else
-            echo -e "  ${DIM}Tip: ★ Production Branch is recommended for most users.${NC}"
-        fi
-        echo ""
-    fi
-
     local selected_nvidia=""
 
     if fetch_nvidia_versions; then
+        # The GPU hint comes after the fetch: the fit check runs inside it.
+        show_gpu_fit_hint
+
         # Build tag/description pairs for ui_menu
         local -a nvidia_menu_args=()
         for ver in "${NVIDIA_VERSIONS[@]}"; do
@@ -2055,6 +2048,7 @@ main() {
         [[ -n "${DETECTED_GPU_MODEL}" ]] && \
             nvidia_prompt="GPU: ${DETECTED_GPU_MODEL}\nSelect driver version:"
 
+        UI_MENU_DEFAULT="$(driver_menu_default)"
         ui_menu selected_nvidia \
             "Step 2: NVIDIA Driver Version" \
             "${nvidia_prompt}" \
