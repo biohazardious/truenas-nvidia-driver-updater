@@ -66,6 +66,7 @@ CHECK_ONLY=0            # 1 = report the current state and exit
 FORCE_KERNEL=0          # 1 = deploy an image built for another kernel anyway
 FORCE_GPU=0             # 1 = deploy an image that won't drive this host's GPUs anyway
 GPU_UNSUPPORTED=()      # --check: "<card> (<slot>) — <reason>" the installed driver can't drive
+GPU_FIT_HOST=""; GPU_FIT_VERSION=""; GPU_FIT_MODULE=""; GPU_FIT_REPORT=""   # set by image_gpu_fit
 UNINSTALL=0             # 1 = deploy the stock image instead of a given one
 PERSIST_ACTION=""       # "on"/"off" = set up / remove update-persistence
 UVM_ACTION=""           # "on"/"off" = register / remove the boot-time uvm load
@@ -742,85 +743,96 @@ for spec in sys.argv[3:]:
 PY
 }
 
+# image_gpu_fit RAW [GPUS] — read RAW's GPU list and build-info, and evaluate
+# every host NVIDIA GPU against it (reserved ones too; callers decide what those
+# mean). GPUS is host_nvidia_gpus output when the caller already has it;
+# without it the GPUs are listed here, after the image checks. On success sets
+#   GPU_FIT_HOST     host_nvidia_gpus lines
+#   GPU_FIT_VERSION  driver version (build-info, else the library name)
+#   GPU_FIT_MODULE   open | proprietary
+#   GPU_FIT_REPORT   gpu_fit_eval lines
+# Otherwise returns why it could not evaluate, in this order of checks:
+#   1 no unsquashfs   2 no temp dir   3 no GPU metadata in the image
+#   4 build-info names no module flavor   5 no python3   6 no lspci
+#   7 no NVIDIA GPU   8 the GPU list could not be read
+image_gpu_fit() {
+    local rc=0 tmp=""
+    GPU_FIT_HOST="${2:-}"; GPU_FIT_VERSION=""; GPU_FIT_MODULE=""; GPU_FIT_REPORT=""
+    command -v unsquashfs >/dev/null 2>&1 || return 1
+    tmp="$(mktemp -d 2>/dev/null)" || return 2
+    # One place removes the temp dir, whichever way the evaluation ends.
+    image_gpu_fit_in "$1" "${tmp}" "$(( $# >= 2 ))" || rc=$?
+    rm -rf "${tmp}"
+    return "${rc}"
+}
+
+# The body of image_gpu_fit, working in DIR. HAVE_GPUS=1 when GPU_FIT_HOST
+# already holds the caller's GPU list.
+image_gpu_fit_in() {
+    local raw="$1" dir="$2" have_gpus="$3" slot devid subsys driver name
+    local -a specs=()
+    image_gpu_metadata "${raw}" "${dir}" || return 3
+    GPU_FIT_VERSION="$(build_info_value "${dir}/build-info" NVIDIA_VERSION)"
+    [[ -n "${GPU_FIT_VERSION}" ]] || GPU_FIT_VERSION="$(image_driver_version "${raw}")"
+    GPU_FIT_MODULE="$(build_info_value "${dir}/build-info" NVIDIA_KERNEL_MODULE_TYPE)"
+    GPU_FIT_MODULE="${GPU_FIT_MODULE,,}"
+    [[ "${GPU_FIT_MODULE}" == open ]] || [[ "${GPU_FIT_MODULE}" == proprietary ]] || return 4
+    command -v python3 >/dev/null 2>&1 || return 5
+    if [[ "${have_gpus}" != 1 ]]; then
+        GPU_FIT_HOST="$(host_nvidia_gpus)" || return 6
+    fi
+    [[ -n "${GPU_FIT_HOST}" ]] || return 7
+    while IFS='|' read -r slot devid subsys driver name; do
+        [[ -n "${slot}" ]] && specs+=("${slot}|${devid}|${subsys}")
+    done <<< "${GPU_FIT_HOST}"
+    GPU_FIT_REPORT="$(gpu_fit_eval "${dir}/supported-gpus.json" "${GPU_FIT_MODULE}" "${specs[@]}" 2>/dev/null)" \
+        || return 8
+}
+
 # Refuses, before anything is touched, an image whose driver or module flavor
 # won't drive this host's GPUs. Cards bound to vfio-pci belong to a VM and are
 # not checked. A missing tool or missing metadata only skips the check: an image
 # built before it existed, or the stock image (--uninstall), must still deploy.
 check_image_gpus() {
-    local tmp="" gpus="" version="" module="" report="" msg
-    local slot devid subsys driver name kind extra
-    local -a specs=() failures=()
+    local rc=0 msg slot devid subsys driver name kind extra
+    local -a failures=()
     local -A fit_name=() reserved=()
 
-    if ! command -v unsquashfs >/dev/null 2>&1; then
-        info "unsquashfs is not available — could not check the image against this host's GPUs"
-        return 0
-    fi
-    if ! tmp="$(mktemp -d 2>/dev/null)"; then
-        info "No temporary directory — could not check the image against this host's GPUs"
-        return 0
-    fi
-    if ! image_gpu_metadata "${NEW_RAW}" "${tmp}"; then
-        rm -rf "${tmp}"
-        info "This image carries no GPU list (built before GPU checks, or the stock image) — skipping the GPU check"
-        return 0
-    fi
-    version="$(build_info_value "${tmp}/build-info" NVIDIA_VERSION)"
-    [[ -n "${version}" ]] || version="$(image_driver_version "${NEW_RAW}")"
-    module="$(build_info_value "${tmp}/build-info" NVIDIA_KERNEL_MODULE_TYPE)"
-    module="${module,,}"
-    if [[ "${module}" != open ]] && [[ "${module}" != proprietary ]]; then
-        rm -rf "${tmp}"
-        info "The image does not say which kernel modules it ships — could not check it against this host's GPUs"
-        return 0
-    fi
-    if ! command -v python3 >/dev/null 2>&1; then
-        rm -rf "${tmp}"
-        info "python3 is not available — could not check the image against this host's GPUs"
-        return 0
-    fi
-    if ! gpus="$(host_nvidia_gpus)"; then
-        rm -rf "${tmp}"
-        info "lspci is not available — could not check the image against this host's GPUs"
-        return 0
-    fi
-    if [[ -z "${gpus}" ]]; then
-        rm -rf "${tmp}"
-        info "No NVIDIA GPU found on this host — nothing to check the image against"
-        return 0
-    fi
+    image_gpu_fit "${NEW_RAW}" || rc=$?
+    case "${rc}" in
+        0) ;;
+        1) info "unsquashfs is not available — could not check the image against this host's GPUs" ;;
+        2) info "No temporary directory — could not check the image against this host's GPUs" ;;
+        3) info "This image carries no GPU list (built before GPU checks, or the stock image) — skipping the GPU check" ;;
+        4) info "The image does not say which kernel modules it ships — could not check it against this host's GPUs" ;;
+        5) info "python3 is not available — could not check the image against this host's GPUs" ;;
+        6) info "lspci is not available — could not check the image against this host's GPUs" ;;
+        7) info "No NVIDIA GPU found on this host — nothing to check the image against" ;;
+        *) warn "Could not read the image's GPU list — could not check it against this host's GPUs" ;;
+    esac
+    [[ ${rc} -eq 0 ]] || return 0
 
-    # Reserved cards go through the evaluation too, but only for their name.
-    while IFS='|' read -r slot devid subsys driver name; do
-        [[ -n "${slot}" ]] && specs+=("${slot}|${devid}|${subsys}")
-    done <<< "${gpus}"
-    if ! report="$(gpu_fit_eval "${tmp}/supported-gpus.json" "${module}" "${specs[@]}" 2>/dev/null)"; then
-        rm -rf "${tmp}"
-        warn "Could not read the image's GPU list — could not check it against this host's GPUs"
-        return 0
-    fi
-    rm -rf "${tmp}"
-
+    # Reserved cards went through the evaluation too, but only for their name.
     while IFS='|' read -r kind slot devid name extra; do
         [[ -n "${slot}" ]] && fit_name["${slot}"]="${name}"
-    done <<< "${report}"
+    done <<< "${GPU_FIT_REPORT}"
     while IFS='|' read -r slot devid subsys driver name; do
         [[ -n "${slot}" ]] && [[ "${driver}" == vfio-pci ]] || continue
         reserved["${slot}"]=1
         name="${name:-${fit_name[${slot}]:-}}"
         info "${name:-NVIDIA 10de:${devid}} (${slot}) is reserved for a VM (vfio-pci) — not checked"
-    done <<< "${gpus}"
+    done <<< "${GPU_FIT_HOST}"
 
     # Same texts as the build's check (entrypoint.sh), with the deploy's fix.
     while IFS='|' read -r kind slot devid name extra; do
         [[ -n "${slot}" ]] && [[ -z "${reserved[${slot}]:-}" ]] || continue
         case "${kind}" in
-            ok)       ok "${name} (10de:${devid}) is supported by NVIDIA ${version} (${module} modules)" ;;
-            legacy)   failures+=("${name} (10de:${devid}) is not supported by NVIDIA ${version}; NVIDIA lists it for the ${extra} legacy driver. Rebuild with ./configure.sh and pick ${extra}.") ;;
-            unlisted) failures+=("10de:${devid} is not in NVIDIA ${version}'s supported list.") ;;
+            ok)       ok "${name} (10de:${devid}) is supported by NVIDIA ${GPU_FIT_VERSION} (${GPU_FIT_MODULE} modules)" ;;
+            legacy)   failures+=("${name} (10de:${devid}) is not supported by NVIDIA ${GPU_FIT_VERSION}; NVIDIA lists it for the ${extra} legacy driver. Rebuild with ./configure.sh and pick ${extra}.") ;;
+            unlisted) failures+=("10de:${devid} is not in NVIDIA ${GPU_FIT_VERSION}'s supported list.") ;;
             module)   failures+=("${name} (10de:${devid}) needs ${extra} kernel modules. Rebuild with ./configure.sh --module ${extra}.") ;;
         esac
-    done <<< "${report}"
+    done <<< "${GPU_FIT_REPORT}"
 
     [[ ${#failures[@]} -eq 0 ]] && return 0
     if [[ ${FORCE_GPU} -eq 1 ]]; then
@@ -836,9 +848,8 @@ Nothing was changed. Pass --force-gpu to install this image anyway."
 # installed image carries NVIDIA's list, whether its driver drives the card.
 # Cards it does not drive are collected in GPU_UNSUPPORTED for the summary.
 report_gpus() {
-    local gpus="" tmp="" version="" module="" report="" label state reason
+    local gpus="" version="" report="" label state reason
     local slot devid subsys driver name kind extra
-    local -a specs=()
     local -A fit=() fit_name=()
 
     if ! gpus="$(host_nvidia_gpus)"; then
@@ -850,21 +861,11 @@ report_gpus() {
         return 0
     fi
 
-    if [[ -f "${NVIDIA_RAW}" ]] && command -v unsquashfs >/dev/null 2>&1 \
-            && command -v python3 >/dev/null 2>&1 && tmp="$(mktemp -d 2>/dev/null)"; then
-        if image_gpu_metadata "${NVIDIA_RAW}" "${tmp}"; then
-            version="$(build_info_value "${tmp}/build-info" NVIDIA_VERSION)"
-            [[ -n "${version}" ]] || version="$(image_driver_version "${NVIDIA_RAW}")"
-            module="$(build_info_value "${tmp}/build-info" NVIDIA_KERNEL_MODULE_TYPE)"
-            module="${module,,}"
-            if [[ "${module}" == open ]] || [[ "${module}" == proprietary ]]; then
-                while IFS='|' read -r slot devid subsys driver name; do
-                    [[ -n "${slot}" ]] && specs+=("${slot}|${devid}|${subsys}")
-                done <<< "${gpus}"
-                report="$(gpu_fit_eval "${tmp}/supported-gpus.json" "${module}" "${specs[@]}" 2>/dev/null)" || report=""
-            fi
-        fi
-        rm -rf "${tmp}"
+    # Any reason the installed image can't be evaluated just leaves out the
+    # "supported" lines.
+    if [[ -f "${NVIDIA_RAW}" ]] && image_gpu_fit "${NVIDIA_RAW}" "${gpus}"; then
+        version="${GPU_FIT_VERSION}"
+        report="${GPU_FIT_REPORT}"
     fi
     while IFS='|' read -r kind slot devid name extra; do
         [[ -n "${slot}" ]] || continue
