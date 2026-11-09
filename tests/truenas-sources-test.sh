@@ -1,0 +1,202 @@
+#!/bin/bash
+# =============================================================================
+# truenas-sources-test.sh — offline test for what configure.sh reads from
+# TrueNAS's own published data: the train (release folder) of each version on
+# download.truenas.com, the host's train from /data/manifest.json, and the
+# TRUENAS_TRAIN line in .env (old TRUENAS_CODENAME files still read).
+# Pages come from tests/fixtures/truenas/.
+#
+# Usage:  tests/truenas-sources-test.sh
+# =============================================================================
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FX="${REPO}/tests/fixtures/truenas"
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
+
+PASS=0; FAIL=0
+pass() { PASS=$((PASS + 1)); echo "  ok    $*"; }
+fail() { FAIL=$((FAIL + 1)); echo "  FAIL  $*"; }
+check() { local name="$1"; shift; if "$@"; then pass "${name}"; else fail "${name}"; fi; }
+is()  { [[ "$1" == "$2" ]]; }
+not() { ! "$@"; }
+
+# ── lift the code under test out of configure.sh ─────────────────────────────
+{
+    echo 'info() { :; }; warn() { :; }; ok() { :; }; err() { :; }'
+    sed -n '/^declare -gA TRUENAS_VERSION_TRAIN=/p' "${REPO}/configure.sh"
+    for fn in valid_train truenas_train_display host_truenas_train resolve_selected_train \
+              fetch_truenas_branch_info truenas_version_supported fetch_truenas_versions \
+              read_existing_config; do
+        sed -n "/^${fn}() {/,/^}/p" "${REPO}/configure.sh"
+    done
+} > "${WORK}/code.sh"
+# shellcheck disable=SC1091
+source "${WORK}/code.sh"
+
+# Stub: download.truenas.com answers from the fixture; anything else fails.
+fetch_url() {
+    case "$1" in
+        https://download.truenas.com/) cat "${FX}/download-root.html" ;;
+        *) return 1 ;;
+    esac
+}
+listed_version() { local v; for v in "${TRUENAS_VERSIONS[@]}"; do [[ "${v}" == "$1" ]] && return 0; done; return 1; }
+# The train read_existing_config takes from a .env holding just these lines.
+env_train_from() {
+    printf '%s\n' "$@" > "${WORK}/train.env"
+    read_existing_config "${WORK}/train.env" >/dev/null 2>&1
+    printf '%s' "${EXISTING_TRAIN}"
+}
+
+fetch_truenas_versions >/dev/null 2>&1
+
+echo "train per version"
+check "25.10.8 → Goldeye"        is "${TRUENAS_VERSION_TRAIN[25.10.8]}" TrueNAS-SCALE-Goldeye
+check "25.10-RC.1 → Goldeye-RC"  is "${TRUENAS_VERSION_TRAIN[25.10-RC.1]}" TrueNAS-SCALE-Goldeye-RC
+check "27.0.0-RC.1 → 27-RC"      is "${TRUENAS_VERSION_TRAIN[27.0.0-RC.1]}" TrueNAS-27-RC
+check "26 BETA → 26-BETA"        is "${TRUENAS_VERSION_TRAIN[26.0.0-BETA.3]}" TrueNAS-26-BETA
+check "24.04 still dropped"      is "${TRUENAS_VERSION_TRAIN[24.04.2.5]:-}" ""
+check "24.04 not listed"         not listed_version 24.04.2.5
+check "nightly ISO not a version" not listed_version 26.0.0-MASTER+20260306-025151
+check "eight versions listed"    is "${#TRUENAS_VERSIONS[@]}" 8
+check "display name"             is "$(truenas_train_display TrueNAS-SCALE-Goldeye-RC)" Goldeye-RC
+check "display name, 26+"        is "$(truenas_train_display TrueNAS-27-RC)" 27-RC
+check "good train accepted"      valid_train TrueNAS-SCALE-Goldeye
+check "bad train rejected"       not valid_train "TrueNAS-x;rm"
+check "train with a slash rejected" not valid_train "TrueNAS-SCALE-Goldeye/25.10.8"
+check "empty train rejected"     not valid_train ""
+
+echo "host train"
+cat > "${WORK}/manifest.json" <<'JSON'
+{"buildtime": 1761000000, "train": "TrueNAS-SCALE-Goldeye", "version": "25.10.9", "size": 1}
+JSON
+export TRUENAS_MANIFEST_FILE="${WORK}/manifest.json"
+check "train from manifest.json" is "$(host_truenas_train)" TrueNAS-SCALE-Goldeye
+check "unlisted host version uses manifest train" \
+    is "$(DETECTED_TRUENAS_VERSION=25.10.9; resolve_selected_train 25.10.9)" TrueNAS-SCALE-Goldeye
+check "listed version uses the list" \
+    is "$(DETECTED_TRUENAS_VERSION=25.10.9; resolve_selected_train 27.0.0-RC.1)" TrueNAS-27-RC
+check "unlisted, not the host → nothing" \
+    is "$(DETECTED_TRUENAS_VERSION=25.10.9; resolve_selected_train 25.10.99)" ""
+mkdir -p "${WORK}/jq-only" "${WORK}/no-json"
+if command -v jq >/dev/null 2>&1; then
+    ln -s "$(command -v jq)" "${WORK}/jq-only/jq"
+    check "jq when there is no python3" is "$(PATH="${WORK}/jq-only" host_truenas_train)" TrueNAS-SCALE-Goldeye
+else
+    echo "  skipped: jq not installed"
+fi
+check "neither python3 nor jq → nothing" is "$(PATH="${WORK}/no-json" host_truenas_train)" ""
+printf '{"train": "TrueNAS-x;rm -rf /"}\n' > "${WORK}/bad-manifest.json"
+check "bad manifest train ignored" is "$(TRUENAS_MANIFEST_FILE="${WORK}/bad-manifest.json" host_truenas_train)" ""
+check "no manifest → nothing" is "$(TRUENAS_MANIFEST_FILE="${WORK}/missing.json" host_truenas_train)" ""
+printf 'not json\n' > "${WORK}/junk.json"
+check "unreadable manifest → nothing" is "$(TRUENAS_MANIFEST_FILE="${WORK}/junk.json" host_truenas_train 2>/dev/null)" ""
+unset TRUENAS_MANIFEST_FILE
+
+echo ".env reader"
+check "legacy codename read"     is "$(env_train_from TRUENAS_CODENAME=Goldeye)" TrueNAS-SCALE-Goldeye
+check "legacy codename with a space" is "$(env_train_from 'TRUENAS_CODENAME=Electric Eel')" TrueNAS-SCALE-ElectricEel
+check "TRUENAS_TRAIN wins over codename" \
+    is "$(env_train_from TRUENAS_TRAIN=TrueNAS-27-RC TRUENAS_CODENAME=Goldeye)" TrueNAS-27-RC
+check "neither → empty"          is "$(env_train_from TRUENAS_VERSION=25.10.8)" ""
+check "empty codename → empty"   is "$(env_train_from TRUENAS_CODENAME=)" ""
+check "bad TRUENAS_TRAIN dropped" is "$(env_train_from 'TRUENAS_TRAIN=TrueNAS-x;rm')" ""
+
+# ── the whole wizard, run on a copy so the real .env is never touched ────────
+# curl serves download.truenas.com from the fixture (or fails when $2 is
+# "down"); NVIDIA's pages fail, so the driver labels are simply missing.
+make_repo() {
+    local d="$1" net="${2:-up}"
+    mkdir -p "${d}/bin"
+    cp "${REPO}/configure.sh" "${REPO}/docker-compose.yaml" "${d}/"
+    printf '#!/bin/bash\nexit 0\n' > "${d}/bin/lspci"
+    printf '#!/bin/bash\nexit 1\n' > "${d}/bin/midclt"
+    printf '#!/bin/bash\nexit 1\n' > "${d}/bin/wget"
+    if [[ "${net}" == "down" ]]; then
+        printf '#!/bin/bash\nexit 22\n' > "${d}/bin/curl"
+    else
+        cat > "${d}/bin/curl" <<STUB
+#!/bin/bash
+case "\${@: -1}" in
+    https://download.truenas.com/) cat "${FX}/download-root.html" ;;
+    *) exit 22 ;;
+esac
+STUB
+    fi
+    chmod +x "${d}/bin/"*
+}
+run_cfg() { local d="$1"; shift; PATH="${d}/bin:${PATH}" TRUENAS_MANIFEST_FILE="${d}/manifest.json" \
+    timeout 60 bash "${d}/configure.sh" "$@" > "${d}/out" 2>&1; RC=$?; }
+
+echo ".env"
+make_repo "$WORK/repo"
+run_cfg "$WORK/repo" --truenas 25.10.8 --nvidia 595.112.07 </dev/null
+check "writes TRUENAS_TRAIN"     grep -qx "TRUENAS_TRAIN=TrueNAS-SCALE-Goldeye" "$WORK/repo/.env"
+check "no TRUENAS_CODENAME line" not grep -q "^TRUENAS_CODENAME=" "$WORK/repo/.env"
+check "comment names the folder" grep -q "Folder of this release on download.truenas.com / update.truenas.com" "$WORK/repo/.env"
+
+echo "host version the list has not indexed"
+make_repo "$WORK/repo-h"
+printf '#!/bin/bash\necho 25.10.9\n' > "$WORK/repo-h/bin/midclt"
+printf '{"train": "TrueNAS-SCALE-Goldeye", "version": "25.10.9"}\n' > "$WORK/repo-h/manifest.json"
+run_cfg "$WORK/repo-h" --truenas 25.10.9 --nvidia 595.112.07 </dev/null
+check "train comes from manifest.json" grep -qx "TRUENAS_TRAIN=TrueNAS-SCALE-Goldeye" "$WORK/repo-h/.env"
+make_repo "$WORK/repo-hw"
+printf '#!/bin/bash\necho 25.10.9\n' > "$WORK/repo-hw/bin/midclt"
+printf '{"train": "TrueNAS-SCALE-Goldeye", "version": "25.10.9"}\n' > "$WORK/repo-hw/manifest.json"
+run_cfg "$WORK/repo-hw" --no-whiptail < <(printf '1\n595.112.07\n\n\n\n\n\n\n\n\n\n')
+check "wizard: detected version keeps its train" grep -qx "TRUENAS_TRAIN=TrueNAS-SCALE-Goldeye" "$WORK/repo-hw/.env"
+check "wizard: nothing asked" not grep -qF "is not known here" "$WORK/repo-hw/out"
+
+echo "--train"
+make_repo "$WORK/repo-t" down
+run_cfg "$WORK/repo-t" --truenas 27.0.0-RC.1 --nvidia 595.112.07 --train TrueNAS-27-RC </dev/null
+check "--train reaches .env"     grep -qx "TRUENAS_TRAIN=TrueNAS-27-RC" "$WORK/repo-t/.env"
+make_repo "$WORK/repo-tb" down
+run_cfg "$WORK/repo-tb" --truenas 25.10.8 --nvidia 595.112.07 --train 'TrueNAS-x;rm' </dev/null
+check "bad --train refused"      not is "${RC}" 0
+check "bad --train writes no .env" not test -e "$WORK/repo-tb/.env"
+make_repo "$WORK/repo-tn" down
+run_cfg "$WORK/repo-tn" --truenas 25.10.8 --nvidia 595.112.07 </dev/null
+check "list down, no --train → empty train" grep -qx "TRUENAS_TRAIN=" "$WORK/repo-tn/.env"
+check "list down, no --train → still accepted" is "${RC}" 0
+
+echo "wizard, list unreachable"
+make_repo "$WORK/repo-w" down
+run_cfg "$WORK/repo-w" --no-whiptail < <(printf '25.10.8\nTrueNAS-SCALE-Goldeye\n595.112.07\n\n\n\n\n\n\n\n\n\n')
+# read -p shows its prompt only on a terminal, so the wording is checked in the script.
+check "the prompt's wording" grep -qF "Enter the release folder on download.truenas.com (e.g. TrueNAS-SCALE-Goldeye), or leave empty to let the build find it:" "$REPO/configure.sh"
+check "says the folder is unknown" grep -qF "The release folder of TrueNAS 25.10.8 is not known here." "$WORK/repo-w/out"
+check "typed train reaches .env" grep -qx "TRUENAS_TRAIN=TrueNAS-SCALE-Goldeye" "$WORK/repo-w/.env"
+make_repo "$WORK/repo-we" down
+run_cfg "$WORK/repo-we" --no-whiptail < <(printf '25.10.8\n\n595.112.07\n\n\n\n\n\n\n\n\n\n')
+check "empty answer allowed"     grep -qx "TRUENAS_TRAIN=" "$WORK/repo-we/.env"
+make_repo "$WORK/repo-wb" down
+run_cfg "$WORK/repo-wb" --no-whiptail < <(printf '25.10.8\nTrueNAS-x;rm\nTrueNAS-26-BETA\n595.112.07\n\n\n\n\n\n\n\n\n\n')
+check "bad answer asked again"   grep -qx "TRUENAS_TRAIN=TrueNAS-26-BETA" "$WORK/repo-wb/.env"
+
+echo "reconfigure an old .env"
+make_repo "$WORK/repo-r" down
+cat > "$WORK/repo-r/.env" <<'ENV'
+NVIDIA_VERSION=595.112.07
+TRUENAS_VERSION=25.10.8
+NVIDIA_KERNEL_MODULE_TYPE=open
+TRUENAS_CODENAME=Goldeye
+EMBED_NVIDIA_RAW_IN_UPDATE=false
+ENV
+run_cfg "$WORK/repo-r" --reconfigure --no-whiptail < <(printf '4\n1\n\n\n')
+check "codename becomes TRUENAS_TRAIN" grep -qx "TRUENAS_TRAIN=TrueNAS-SCALE-Goldeye" "$WORK/repo-r/.env"
+check "codename line gone"       not grep -q "^TRUENAS_CODENAME=" "$WORK/repo-r/.env"
+
+echo "tables and prompts"
+check "tables gone"              is "$(grep -cE 'CODENAME_MAP|VERSION_TO_CODENAME' "$REPO/configure.sh")" 0
+check "per-version codenames gone" is "$(grep -c 'TRUENAS_VERSION_CODENAMES' "$REPO/configure.sh")" 0
+check "no 26+ codename prompt"   is "$(grep -c 'leave empty for TrueNAS 26' "$REPO/configure.sh")" 0
+check "compose passes TRUENAS_TRAIN" grep -q 'TRUENAS_TRAIN=${TRUENAS_TRAIN:-}' "$REPO/docker-compose.yaml"
+check "compose keeps TRUENAS_CODENAME" grep -q 'TRUENAS_CODENAME=${TRUENAS_CODENAME:-}' "$REPO/docker-compose.yaml"
+
+echo ""
+echo "${PASS} passed, ${FAIL} failed"
+[[ ${FAIL} -eq 0 ]]

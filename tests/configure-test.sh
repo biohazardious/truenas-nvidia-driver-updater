@@ -37,6 +37,7 @@ fetch_url() {
 HTML
 }
 PAGE
+    sed -n '/^valid_train() {/,/^}/p' "${REPO}/configure.sh"
     sed -n '/^truenas_version_supported() {/,/^}/p' "${REPO}/configure.sh"
     sed -n '/^fetch_truenas_versions() {/,/^}/p' "${REPO}/configure.sh"
     echo 'fetch_truenas_versions'

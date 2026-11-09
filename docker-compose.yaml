@@ -20,7 +20,10 @@ services:
       # Set false only if the target TrueNAS kernel cannot load nvidia_drm.
       - NVIDIA_INSTALL_DRM=${NVIDIA_INSTALL_DRM:-true}
       - TRUENAS_VERSION=${TRUENAS_VERSION:?Run ./configure.sh first or create .env}
-      # Required for 25.x and earlier downloads. Leave empty for TrueNAS 26+.
+      # Folder of this release on download.truenas.com / update.truenas.com,
+      # e.g. TrueNAS-SCALE-Goldeye. Empty: the build finds it.
+      - TRUENAS_TRAIN=${TRUENAS_TRAIN:-}
+      # Older .env files name the codename instead (e.g. Goldeye); still read.
       - TRUENAS_CODENAME=${TRUENAS_CODENAME:-}
       # true/false — when enabled, also generate a rebuilt truenas.update with
       # the bundled nvidia.raw replaced.

@@ -78,6 +78,8 @@ Non-interactive mode (for automation / CI):
   All flags:
     --truenas VERSION     TrueNAS version (e.g. 25.10.8)
     --nvidia VERSION      NVIDIA driver version (e.g. 595.112.07)
+    --train TRAIN         Release folder on download.truenas.com, e.g.
+                          TrueNAS-SCALE-Goldeye (default: looked up for --truenas)
     --module TYPE         Kernel module type: open (default) or proprietary
     --embed true|false    Embed nvidia.raw in truenas.update (default: false)
     --patch MODE          Source patches: none, custom, predefined, or auto
@@ -113,6 +115,7 @@ EOF
 # ── CLI variables for non-interactive mode ───────────────────────────────────
 CLI_TRUENAS=""
 CLI_NVIDIA=""
+CLI_TRAIN=""
 CLI_MODULE=""
 CLI_EMBED=""
 CLI_PATCH=""
@@ -129,6 +132,7 @@ while [[ $# -gt 0 ]]; do
         --reconfigure)    CLI_RECONFIGURE=true ;;
         --truenas)        CLI_TRUENAS="$2"; shift ;;
         --nvidia)         CLI_NVIDIA="$2"; shift ;;
+        --train)          CLI_TRAIN="$2"; shift ;;
         --module)         CLI_MODULE="$2"; shift ;;
         --embed)          CLI_EMBED="$2"; shift ;;
         --patch)          CLI_PATCH="$2"; shift ;;
@@ -136,6 +140,7 @@ while [[ $# -gt 0 ]]; do
         --custom-run)     CLI_RUN_FILE="$2"; shift ;;
         --truenas=*)      CLI_TRUENAS="${1#*=}" ;;
         --nvidia=*)       CLI_NVIDIA="${1#*=}" ;;
+        --train=*)        CLI_TRAIN="${1#*=}" ;;
         --module=*)       CLI_MODULE="${1#*=}" ;;
         --embed=*)        CLI_EMBED="${1#*=}" ;;
         --patch=*)        CLI_PATCH="${1#*=}" ;;
@@ -181,20 +186,100 @@ wt_size() {
 # TrueNAS Version Fetching
 # =============================================================================
 
-# Known codename → major version mapping (fallback if page parsing fails)
-declare -A CODENAME_MAP=(
-    ["Goldeye"]="25.10"
-    ["Fangtooth"]="25.04"
-    ["ElectricEel"]="24.10"
-    ["Electric Eel"]="24.10"
-)
+# Train of each listed version: the folder it sits in on download.truenas.com
+# (e.g. 25.10.8 → TrueNAS-SCALE-Goldeye, 27.0.0-RC.1 → TrueNAS-27-RC). The same
+# name is the train on update.truenas.com. Filled by fetch_truenas_versions.
+declare -gA TRUENAS_VERSION_TRAIN=()
+TRUENAS_LIST_TRIED=false
 
-# Reverse: major version → codename
-declare -A VERSION_TO_CODENAME=(
-    ["25.10"]="Goldeye"
-    ["25.04"]="Fangtooth"
-    ["24.10"]="Electric Eel"
-)
+# The host's own release record (written by TrueNAS; holds "train").
+TRUENAS_MANIFEST_FILE="${TRUENAS_MANIFEST_FILE:-/data/manifest.json}"
+
+# 0 when $1 looks like a train name (a single folder, nothing to escape).
+valid_train() {
+    [[ "${1:-}" =~ ^TrueNAS-[A-Za-z0-9-]+$ ]]
+}
+
+# Human name of a train: TrueNAS-SCALE-Goldeye-RC → Goldeye-RC, TrueNAS-27-RC → 27-RC.
+truenas_train_display() {
+    local name="${1#TrueNAS-SCALE-}"
+    [[ "${name}" == "$1" ]] && name="${1#TrueNAS-}"
+    printf '%s\n' "${name}"
+}
+
+# Menu description of a listed version: its train's name and its tag.
+truenas_menu_desc() {
+    local ver="$1" name="" tag="${TRUENAS_VERSION_TAGS[$1]:-}"
+    [[ -n "${TRUENAS_VERSION_TRAIN[${ver}]:-}" ]] \
+        && name="$(truenas_train_display "${TRUENAS_VERSION_TRAIN[${ver}]}")"
+    printf '%s\n' "${name}${tag:+${name:+  }${tag}}"
+}
+
+# Train of the TrueNAS this runs on, from its manifest.json; prints nothing when
+# the file is missing, unreadable, or there is no python3/jq to read it.
+host_truenas_train() {
+    local file="${TRUENAS_MANIFEST_FILE:-/data/manifest.json}" train=""
+    [[ -r "${file}" ]] || return 0
+    if command -v python3 >/dev/null 2>&1; then
+        train="$(python3 -I -c 'import json, sys
+t = json.load(open(sys.argv[1])).get("train")
+print(t if isinstance(t, str) else "")' "${file}" 2>/dev/null)" || train=""
+    elif command -v jq >/dev/null 2>&1; then
+        train="$(jq -r 'if (.train | type) == "string" then .train else "" end' "${file}" 2>/dev/null)" || train=""
+    fi
+    valid_train "${train}" && printf '%s\n' "${train}"
+    return 0
+}
+
+# Train of the selected version: from the download.truenas.com list, else —
+# for the version this host runs (which the list may not have indexed yet) —
+# from the host's manifest.json. Prints nothing when neither knows it.
+resolve_selected_train() {
+    local version="$1"
+    if [[ -n "${TRUENAS_VERSION_TRAIN[${version}]:-}" ]]; then
+        printf '%s\n' "${TRUENAS_VERSION_TRAIN[${version}]}"
+    elif [[ -n "${version}" ]] && [[ "${version}" == "${DETECTED_TRUENAS_VERSION:-}" ]]; then
+        host_truenas_train
+    fi
+    return 0
+}
+
+# Ask for the train once (an invalid answer is asked again). Empty is allowed:
+# the build then finds the folder itself. Sets the variable named by $1.
+prompt_truenas_train() {
+    local -n _train_answer=$1
+    local answer=""
+    while true; do
+        answer=""
+        ui_inputbox answer "Release folder" \
+            "Enter the release folder on download.truenas.com (e.g. TrueNAS-SCALE-Goldeye), or leave empty to let the build find it:" \
+            || answer=""
+        answer="${answer//[[:space:]]/}"
+        if [[ -z "${answer}" ]] || valid_train "${answer}"; then
+            _train_answer="${answer}"
+            return 0
+        fi
+        warn "'${answer}' is not a release folder name (expected e.g. TrueNAS-SCALE-Goldeye)."
+    done
+}
+
+# Train for the version the wizard selected: the list, the host, then — when
+# the list has not been fetched yet — the list after all; asks only when none
+# of them knows it. Sets the variable named by $1.
+wizard_truenas_train() {
+    local -n _wizard_train=$1
+    local version="$2" train=""
+    train="$(resolve_selected_train "${version}")"
+    if [[ -z "${train}" ]] && [[ "${TRUENAS_LIST_TRIED}" != true ]] \
+        && fetch_truenas_versions; then
+        train="$(resolve_selected_train "${version}")"
+    fi
+    if [[ -z "${train}" ]]; then
+        warn "The release folder of TrueNAS ${version} is not known here."
+        prompt_truenas_train train
+    fi
+    _wizard_train="${train}"
+}
 
 fetch_truenas_branch_info() {
     # Tag TrueNAS versions heuristically from the sorted version list.
@@ -280,8 +365,9 @@ fetch_truenas_branch_info() {
 # ordinary packages, with no nvidia.raw for this project to replace.
 truenas_version_supported() {
     local major="${1%%.*}" rest="${1#*.}"
-    local minor="${rest%%.*}"
-    [[ "${major}" =~ ^[0-9]+$ ]] && [[ "${minor}" =~ ^[0-9]+$ ]] || return 1
+    # The minor is the digits after the first dot: 25.10-RC.1 is 25.10.
+    local minor="${rest%%[!0-9]*}"
+    [[ "$1" == *.* ]] && [[ "${major}" =~ ^[0-9]+$ ]] && [[ "${minor}" =~ ^[0-9]+$ ]] || return 1
     (( 10#${major} * 100 + 10#${minor} >= 2410 ))
 }
 
@@ -294,7 +380,7 @@ require_supported_truenas() {
 
 fetch_truenas_versions() {
     local html=""
-    local -a versions=()
+    TRUENAS_LIST_TRIED=true
 
     info "Fetching TrueNAS versions from download.truenas.com …"
 
@@ -303,23 +389,16 @@ fetch_truenas_versions() {
         return 1
     }
 
-    # Parse the HTML to extract version entries
-    # The page structure has folders like:
-    #   TrueNAS-SCALE-Goldeye/25.10.3.1/
-    #   TrueNAS-26-BETA/26.0.0-BETA.1/
-    #
-    # We look for version-like directory names inside these parent folders.
-    # The HTML contains href attributes like:
-    #   href="TrueNAS-SCALE-Goldeye/25.10.3"
-    #   href="TrueNAS-26-BETA/26.0.0-BETA.1"
-
-    # Extract all versioned paths: "ParentDir/Version"
+    # Each release is a folder inside its train's folder, linked as
+    #   href="TrueNAS-SCALE-Goldeye/25.10.8"
+    #   href="TrueNAS-27-RC/27.0.0-RC.1"
+    # so the parent folder of every version is its train. Files (ISOs, nightly
+    # builds) and deeper paths are not releases.
     local raw_versions=""
-    raw_versions="$(echo "${html}" | grep -oP 'href="(TrueNAS-[^"]*?/[0-9][^"]*?)"' \
-        | sed 's/href="//;s/"$//' \
-        | grep -vE '\.(iso|gpg|sha256|mtree|update|deb|gz|xz|bz2)' \
+    raw_versions="$(grep -oE 'href="TrueNAS-[^"/]+/[0-9][^"]*"' <<< "${html}" \
+        | sed 's/^href="//;s/"$//;s:/$::' \
+        | grep -vE '\.(iso|gpg|sha256|mtree|update|deb|gz|xz|bz2)$' \
         | grep -vE 'Nightlies|MASTER|packages' \
-        | grep -E '/[0-9]+\.[0-9]+' \
         | sort -u)" || true
 
     if [[ -z "${raw_versions}" ]]; then
@@ -327,38 +406,22 @@ fetch_truenas_versions() {
         return 1
     fi
 
-    # Build associative arrays: version → codename, and ordered version list
-    declare -gA TRUENAS_VERSION_CODENAMES=()
+    # Version → train, and the version list
+    declare -gA TRUENAS_VERSION_TRAIN=()
     declare -ga TRUENAS_VERSIONS=()
 
-    local seen_versions=""
+    local entry train version
     while IFS= read -r entry; do
-        local parent_dir="" version=""
-        parent_dir="$(dirname "${entry}")"
-        version="$(basename "${entry}")"
+        train="${entry%%/*}"
+        version="${entry#*/}"
 
-        # Skip non-version entries (e.g. GITMANIFEST from deeper paths)
-        [[ "${version}" =~ ^[0-9] ]] || continue
+        valid_train "${train}" || continue
+        [[ "${version}" =~ ^[0-9]+\.[0-9]+[0-9A-Za-z.-]*$ ]] || continue
         truenas_version_supported "${version}" || continue
+        # A version listed under two trains keeps the first one.
+        [[ -n "${TRUENAS_VERSION_TRAIN[${version}]:-}" ]] && continue
 
-        # Skip if we've already seen this version
-        if echo "${seen_versions}" | grep -qF "|${version}|" 2>/dev/null; then
-            continue
-        fi
-        seen_versions="${seen_versions}|${version}|"
-
-        # Determine codename from parent directory
-        local codename=""
-        if [[ "${parent_dir}" =~ TrueNAS-SCALE-(.+) ]]; then
-            codename="${BASH_REMATCH[1]}"
-            # Normalize: "ElectricEel" → "Electric Eel"
-            case "${codename}" in
-                ElectricEel) codename="Electric Eel" ;;
-            esac
-        fi
-        # TrueNAS 26+ doesn't use codenames
-
-        TRUENAS_VERSION_CODENAMES["${version}"]="${codename}"
+        TRUENAS_VERSION_TRAIN["${version}"]="${train}"
         TRUENAS_VERSIONS+=("${version}")
     done <<< "${raw_versions}"
 
@@ -1211,7 +1274,7 @@ ui_msgbox() {
 generate_env_file() {
     local nvidia_version="$1"
     local truenas_version="$2"
-    local codename="$3"
+    local train="$3"
     local module_type="$4"
     local embed_update="$5"
     local build_cc="$6"
@@ -1253,8 +1316,9 @@ NVIDIA_KERNEL_MODULE_TYPE=${module_type}
 NVIDIA_TARGET_GPUS=${target_gpus}
 SKIP_GPU_CHECK=${skip_gpu_check}
 
-# Required for TrueNAS 25.x and earlier download URLs. Leave empty for 26+.
-TRUENAS_CODENAME=${codename}
+# Folder of this release on download.truenas.com / update.truenas.com
+# (e.g. TrueNAS-SCALE-Goldeye). Leave empty to let the build find it.
+TRUENAS_TRAIN=${train}
 
 # Compiler override for the NVIDIA kernel module build (e.g. gcc-14).
 # Leave empty to auto-detect.
@@ -1645,11 +1709,12 @@ show_gpu_fit_hint() {
 read_existing_config() {
     local env_file="$1"
 
-    declare -g EXISTING_TRUENAS="" EXISTING_NVIDIA="" EXISTING_MODULE="" EXISTING_EMBED="" EXISTING_CODENAME="" EXISTING_PATCH_MODE=""
+    declare -g EXISTING_TRUENAS="" EXISTING_NVIDIA="" EXISTING_MODULE="" EXISTING_EMBED="" EXISTING_TRAIN="" EXISTING_PATCH_MODE=""
     declare -g EXISTING_RUN_URL="" EXISTING_RUN_FILE="" EXISTING_SKIP_GPU_CHECK=""
 
     [[ -f "${env_file}" ]] || return 1
 
+    local legacy_codename=""
     # Source the .env file safely (only read KEY=VALUE lines, skip comments)
     while IFS='=' read -r key value; do
         # Skip comments and empty lines
@@ -1663,13 +1728,24 @@ read_existing_config() {
             TRUENAS_VERSION)            EXISTING_TRUENAS="${value}" ;;
             NVIDIA_KERNEL_MODULE_TYPE)  EXISTING_MODULE="${value}" ;;
             EMBED_NVIDIA_RAW_IN_UPDATE) EXISTING_EMBED="${value}" ;;
-            TRUENAS_CODENAME)           EXISTING_CODENAME="${value}" ;;
+            TRUENAS_TRAIN)              EXISTING_TRAIN="${value}" ;;
+            TRUENAS_CODENAME)           legacy_codename="${value}" ;;
             NVIDIA_PATCH_MODE)          EXISTING_PATCH_MODE="${value}" ;;
             NVIDIA_RUN_URL)             EXISTING_RUN_URL="${value}" ;;
             NVIDIA_RUN_FILE)            EXISTING_RUN_FILE="${value}" ;;
             SKIP_GPU_CHECK)             EXISTING_SKIP_GPU_CHECK="${value}" ;;
         esac
     done < "${env_file}"
+
+    # Older files name the codename instead (spaces were already dropped
+    # above): TRUENAS_CODENAME=Goldeye is the train TrueNAS-SCALE-Goldeye.
+    if [[ -z "${EXISTING_TRAIN}" ]] && [[ -n "${legacy_codename}" ]]; then
+        EXISTING_TRAIN="TrueNAS-SCALE-${legacy_codename}"
+    fi
+    if [[ -n "${EXISTING_TRAIN}" ]] && ! valid_train "${EXISTING_TRAIN}"; then
+        warn "Ignoring the release folder in .env (${EXISTING_TRAIN}): not a folder name; the build will look it up."
+        EXISTING_TRAIN=""
+    fi
 
     return 0
 }
@@ -1779,6 +1855,10 @@ main() {
         info "Running in non-interactive mode"
 
         require_supported_truenas "${CLI_TRUENAS}"
+        if [[ -n "${CLI_TRAIN}" ]] && ! valid_train "${CLI_TRAIN}"; then
+            err "Invalid --train '${CLI_TRAIN}' (expected a release folder such as TrueNAS-SCALE-Goldeye)"
+            exit 1
+        fi
 
         local selected_truenas="${CLI_TRUENAS}"
         local selected_nvidia="${CLI_NVIDIA}"
@@ -1816,12 +1896,17 @@ main() {
             selected_module_type="proprietary"
         fi
 
-        # Resolve codename
-        local major_minor=""
-        major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
-        local selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
+        # The train: --train, else the download.truenas.com list or this
+        # host's manifest. Nothing is asked here; left empty, the build finds it.
+        local selected_train="${CLI_TRAIN}"
+        if [[ -z "${selected_train}" ]]; then
+            fetch_truenas_versions || true
+            selected_train="$(resolve_selected_train "${selected_truenas}")"
+            [[ -n "${selected_train}" ]] \
+                || info "Release folder of TrueNAS ${selected_truenas} not found here — the build will look it up."
+        fi
 
-        ok "TrueNAS: ${selected_truenas}${selected_codename:+ (${selected_codename})}"
+        ok "TrueNAS: ${selected_truenas}${selected_train:+ ($(truenas_train_display "${selected_train}"))}"
         ok "NVIDIA:  ${selected_nvidia}"
         ok "Module:  ${selected_module_type}"
         ok "Embed:   ${selected_embed}"
@@ -1839,7 +1924,7 @@ main() {
         generate_env_file \
             "${selected_nvidia}" \
             "${selected_truenas}" \
-            "${selected_codename}" \
+            "${selected_train}" \
             "${selected_module_type}" \
             "${selected_embed}" \
             "${selected_cc}" \
@@ -1903,7 +1988,7 @@ main() {
         fi
 
         local selected_truenas="${EXISTING_TRUENAS}"
-        local selected_codename="${EXISTING_CODENAME}"
+        local selected_train="${EXISTING_TRAIN}"
         local selected_nvidia="${EXISTING_NVIDIA}"
         local selected_module_type="${EXISTING_MODULE}"
         local selected_embed="${EXISTING_EMBED}"
@@ -1915,20 +2000,14 @@ main() {
                 if fetch_truenas_versions; then
                     local -a truenas_menu_args=()
                     for ver in "${TRUENAS_VERSIONS[@]}"; do
-                        local cn="${TRUENAS_VERSION_CODENAMES[${ver}]:-}"
-                        local tag="${TRUENAS_VERSION_TAGS[${ver}]:-}"
-                        local desc=""
-                        [[ -n "${cn}" ]] && desc="${cn}"
-                        [[ -n "${tag}" ]] && desc="${desc:+${desc}  }${tag}"
-                        truenas_menu_args+=("${ver}" "${desc}")
+                        truenas_menu_args+=("${ver}" "$(truenas_menu_desc "${ver}")")
                     done
                     ui_menu selected_truenas "TrueNAS Version" \
                         "Select new TrueNAS version:" "${truenas_menu_args[@]}"
-                    selected_codename="${TRUENAS_VERSION_CODENAMES[${selected_truenas}]:-}"
-                    if [[ -z "${selected_codename}" ]]; then
-                        local major_minor=""
-                        major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
-                        selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
+                    if [[ "${selected_truenas}" != "${EXISTING_TRUENAS}" ]]; then
+                        wizard_truenas_train selected_train "${selected_truenas}"
+                    elif [[ -z "${selected_train}" ]]; then
+                        selected_train="$(resolve_selected_train "${selected_truenas}")"
                     fi
                 fi
                 ;;
@@ -1991,7 +2070,7 @@ main() {
         fi
 
         generate_env_file \
-            "${selected_nvidia}" "${selected_truenas}" "${selected_codename}" \
+            "${selected_nvidia}" "${selected_truenas}" "${selected_train}" \
             "${selected_module_type}" "${selected_embed}" "${selected_cc}" \
             "${env_file}" "${selected_patch_mode}"
         ok ".env updated! (changed: ${reconfigure_what})"
@@ -2013,7 +2092,7 @@ main() {
     # ── Step 1: TrueNAS Version ──────────────────────────────────────────────
     banner "Step 1: Select TrueNAS Version"
 
-    local selected_truenas="" selected_codename=""
+    local selected_truenas="" selected_train=""
 
     # Use auto-detected version if available
     if [[ -n "${DETECTED_TRUENAS_VERSION}" ]]; then
@@ -2022,9 +2101,6 @@ main() {
             "TrueNAS version ${DETECTED_TRUENAS_VERSION} was auto-detected.\n\nUse this version?" "true"
         then
             selected_truenas="${DETECTED_TRUENAS_VERSION}"
-            local major_minor=""
-            major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
-            selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
         fi
     fi
 
@@ -2033,12 +2109,7 @@ main() {
             # Build tag/description pairs for ui_menu
             local -a truenas_menu_args=()
             for ver in "${TRUENAS_VERSIONS[@]}"; do
-                local cn="${TRUENAS_VERSION_CODENAMES[${ver}]:-}"
-                local tag="${TRUENAS_VERSION_TAGS[${ver}]:-}"
-                local desc=""
-                [[ -n "${cn}" ]] && desc="${cn}"
-                [[ -n "${tag}" ]] && desc="${desc:+${desc}  }${tag}"
-                truenas_menu_args+=("${ver}" "${desc}")
+                truenas_menu_args+=("${ver}" "$(truenas_menu_desc "${ver}")")
             done
 
             local truenas_prompt="Select the TrueNAS version you are running:"
@@ -2049,42 +2120,22 @@ main() {
                 "Step 1: TrueNAS Version" \
                 "${truenas_prompt}" \
                 "${truenas_menu_args[@]}"
-
-            # Resolve codename
-            if [[ -n "${selected_truenas}" ]]; then
-                selected_codename="${TRUENAS_VERSION_CODENAMES[${selected_truenas}]:-}"
-                if [[ -z "${selected_codename}" ]]; then
-                    local major_minor=""
-                    major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
-                    selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
-                    if [[ -z "${selected_codename}" ]]; then
-                        ui_inputbox selected_codename \
-                            "Codename" \
-                            "Enter codename (leave empty for TrueNAS 26+):"
-                    fi
-                fi
-            fi
         else
             warn "Failed to fetch version list. Please enter manually."
             ui_inputbox selected_truenas \
                 "TrueNAS Version" \
                 "Enter TrueNAS version (e.g. 25.10.8):"
-            local major_minor=""
-            major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
-            selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
-            if [[ -z "${selected_codename}" ]]; then
-                ui_inputbox selected_codename \
-                    "Codename" \
-                    "Enter codename (leave empty for TrueNAS 26+):"
-            fi
         fi
     fi
 
     [[ -n "${selected_truenas}" ]] || { err "No TrueNAS version selected. Aborting."; exit 1; }
     require_supported_truenas "${selected_truenas}"
 
-    if [[ -n "${selected_codename}" ]]; then
-        ok "Selected: ${selected_truenas} (${selected_codename})"
+    # Its train: from the list or this host's manifest; asked only when neither knows it.
+    wizard_truenas_train selected_train "${selected_truenas}"
+
+    if [[ -n "${selected_train}" ]]; then
+        ok "Selected: ${selected_truenas} ($(truenas_train_display "${selected_train}"))"
     else
         ok "Selected: ${selected_truenas}"
     fi
@@ -2198,7 +2249,7 @@ main() {
 
     local summary=""
     summary+="  TrueNAS Version   : ${selected_truenas}"
-    [[ -n "${selected_codename}" ]] && summary+="\n  TrueNAS Codename  : ${selected_codename}"
+    summary+="\n  Release Folder     : ${selected_train:-found by the build}"
     summary+="\n  NVIDIA Driver      : ${selected_nvidia}"
     summary+="\n  Module Type        : ${selected_module_type}"
     summary+="\n  Embed in .update   : ${selected_embed}"
@@ -2209,9 +2260,7 @@ main() {
         ui_msgbox "Configuration Summary" "$(echo -e "${summary}")"
     else
         echo -e "  ${GREEN}►${NC} TrueNAS Version   : ${BOLD}${selected_truenas}${NC}"
-        if [[ -n "${selected_codename}" ]]; then
-            echo -e "  ${GREEN}►${NC} TrueNAS Codename  : ${BOLD}${selected_codename}${NC}"
-        fi
+        echo -e "  ${GREEN}►${NC} Release Folder     : ${BOLD}${selected_train:-found by the build}${NC}"
         echo -e "  ${GREEN}►${NC} NVIDIA Driver      : ${BOLD}${selected_nvidia}${NC}"
         echo -e "  ${GREEN}►${NC} Module Type        : ${BOLD}${selected_module_type}${NC}"
         echo -e "  ${GREEN}►${NC} Embed in .update   : ${BOLD}${selected_embed}${NC}"
@@ -2234,7 +2283,7 @@ main() {
     generate_env_file \
         "${selected_nvidia}" \
         "${selected_truenas}" \
-        "${selected_codename}" \
+        "${selected_train}" \
         "${selected_module_type}" \
         "${selected_embed}" \
         "${selected_cc}" \
