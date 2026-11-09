@@ -100,8 +100,15 @@ if [[ "$1" == set ]]; then
 fi
 STUB
 
+    # -cat serves files from ${SB}/image (the GPU metadata a test placed there),
+    # whatever image it is asked about, and fails like the real one when absent.
     cat > "${bin}/unsquashfs" <<'STUB'
 #!/bin/bash
+if [[ "$1" == -cat ]]; then
+    [[ -f "${SB}/image/$3" ]] || { echo "unsquashfs: $3 not found in $2" >&2; exit 1; }
+    cat "${SB}/image/$3"
+    exit 0
+fi
 [[ "$1" == -l ]] || exit 0
 grep -q NOMODULES "$2" && exit 0
 kernel="$(grep -oP 'KERNEL=\K\S+' "$2" || echo 6.12.1-test)"
@@ -126,6 +133,8 @@ STUB
     printf '#!/bin/bash\nexit 0\n' > "${bin}/nvidia-modprobe"
     printf '#!/bin/bash\ncat "${SB}/smi" 2>/dev/null\n' > "${bin}/nvidia-smi"
     printf '#!/bin/bash\nprintf "512\\t%%s\\n" "${@: -1}"\n' > "${bin}/du"
+    # The host's GPUs: a copy of an lspci fixture, or none at all.
+    printf '#!/bin/bash\ncat "${SB}/lspci" 2>/dev/null\nexit 0\n' > "${bin}/lspci"
     chmod +x "${bin}"/*
 }
 
@@ -398,6 +407,156 @@ for version in 24.10.2.4 25.04.2.6 25.10.8 27.0.0-RC.1 TrueNAS-SCALE-25.10.8; do
     deploy "${sb}" NEW
     check "${version} deploys" is "${RC}" 0
 done
+
+FIXTURES="${REPO}/tests/fixtures/nvidia"
+
+# put_image <sandbox> <module>-<580|595> | none — the GPU metadata the unsquashfs
+# stub serves for every image: NVIDIA's list plus build-info, or nothing.
+put_image() {
+    local dir="$1/image/usr/share/nvidia-sysext" kind="$2" version
+    rm -rf "$1/image"
+    [[ "${kind}" == none ]] && return 0
+    case "${kind##*-}" in
+        580) version=580.196.07 ;;
+        595) version=595.112.07 ;;
+    esac
+    mkdir -p "${dir}"
+    cp "${FIXTURES}/supported-gpus-${version}.json" "${dir}/supported-gpus.json"
+    printf 'NVIDIA_VERSION=%s\nNVIDIA_KERNEL_MODULE_TYPE=%s\n' "${version}" "${kind%-*}" > "${dir}/build-info"
+}
+
+# gpu_sandbox <lspci fixture> <image metadata> [installed image text] — always at
+# ${WORK}/gpu: the helpers below run inside $(…), so the path has to be known
+# to the caller without coming back from the subshell.
+gpu_sandbox() {
+    rm -rf "${WORK}/gpu"
+    local s; s="$(new_sandbox gpu true "${3:-OLD}")"
+    cp "${FIXTURES}/$1" "${s}/lspci"
+    put_image "${s}" "$2"
+}
+
+# deploy_with <lspci fixture> <image metadata> [flags] — output in <sb>/out
+deploy_with() {
+    local lspci="$1" image="$2"; shift 2
+    gpu_sandbox "${lspci}" "${image}"
+    echo NEW > "${WORK}/gpu/new.raw"
+    SB="${WORK}/gpu" PATH="${WORK}/gpu/bin:${PATH}" \
+        bash "${WORK}/gpu/deploy-nvidia.sh" "$@" "${WORK}/gpu/new.raw" > "${WORK}/gpu/out" 2>&1
+    RC=$?
+}
+
+# uninstall_with <lspci fixture> — the stock image never carries GPU metadata
+uninstall_with() {
+    gpu_sandbox "$1" none
+    echo STOCK > "${WORK}/gpu/nvidia.raw.stock"
+    SB="${WORK}/gpu" PATH="${WORK}/gpu/bin:${PATH}" \
+        bash "${WORK}/gpu/deploy-nvidia.sh" --uninstall > "${WORK}/gpu/out" 2>&1 </dev/null
+    RC=$?
+}
+
+# menu_with <lspci fixture> <image metadata> <keystrokes> — drives the plain menu
+# from inside the sandbox, so the loose ./nvidia.raw is the only image it finds.
+menu_with() {
+    gpu_sandbox "$1" "$2"
+    echo NEW > "${WORK}/gpu/nvidia.raw"
+    echo STOCK > "${WORK}/gpu/nvidia.raw.stock"
+    ( cd "${WORK}/gpu" && printf '%b' "$3" | SB="${WORK}/gpu" PATH="${WORK}/gpu/bin:${PATH}" \
+        timeout 20 bash "${WORK}/gpu/deploy-nvidia.sh" --no-whiptail > "${WORK}/gpu/out" 2>&1 )
+    RC=$?
+}
+
+# check_with <lspci fixture> <image metadata> — --check of a healthy install of
+# that image; output in <sb>/check-out
+check_with() {
+    gpu_sandbox "$1" "$2" "NEW DRIVER=580.196.07"
+    load_modules "${WORK}/gpu"; loaded_driver "${WORK}/gpu" 580.196.07
+    echo "580.196.07, Test GPU" > "${WORK}/gpu/smi"
+    SB="${WORK}/gpu" PATH="${WORK}/gpu/bin:${PATH}" \
+        bash "${WORK}/gpu/deploy-nvidia.sh" --check > "${WORK}/gpu/check-out" 2>&1
+    RC=$?
+}
+
+count_in()    { grep -cF -- "$2" "$1"; }
+has()         { grep -qF -- "$2" "$1"; }
+lacks()       { ! grep -qF -- "$2" "$1"; }
+
+# A PATH holding every host tool except one, to stand in for a TrueNAS box
+# that lacks it.
+path_without() {
+    local dir="${WORK}/no-$1" f
+    if [[ ! -d "${dir}" ]]; then
+        mkdir -p "${dir}"
+        for f in /usr/bin/* /bin/*; do
+            [[ -x "${f}" ]] || continue
+            case "$(basename "${f}")" in "$1"|"$1".*) continue ;; esac
+            [[ -e "${dir}/$(basename "${f}")" ]] || ln -s "${f}" "${dir}/$(basename "${f}")"
+        done
+    fi
+    printf '%s' "${dir}"
+}
+
+sb="${WORK}/gpu"
+echo "deploy: GPU check"
+check "open image + GTX 1080 host is refused" is "$(deploy_with lspci-gtx1080.txt open-580; echo $RC)" 1
+check "nothing changed after the refusal"     is "$(installed "${sb}")" OLD
+check "integration never touched"             is "$(grep -c docker.update "${sb}/events")" 0
+check "nothing unmerged"                      is "$(grep -c 'systemd-sysext unmerge' "${sb}/events")" 0
+check "names the card and the flavor it needs" has "${sb}/out" "NVIDIA GeForce GTX 1080 (10de:1b80) needs proprietary kernel modules"
+check "points at the rebuild and --force-gpu" has "${sb}/out" "--force-gpu"
+check "does not suggest SKIP_GPU_CHECK"       lacks "${sb}/out" "SKIP_GPU_CHECK"
+check "--force-gpu deploys anyway"            is "$(deploy_with lspci-gtx1080.txt open-580 --force-gpu; installed "${sb}")" NEW
+check "--force-gpu still says why"            has "${sb}/out" "needs proprietary kernel modules"
+check "--dry-run runs the check too"          is "$(deploy_with lspci-gtx1080.txt open-580 --dry-run; echo $RC)" 1
+check "dry run names the card"                has "${sb}/out" "NVIDIA GeForce GTX 1080 (10de:1b80)"
+check "reserved T1000 is not checked, RTX PRO 2000 passes" is "$(deploy_with lspci-truenas-t1000-vfio-rtxpro2000.txt open-580; installed "${sb}")" NEW
+check "says the T1000 was skipped"            grep -q "reserved for a VM (vfio-pci) — not checked" "${sb}/out"
+check "the check runs exactly once"           is "$(count_in "${sb}/out" "reserved for a VM (vfio-pci) — not checked")" 1
+check "confirms the RTX PRO 2000"             has "${sb}/out" "NVIDIA RTX PRO 2000 Blackwell (10de:2d30) is supported by NVIDIA 580.196.07 (open modules)"
+check "proprietary image + GTX 1080 deploys"  is "$(deploy_with lspci-gtx1080.txt proprietary-580; installed "${sb}")" NEW
+check "proprietary image + RTX 5080 is refused" is "$(deploy_with lspci-rtx5080-3d.txt proprietary-580; echo $RC)" 1
+check "says the RTX 5080 needs open modules"  has "${sb}/out" "NVIDIA GeForce RTX 5080 (10de:2c02) needs open kernel modules"
+check "legacy-only card is refused"           is "$(deploy_with lspci-gtx1080.txt open-595; echo $RC)" 1
+check "names the legacy branch"               has "${sb}/out" "NVIDIA lists it for the 580.xx legacy driver"
+check "unlisted card is refused"              is "$(deploy_with lspci-gtx480-fermi.txt open-580; echo $RC)" 1
+check "says the card is not listed"           has "${sb}/out" "10de:06c0 is not in NVIDIA 580.196.07's supported list"
+check "image without metadata deploys"        is "$(deploy_with lspci-gtx1080.txt none; installed "${sb}")" NEW
+check "says why it skipped the check"         has "${sb}/out" "This image carries no GPU list (built before GPU checks, or the stock image) — skipping the GPU check"
+check "--uninstall (stock image) is not blocked" is "$(uninstall_with lspci-gtx1080.txt; echo $RC)" 0
+check "--uninstall installs the stock image"  is "$(installed "${sb}")" STOCK
+check "--uninstall says why it skipped"       has "${sb}/out" "This image carries no GPU list"
+
+rc="$(deploy_with lspci-gtx1080.txt open-580; echo $RC)"   # sets up the sandbox
+SB="${sb}" PATH="${sb}/bin:$(path_without python3)" bash "${sb}/deploy-nvidia.sh" "${sb}/new.raw" > "${sb}/out" 2>&1
+check "no python3: deploys anyway"            is "$?:$(installed "${sb}")" 0:NEW
+check "no python3: says it could not check"   has "${sb}/out" "could not check"
+rc="$(deploy_with lspci-gtx1080.txt open-580; echo $RC)"
+rm -f "${sb}/bin/unsquashfs"
+SB="${sb}" PATH="${sb}/bin:$(path_without unsquashfs)" bash "${sb}/deploy-nvidia.sh" "${sb}/new.raw" > "${sb}/out" 2>&1
+check "no unsquashfs: deploys anyway"         is "$?:$(installed "${sb}")" 0:NEW
+check "no unsquashfs: says it could not check" has "${sb}/out" "could not check"
+
+echo "menu: GPU check"
+check "menu deploy is refused"                is "$(menu_with lspci-gtx1080.txt open-580 '2\n1\n1\ny\n\n\n'; installed "${sb}")" OLD
+check "menu deploy names the card once"       is "$(count_in "${sb}/out" "needs proprietary kernel modules")" 1
+check "menu deploy of a fitting image works"  is "$(menu_with lspci-truenas-t1000-vfio-rtxpro2000.txt open-580 '2\n1\n1\ny\n\n\n'; installed "${sb}")" NEW
+check "menu deploy checks once"               is "$(count_in "${sb}/out" "reserved for a VM (vfio-pci) — not checked")" 1
+check "menu uninstall is not blocked"         is "$(menu_with lspci-gtx1080.txt none '4\ny\n\n\n'; installed "${sb}")" STOCK
+check "menu uninstall says why, once"         is "$(count_in "${sb}/out" "This image carries no GPU list")" 1
+
+echo "--check GPU section"
+check_with lspci-truenas-t1000-vfio-rtxpro2000.txt open-580
+check "lists the reserved card"  grep -q "T1000 8GB (0000:03:00.0): reserved for a VM (vfio-pci)" "${sb}/check-out"
+check "lists the driven card"    grep -q "(0000:81:00.0): driven by nvidia" "${sb}/check-out"
+check "names a card lspci can't from the image" has "${sb}/check-out" "NVIDIA RTX PRO 2000 Blackwell (0000:81:00.0): driven by nvidia"
+check "the installed driver supports it" has "${sb}/check-out" "supported by the installed driver: yes"
+check "a fitting GPU is no problem" is "$(check_with lspci-truenas-t1000-vfio-rtxpro2000.txt open-580; echo $RC)" 0
+check "a card with no driver bound" is "$(check_with lspci-gtx1080.txt open-580; echo $RC)" 1
+check "says no driver is bound"  has "${sb}/check-out" "GeForce GTX 1080 (0000:01:00.0): no driver bound"
+check "says why it is unsupported" has "${sb}/check-out" "supported by the installed driver: no — needs proprietary kernel modules"
+check "lists it under Problems"  has "${sb}/check-out" "does not drive"
+check_with lspci-gtx1080.txt none
+check "no metadata: no support line" lacks "${sb}/check-out" "supported by the installed driver"
+check "no metadata: still lists the card" has "${sb}/check-out" "(0000:01:00.0): no driver bound"
 
 echo ""
 echo "${PASS} passed, ${FAIL} failed"

@@ -8,6 +8,7 @@
 #         ./deploy-nvidia.sh --dry-run <image>      show every step, change nothing
 #         ./deploy-nvidia.sh --uninstall            restore the stock driver
 #         ./deploy-nvidia.sh --force-kernel <image> deploy for another kernel
+#         ./deploy-nvidia.sh --force-gpu <image>    deploy even if it won't drive the GPUs
 #
 # Run with no arguments it offers a menu to inspect the current state, deploy
 # an image, or roll back to a previous one; the menu re-invokes this script to
@@ -63,6 +64,8 @@ DEPLOY_COMPLETE=0       # 1 once everything succeeded
 DRY_RUN=0               # 1 = log every mutating command instead of running it
 CHECK_ONLY=0            # 1 = report the current state and exit
 FORCE_KERNEL=0          # 1 = deploy an image built for another kernel anyway
+FORCE_GPU=0             # 1 = deploy an image that won't drive this host's GPUs anyway
+GPU_UNSUPPORTED=()      # --check: "<card> (<slot>) — <reason>" the installed driver can't drive
 UNINSTALL=0             # 1 = deploy the stock image instead of a given one
 PERSIST_ACTION=""       # "on"/"off" = set up / remove update-persistence
 UVM_ACTION=""           # "on"/"off" = register / remove the boot-time uvm load
@@ -76,6 +79,7 @@ Usage:
   $0 <path-to-nvidia.raw>    Deploy the image
   $0 --dry-run <image>       Walk the whole flow, change nothing
   $0 --force-kernel <image>  Deploy an image built for another kernel
+  $0 --force-gpu <image>     Deploy an image whose driver won't drive this host's GPUs
   $0 --check                 Report the current driver/sysext state and exit
   $0 --uninstall             Restore the driver this TrueNAS release shipped
   $0 --persist               Keep the driver across TrueNAS updates (PREINIT)
@@ -90,6 +94,12 @@ image, or roll back to a previous one.
 
 --check is read-only and also works without root, reporting less where a call
 needs privileges. It exits non-zero when it finds a problem.
+
+Before it changes anything, a deployment checks the host's NVIDIA GPUs against
+the list NVIDIA ships in the image, and refuses an image whose driver or kernel
+module flavor (open/proprietary) won't drive them. GPUs bound to vfio-pci
+(reserved for a VM) are not checked. Images without that list (older builds,
+the stock image) deploy with a note.
 EOF
 }
 
@@ -610,6 +620,281 @@ image_driver_version() {
         | grep -m1 -oP 'libcuda\.so\.\K[0-9]+\.[0-9.]+' || true
 }
 
+# ── Host GPUs against the image's GPU list ──────────────────────────────────
+# An image only helps if its driver, and its kernel module flavor, drives the
+# cards in this box. The build embeds NVIDIA's own per-device list and what it
+# was built as, so the deploy can tell before it swaps anything.
+
+# Every NVIDIA display controller (classes 0300/0302/0380) as
+# `slot|devid|subsys|driver|name`: devid lowercase; subsys `vvvv:dddd` or empty;
+# driver from "Kernel driver in use" (empty when none is bound; vfio-pci means
+# reserved for a VM); name empty when lspci only knows "Device xxxx".
+# Same parsing as configure.sh's parse_nvidia_gpus, copied because this script
+# has to stay a single file. Returns 1 when lspci is missing.
+host_nvidia_gpus() {
+    command -v lspci >/dev/null 2>&1 || return 1
+    local hdr='^([0-9a-fA-F:.]+) .*\[(0300|0302|0380)\]: (.*) \[10de:([0-9a-fA-F]{4})\]'
+    local out line prefix cur=-1 i
+    local -a slots=() devids=() subs=() drivers=() names=()
+    # Captured first, never piped into a reader that may stop early (see image_has_kernel).
+    out="$(lspci -Dnnk -d 10de: 2>/dev/null || true)"
+    while IFS= read -r line; do
+        if [[ "${line}" =~ ${hdr} ]]; then
+            prefix="${BASH_REMATCH[3]}"
+            cur=${#devids[@]}
+            slots[cur]="${BASH_REMATCH[1]}"
+            devids[cur]="${BASH_REMATCH[4],,}"
+            subs[cur]=""
+            drivers[cur]=""
+            if [[ "${prefix}" =~ \[([^][]*)\]$ ]]; then
+                names[cur]="${BASH_REMATCH[1]}"
+            else
+                names[cur]=""
+            fi
+        elif [[ "${line}" =~ ^[[:space:]] ]]; then
+            [[ ${cur} -ge 0 ]] || continue
+            if [[ "${line}" =~ Subsystem:.*\[([0-9a-fA-F]{4}:[0-9a-fA-F]{4})\]$ ]]; then
+                subs[cur]="${BASH_REMATCH[1],,}"
+            elif [[ "${line}" =~ Kernel\ driver\ in\ use:\ ([^[:space:]]+) ]]; then
+                drivers[cur]="${BASH_REMATCH[1]}"
+            fi
+        else
+            cur=-1   # another device (e.g. the GPU's audio function)
+        fi
+    done <<< "${out}"
+    for i in "${!devids[@]}"; do
+        printf '%s|%s|%s|%s|%s\n' "${slots[i]}" "${devids[i]}" "${subs[i]}" "${drivers[i]}" "${names[i]}"
+    done
+    return 0
+}
+
+# image_gpu_metadata RAW DIR — copy the image's supported-gpus.json and
+# build-info into DIR. Returns 1 when either is missing (an image built before
+# GPU checks existed, or the stock image). Written to files, not piped: see
+# image_has_kernel for what an early-exiting reader does to unsquashfs.
+image_gpu_metadata() {
+    local raw="$1" dir="$2" f
+    for f in supported-gpus.json build-info; do
+        unsquashfs -cat "${raw}" "usr/share/nvidia-sysext/${f}" > "${dir}/${f}" 2>/dev/null || return 1
+        [[ -s "${dir}/${f}" ]] || return 1
+    done
+}
+
+# build_info_value FILE KEY — a KEY=VALUE line from build-info. Read, never
+# sourced: it comes out of an image.
+build_info_value() {
+    local key value
+    while IFS='=' read -r key value || [[ -n "${key}" ]]; do
+        [[ "${key}" == "$2" ]] && { printf '%s' "${value}"; return 0; }
+    done < "$1"
+    return 0
+}
+
+# gpu_fit_eval JSON MODULE GPU… — each GPU is `slot|devid|subsys[|…]`. Prints
+# one line per GPU:
+#   ok|<slot>|<devid>|<name>        module|<slot>|<devid>|<name>|<flavor that drives it>
+#   legacy|<slot>|<devid>|<name>|<branch>      unlisted|<slot>|<devid>|
+# The rules of entrypoint.sh's gpu_fit_report (NVIDIA's supported-gpus.json),
+# in python3 because TrueNAS ships no jq: only rows WITHOUT legacybranch count
+# as driven, the one matching the card's subsystem first; open needs
+# kernelopen; proprietary needs gsp_proprietary_supported or no kernelopen
+# (pre-GSP). Returns non-zero when the JSON can't be read.
+gpu_fit_eval() {
+    local json="$1" module="$2"; shift 2
+    python3 - "${json}" "${module}" "$@" <<'PY'
+import json, sys
+
+def norm(v):
+    v = str(v or "").lower()
+    return v[2:] if v.startswith("0x") else v
+
+def field(v):
+    return str(v or "").replace("|", "/")
+
+with open(sys.argv[1]) as f:
+    chips = [c for c in (json.load(f).get("chips") or []) if isinstance(c, dict)]
+module = sys.argv[2].lower()
+for spec in sys.argv[3:]:
+    slot, devid, subsys = (spec.split("|") + ["", "", ""])[:3]
+    devid = norm(devid)
+    sv, _, sd = subsys.partition(":")
+    sv, sd = norm(sv), norm(sd)
+    rows = [c for c in chips if norm(c.get("devid")) == devid]
+    cur = [c for c in rows if "legacybranch" not in c]
+    leg = [c for c in rows if "legacybranch" in c]
+    if cur:
+        exact = [c for c in cur if norm(c.get("subvendorid")) == sv and norm(c.get("subdevid")) == sd]
+        r = exact[0] if sv and sd and exact else cur[0]
+        feats = r.get("features")
+        feats = feats if isinstance(feats, list) else []
+        is_open = "kernelopen" in feats
+        gsp = "gsp_proprietary_supported" in feats
+        fits = is_open if module == "open" else (gsp or not is_open)
+        if fits:
+            print("|".join(["ok", slot, devid, field(r.get("name"))]))
+        else:
+            other = "proprietary" if module == "open" else "open"
+            print("|".join(["module", slot, devid, field(r.get("name")), other]))
+    elif leg:
+        print("|".join(["legacy", slot, devid, field(leg[0].get("name")), field(leg[0].get("legacybranch"))]))
+    else:
+        print("|".join(["unlisted", slot, devid, ""]))
+PY
+}
+
+# Refuses, before anything is touched, an image whose driver or module flavor
+# won't drive this host's GPUs. Cards bound to vfio-pci belong to a VM and are
+# not checked. A missing tool or missing metadata only skips the check: an image
+# built before it existed, or the stock image (--uninstall), must still deploy.
+check_image_gpus() {
+    local tmp="" gpus="" version="" module="" report="" msg
+    local slot devid subsys driver name kind extra
+    local -a specs=() failures=()
+    local -A fit_name=() reserved=()
+
+    if ! command -v unsquashfs >/dev/null 2>&1; then
+        info "unsquashfs is not available — could not check the image against this host's GPUs"
+        return 0
+    fi
+    if ! tmp="$(mktemp -d 2>/dev/null)"; then
+        info "No temporary directory — could not check the image against this host's GPUs"
+        return 0
+    fi
+    if ! image_gpu_metadata "${NEW_RAW}" "${tmp}"; then
+        rm -rf "${tmp}"
+        info "This image carries no GPU list (built before GPU checks, or the stock image) — skipping the GPU check"
+        return 0
+    fi
+    version="$(build_info_value "${tmp}/build-info" NVIDIA_VERSION)"
+    [[ -n "${version}" ]] || version="$(image_driver_version "${NEW_RAW}")"
+    module="$(build_info_value "${tmp}/build-info" NVIDIA_KERNEL_MODULE_TYPE)"
+    module="${module,,}"
+    if [[ "${module}" != open ]] && [[ "${module}" != proprietary ]]; then
+        rm -rf "${tmp}"
+        info "The image does not say which kernel modules it ships — could not check it against this host's GPUs"
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        rm -rf "${tmp}"
+        info "python3 is not available — could not check the image against this host's GPUs"
+        return 0
+    fi
+    if ! gpus="$(host_nvidia_gpus)"; then
+        rm -rf "${tmp}"
+        info "lspci is not available — could not check the image against this host's GPUs"
+        return 0
+    fi
+    if [[ -z "${gpus}" ]]; then
+        rm -rf "${tmp}"
+        info "No NVIDIA GPU found on this host — nothing to check the image against"
+        return 0
+    fi
+
+    # Reserved cards go through the evaluation too, but only for their name.
+    while IFS='|' read -r slot devid subsys driver name; do
+        [[ -n "${slot}" ]] && specs+=("${slot}|${devid}|${subsys}")
+    done <<< "${gpus}"
+    if ! report="$(gpu_fit_eval "${tmp}/supported-gpus.json" "${module}" "${specs[@]}" 2>/dev/null)"; then
+        rm -rf "${tmp}"
+        warn "Could not read the image's GPU list — could not check it against this host's GPUs"
+        return 0
+    fi
+    rm -rf "${tmp}"
+
+    while IFS='|' read -r kind slot devid name extra; do
+        [[ -n "${slot}" ]] && fit_name["${slot}"]="${name}"
+    done <<< "${report}"
+    while IFS='|' read -r slot devid subsys driver name; do
+        [[ -n "${slot}" ]] && [[ "${driver}" == vfio-pci ]] || continue
+        reserved["${slot}"]=1
+        name="${name:-${fit_name[${slot}]:-}}"
+        info "${name:-NVIDIA 10de:${devid}} (${slot}) is reserved for a VM (vfio-pci) — not checked"
+    done <<< "${gpus}"
+
+    # Same texts as the build's check (entrypoint.sh), with the deploy's fix.
+    while IFS='|' read -r kind slot devid name extra; do
+        [[ -n "${slot}" ]] && [[ -z "${reserved[${slot}]:-}" ]] || continue
+        case "${kind}" in
+            ok)       ok "${name} (10de:${devid}) is supported by NVIDIA ${version} (${module} modules)" ;;
+            legacy)   failures+=("${name} (10de:${devid}) is not supported by NVIDIA ${version}; NVIDIA lists it for the ${extra} legacy driver. Rebuild with ./configure.sh and pick ${extra}.") ;;
+            unlisted) failures+=("10de:${devid} is not in NVIDIA ${version}'s supported list.") ;;
+            module)   failures+=("${name} (10de:${devid}) needs ${extra} kernel modules. Rebuild with ./configure.sh --module ${extra}.") ;;
+        esac
+    done <<< "${report}"
+
+    [[ ${#failures[@]} -eq 0 ]] && return 0
+    if [[ ${FORCE_GPU} -eq 1 ]]; then
+        for msg in "${failures[@]}"; do warn "${msg}"; done
+        warn "--force-gpu: installing anyway — the GPU(s) above will not work with this driver"
+        return 0
+    fi
+    die "$(printf '%s\n' "${failures[@]}")
+Nothing was changed. Pass --force-gpu to install this image anyway."
+}
+
+# The GPUs section of --check: what each card is bound to and, when the
+# installed image carries NVIDIA's list, whether its driver drives the card.
+# Cards it does not drive are collected in GPU_UNSUPPORTED for the summary.
+report_gpus() {
+    local gpus="" tmp="" version="" module="" report="" label state reason
+    local slot devid subsys driver name kind extra
+    local -a specs=()
+    local -A fit=() fit_name=()
+
+    if ! gpus="$(host_nvidia_gpus)"; then
+        echo "  lspci not available — cannot list the GPUs"
+        return 0
+    fi
+    if [[ -z "${gpus}" ]]; then
+        echo "  no NVIDIA GPU found"
+        return 0
+    fi
+
+    if [[ -f "${NVIDIA_RAW}" ]] && command -v unsquashfs >/dev/null 2>&1 \
+            && command -v python3 >/dev/null 2>&1 && tmp="$(mktemp -d 2>/dev/null)"; then
+        if image_gpu_metadata "${NVIDIA_RAW}" "${tmp}"; then
+            version="$(build_info_value "${tmp}/build-info" NVIDIA_VERSION)"
+            [[ -n "${version}" ]] || version="$(image_driver_version "${NVIDIA_RAW}")"
+            module="$(build_info_value "${tmp}/build-info" NVIDIA_KERNEL_MODULE_TYPE)"
+            module="${module,,}"
+            if [[ "${module}" == open ]] || [[ "${module}" == proprietary ]]; then
+                while IFS='|' read -r slot devid subsys driver name; do
+                    [[ -n "${slot}" ]] && specs+=("${slot}|${devid}|${subsys}")
+                done <<< "${gpus}"
+                report="$(gpu_fit_eval "${tmp}/supported-gpus.json" "${module}" "${specs[@]}" 2>/dev/null)" || report=""
+            fi
+        fi
+        rm -rf "${tmp}"
+    fi
+    while IFS='|' read -r kind slot devid name extra; do
+        [[ -n "${slot}" ]] || continue
+        fit["${slot}"]="${kind}|${extra}"
+        fit_name["${slot}"]="${name}"
+    done <<< "${report}"
+
+    while IFS='|' read -r slot devid subsys driver name; do
+        [[ -n "${slot}" ]] || continue
+        label="${name:-${fit_name[${slot}]:-}}"
+        label="${label:-NVIDIA 10de:${devid}}"
+        case "${driver}" in
+            vfio-pci) state="reserved for a VM (vfio-pci)" ;;
+            "")       state="no driver bound" ;;
+            *)        state="driven by ${driver}" ;;
+        esac
+        echo "  ${label} (${slot}): ${state}"
+        [[ "${driver}" != vfio-pci ]] && [[ -n "${fit[${slot}]:-}" ]] || continue
+        kind="${fit[${slot}]%%|*}"; extra="${fit[${slot}]#*|}"
+        case "${kind}" in
+            ok)       echo "      supported by the installed driver: yes"; continue ;;
+            module)   reason="needs ${extra} kernel modules" ;;
+            legacy)   reason="NVIDIA lists it for the ${extra} legacy driver" ;;
+            *)        reason="not in NVIDIA ${version}'s supported list" ;;
+        esac
+        echo "      supported by the installed driver: no — ${reason}"
+        GPU_UNSUPPORTED+=("${label} (${slot}) — ${reason}")
+    done <<< "${gpus}"
+}
+
 report_state() {
     local problems=0
     local host_kernel; host_kernel="$(uname -r)"
@@ -687,6 +972,11 @@ report_state() {
     else
         echo "  nvidia-smi      <not present>"
     fi
+
+    echo ""
+    echo -e "${BOLD}── GPUs ────────────────────────────────────────────────────${NC}"
+    report_gpus
+    problems=$((problems + ${#GPU_UNSUPPORTED[@]}))
 
     echo ""
     echo -e "${BOLD}── Activation ──────────────────────────────────────────────${NC}"
@@ -801,6 +1091,10 @@ report_state() {
     fi
     [[ -n "${NOT_ACTIVATED:-}" ]] && \
         warn "The image is not activated: no symlink in /etc/extensions or /run/extensions."
+    local gpu
+    for gpu in "${GPU_UNSUPPORTED[@]}"; do
+        warn "The installed driver does not drive ${gpu}. Rebuild with ./configure.sh and redeploy."
+    done
     if [[ -n "${PERSIST_STALE:-}" ]]; then
         warn "The copy saved for update-persistence was built for kernel ${PERSIST_STALE},"
         warn "not the running ${host_kernel} — it will be refused at boot rather than"
@@ -1471,6 +1765,7 @@ while [[ $# -gt 0 ]]; do
         --unpersist-uvm) UVM_ACTION="off"; shift ;;
         --dry-run)      DRY_RUN=1; shift ;;
         --force-kernel) FORCE_KERNEL=1; shift ;;
+        --force-gpu)    FORCE_GPU=1; shift ;;
         --no-whiptail)  FORCE_BASH=true; shift ;;
         -*)             die "Unknown option: $1 (see --help)" ;;
         *)
@@ -1551,6 +1846,10 @@ fi
 [[ $(id -u) -eq 0 ]] || die "This script must be run as root."
 [[ -f "${NEW_RAW}" ]] || die "File not found: ${NEW_RAW}"
 check_image_kernel
+# Every deployment passes here exactly once: the command line, --uninstall, and
+# the menu's deploy / roll back / restore entries (which re-run this script with
+# the image). It is before the EXIT trap, so a refusal leaves nothing to undo.
+check_image_gpus
 
 if [[ ${DRY_RUN} -eq 1 ]]; then
     echo ""
